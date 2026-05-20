@@ -1,11 +1,12 @@
-# rkyvser
+# rkyvser — Rust + rkyv experiment (archived)
 
-A PHP serialization extension built on [rkyv](https://rkyv.org/), targeting
-read-heavy cache workloads where decode time matters more than encode time
-or payload size.
+This is the historical record of the V0→V3 attempt to build a PHP serializer
+on top of rkyv via `ext-php-rs`. It did not deliver on its core pitch
+(see status section below), so the project pivoted to a C extension —
+`phpser`, in this same repo. See `README.md` for the live project.
 
-Status: working V2. Round-trip is clean on all primitive + array shapes.
-Object reconstruction is still a stub (round-trips through `stdClass` shape).
+The Rust source itself is preserved on the `legacy-rkyv` tag; current main
+contains C only.
 
 ## What's here
 
@@ -34,35 +35,48 @@ Then load both `librkyvser.so` and `igbinary.so` into the local PHP:
   bench.php
 ```
 
-## V3 baseline numbers
+## Status: project pivoted to a C extension
 
-PHP 8.4.22-dev **NTS DEBUG** build (debug build inflates both libraries'
-absolute ns/op ~5–10× vs release; relative ratios should hold roughly).
+The rkyv-backed approach **did not deliver on its core pitch in
+production-realistic benchmarks**. See `LEGACY-RKYV.md` for the full V0→V3
+journey, the design rationale, and the data. Short version:
 
-| Shape | Size: ig → rk | Serialize: ig → rk | Unserialize: ig → rk |
+PHP 8.4.22-dev **NTS RELEASE** build (the bench numbers below — these
+are the real ones, not the inflated DEBUG numbers we initially measured):
+
+| Shape | rkyvser ser vs igbinary | rkyvser uns vs igbinary | Size vs igbinary |
 |---|---|---|---|
-| rowset_100 | 4.5K → 40K (+777%) | 17k ns → 257k ns (15×) | 103k ns → 142k ns (+38%) |
-| rowset_1000 | 47K → 399K (+741%) | 177k ns → 1.5M ns (8.5×) | 1001k ns → 1370k ns (+37%) |
-| packed_1k | 5.5K → 24K (+338%) | 7k ns → 65k ns (9.3×) | 36k ns → **27k ns (-26%)** |
-| packed_10k | 60K → 240K (+304%) | 63k ns → 581k ns (9.2×) | 334k ns → **266k ns (-20%)** |
-| deep_50 | 420 → 4144 (+889%) | 4k ns → 35k ns (8.6×) | 21k ns → 20k ns (parity) |
+| rowset_100 | +330% (4.3× slower) | **+60% slower** | +777% larger |
+| rowset_1000 | +275% (3.8× slower) | **+60% slower** | +741% larger |
+| packed_1k | +370% (4.7× slower) | **+56% slower** | +338% larger |
+| packed_10k | +330% (4.3× slower) | **+78% slower** | +304% larger |
+| deep_50 | +172% (2.7× slower) | parity | +889% larger |
 
-**Where rkyvser wins**: packed numeric arrays — about 20–26% faster decode
-than igbinary, validating the zero-copy architecture for this shape.
+Earlier DEBUG-mode runs showed rkyvser 20–26% **faster** than igbinary on
+packed numerics. That win was an artifact: debug-mode overhead inflated
+igbinary's hot path proportionally more than ours. With both libraries
+running optimized, igbinary wins decode on every shape — even packed
+numerics, which was supposedly our home turf.
 
-**Where rkyvser loses**:
-- *Size*: 3–10× larger. rkyv pads everything for alignment to enable
-  pointer-cast access. This is inherent to the format — varint encoding
-  would fight rkyv's design.
-- *Encode speed*: 8.5–15× slower (was 16–42× in V2). V3's raw zend FFI on
-  HT iteration cut this in half. Remaining gap is rkyv's per-slot
-  alignment writes in `to_bytes` + the `PhpValue` tree allocation itself.
-  Closing further requires either a manual `Archive`/`Serialize` impl on
-  a `ZvalView` wrapper, or accepting that rkyv-class formats won't match
-  varint streamers on encode.
-- *Decode on rowsets*: 37–38% slower. Was 230% slower before V2's string
-  refcount reuse. Closing the remainder probably requires custom bucket
-  insertion that skips ext-php-rs's `into_zval` overhead per entry.
+**Why the architecture didn't pan out:**
+
+1. Parse cost wasn't the bottleneck. rkyv's "zero-copy parse" optimized
+   the part of decode that isn't dominant.
+2. Zval allocation is the actual hot path. ext-php-rs's `IntoZval`
+   wrapper adds measurable indirection per entry that igbinary's
+   direct `ZVAL_*` macro path avoids.
+3. rkyv's structural overhead (alignment padding, per-node metadata,
+   bytecheck validation) shows up clearly when underlying ops are fast.
+4. The 3–10× size cost has no speed compensation anymore.
+
+**What we kept from the experiment** (now informs the C extension):
+
+- Front-loaded string dictionary with pointer-equality intern hits
+- Refcount-reuse of zend_strings on decode (`StringCache` shape)
+- Raw HT iteration via Bucket / arPacked pointer math
+- `HT_IS_PACKED` flag check, not iteration scan
+- Sparse-packed array fallback preserving original int keys
+- Round-trip test corpus and bench.php skeleton
 
 ## V0 → V1 → V2 → V3 progression
 
