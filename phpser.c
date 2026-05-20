@@ -991,6 +991,15 @@ typedef struct {
      * case-insensitive). Owned by the caller of phpser_decode_buf. */
     int allowed_mode;
     HashTable *allowed_set;
+    /* Class-entry lookup cache: (class_idx → zend_class_entry *). Sized
+     * to dict_len, lazy-allocated on first object decode. Avoids
+     * re-resolving the same class through the engine's class table for
+     * every TAG_OBJECT/TAG_OBJECT_MAGIC/TAG_OBJECT_LEGACY/TAG_ENUM. Real
+     * cache workloads serialize batches of same-typed DTOs; without
+     * this cache, decoding a 1000-DTO payload calls zend_lookup_class_ex
+     * 1000 times. Sentinel (zend_class_entry *)-1 marks "looked up but
+     * not found" so we don't repeatedly retry missing classes. */
+    zend_class_entry **ce_cache;
     /* C-stack recursion guard: TAG_NEW_REF / TAG_PACKED_MIXED / TAG_ASSOC /
      * TAG_OBJECT / TAG_OBJECT_MAGIC all recurse through decode_value.
      * Without a cap, attacker-controlled wire format can blow the pthread
@@ -1062,6 +1071,26 @@ static int dec_defer_wakeup(decode_ctx *d, zend_object *obj) {
     GC_ADDREF(obj);
     d->wakeup[d->wakeup_len++] = obj;
     return 0;
+}
+
+/* Resolve a class entry from a dict-indexed class name with memoization
+ * keyed by class_idx. Sentinel (zend_class_entry *)-1 marks "tried,
+ * not found" so we don't re-call zend_lookup_class_ex for missing
+ * classes either. Caller still gets NULL for unknown classes. */
+#define DEC_CE_MISSING ((zend_class_entry *)(uintptr_t)-1)
+static inline zend_class_entry *dec_class_resolve(
+    decode_ctx *d, uint64_t class_idx, zend_string *class_name)
+{
+    if (UNEXPECTED(!d->ce_cache)) {
+        d->ce_cache = ecalloc(d->dict_len, sizeof(zend_class_entry *));
+    }
+    zend_class_entry *ce = d->ce_cache[class_idx];
+    if (EXPECTED(ce != NULL)) {
+        return ce == DEC_CE_MISSING ? NULL : ce;
+    }
+    ce = zend_lookup_class_ex(class_name, NULL, 0);
+    d->ce_cache[class_idx] = ce ? ce : DEC_CE_MISSING;
+    return ce;
 }
 
 /* Returns 1 if `class_name` is allowed by the current decode_ctx filter.
@@ -1225,6 +1254,7 @@ static void decode_destroy(decode_ctx *d) {
         }
         efree(d->wakeup);
     }
+    if (d->ce_cache) efree(d->ce_cache);
 }
 
 /* Read an Assoc/Object key (one byte tag + payload). Stores result in out_key,
@@ -1477,7 +1507,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 dec_register(d, out);
                 return 0;
             }
-            zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
+            zend_class_entry *ce = dec_class_resolve(d, class_idx, class_name);
             if (!ce || ce->unserialize == NULL) {
                 /* Unknown class or no C-level unserializer — skip past the
                  * payload bytes, yield NULL, and register a NULL id-slot so
@@ -1514,7 +1544,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * from the stream either way to keep id counts aligned. */
             int allowed = dec_class_allowed(d, class_name);
             zend_class_entry *ce = allowed
-                ? zend_lookup_class_ex(class_name, NULL, 0) : NULL;
+                ? dec_class_resolve(d, class_idx, class_name) : NULL;
             if (!ce) ce = allowed ? zend_standard_class_def : PHP_IC_ENTRY;
 
             if (object_init_ex(out, ce) != SUCCESS) {
@@ -1570,7 +1600,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 dec_register(d, out);
                 return 0;
             }
-            zend_class_entry *ce = zend_lookup_class_ex(cname, NULL, 0);
+            zend_class_entry *ce = dec_class_resolve(d, class_idx, cname);
             if (!ce || !(ce->ce_flags & ZEND_ACC_ENUM)) return -1;
             zend_object *obj = zend_enum_get_case(ce, casename);
             if (!obj) return -1;
@@ -1593,7 +1623,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * normal IS_INDIRECT / dynamic-prop write path. */
             int allowed = dec_class_allowed(d, class_name);
             zend_class_entry *ce = allowed
-                ? zend_lookup_class_ex(class_name, NULL, 0) : PHP_IC_ENTRY;
+                ? dec_class_resolve(d, class_idx, class_name) : PHP_IC_ENTRY;
             /* Resolve the class. If autoloading fails or the class doesn't
              * exist, fall back to stdClass — refusing would break round-trips
              * of payloads written before a class was registered. */
