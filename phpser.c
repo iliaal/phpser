@@ -248,12 +248,20 @@ typedef struct {
     uint32_t idx;  /* high bit set = INLINE_EMITTED, clear = DICT_IDX with idx in low 31 bits */
 } intern_slot;
 
-/* Cycle guard for recursive encode. Cache payloads usually nest 5-10 deep;
- * anything beyond MAX_DEPTH is treated as a runaway and aborted. The most
- * common way to hit this is IS_REFERENCE pointing back into an ancestor —
- * we flatten references rather than encode them as shareable, so a true
- * self-ref turns into an infinite chase without this counter. */
-#define MAX_DEPTH 4096
+/* Cycle guard for recursive encode/decode. Cache payloads usually nest
+ * 5-10 deep; anything beyond MAX_DEPTH is treated as a runaway and
+ * aborted. The most common way to hit this is IS_REFERENCE pointing back
+ * into an ancestor: we flatten references rather than encode them as
+ * shareable, so a true self-ref turns into an infinite chase without
+ * this counter.
+ *
+ * 512 picked to stay safely below stack-overflow on every supported
+ * build: ASAN-instrumented decode_value frames can hit ~1.5 KB each
+ * (vs ~150 B for opt-NTS), so the cap must hold within a single 8 MB
+ * stack worst-case. 512 leaves ~2x headroom under ASAN and ~50x under
+ * opt-NTS, and is still many orders of magnitude past any legitimate
+ * cache payload. */
+#define MAX_DEPTH 512
 
 /* Flat open-addressed identity table: (ptr → id). Linear probing on a
  * power-of-2 sized bucket array; empty slot is ptr==0. Way tighter than

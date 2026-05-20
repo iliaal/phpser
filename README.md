@@ -183,12 +183,13 @@ as a `session.serialize_handler` when available.
 
 ## Limitations / known gaps
 
-- **Recursion depth is capped at 4096** on both encode and decode. Anything
-  deeper than 4096 nested containers / refs is rejected to bound stack
+- **Recursion depth is capped at 512** on both encode and decode. Anything
+  deeper than 512 nested containers / refs is rejected to bound stack
   consumption against adversarial wire payloads. Object cycles are
   preserved correctly via the id-table machinery and don't count against
   this cap for shared-graph cases; the cap only fires on genuinely deep
-  trees.
+  trees. Cache workloads typically nest 5-10 deep, so the cap is many
+  orders of magnitude past any legitimate payload.
 - **Closures and resources encode as `NULL`.** Same shape as PHP's own
   `serialize()`; these types are inherently non-serializable.
 - **Unknown classes at decode fall back to `stdClass`** rather than PHP's
