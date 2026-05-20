@@ -276,7 +276,12 @@ static void enc_ctx_init(encode_ctx *e) {
 static void enc_ctx_destroy(encode_ctx *e) {
     if (e->hash_map_inited) zend_hash_destroy(&e->hash_map);
     if (e->id_buckets) efree(e->id_buckets);
-    if (e->dict) efree(e->dict);
+    if (e->dict) {
+        for (uint32_t i = 0; i < e->dict_len; i++) {
+            zend_string_release(e->dict[i]);
+        }
+        efree(e->dict);
+    }
 }
 
 /* Mix the pointer down: object/reference allocations are 8/16-byte aligned,
@@ -386,7 +391,13 @@ static uint32_t enc_dict_append(encode_ctx *e, zend_string *zs) {
         e->dict = erealloc(e->dict, e->dict_cap * sizeof(zend_string *));
     }
     uint32_t idx = e->dict_len++;
-    e->dict[idx] = zs;
+    /* Own a refcount on the dict entry. Magic-method paths (__sleep
+     * dynamic names, __serialize return arrays) borrow zend_strings
+     * from temporaries we dtor mid-encode; without this addref the dict
+     * pointer dangles by the time the header is emitted, and reads land
+     * on freed allocator memory. Interned literals (the common case)
+     * short-circuit zend_string_copy to a flag-check no-op. */
+    e->dict[idx] = zend_string_copy(zs);
 
     if (e->dict_len == HASH_MAP_THRESHOLD) {
         /* Lazy init: pre-size the map to the threshold count to avoid an
@@ -946,8 +957,14 @@ typedef struct {
 enum { ALLOWED_ALL = 0, ALLOWED_NONE, ALLOWED_SET };
 
 /* Register the GC entity at `z` (must be IS_OBJECT or IS_REFERENCE), claiming
- * the next id. No refcount bump: the entity's primary owner (the parent
- * container slot we just wrote into) keeps it alive for the decode pass. */
+ * the next id. Holds an explicit refcount on the entity for the lifetime of
+ * the decode pass, released in decode_destroy. Without this, a crafted
+ * payload with a duplicate assoc/property key whose first value is the
+ * just-registered object lets zend_hash_update destroy the only bucket
+ * holding the obj — id_table then dangles, and a later TAG_REF to that id
+ * deref's freed memory (zend_mm_heap corruption). The addref is per-entity
+ * and amortized; cost is negligible vs. the correctness guarantee at the
+ * decoder's security boundary. */
 static int dec_register(decode_ctx *d, zval *z) {
     if (d->id_table_len == d->id_table_cap) {
         d->id_table_cap = d->id_table_cap ? d->id_table_cap * 2 : 16;
@@ -957,9 +974,11 @@ static int dec_register(decode_ctx *d, zval *z) {
     if (Z_TYPE_P(z) == IS_OBJECT) {
         s->kind = ID_OBJ;
         s->u.obj = Z_OBJ_P(z);
+        GC_ADDREF(s->u.obj);
     } else if (Z_TYPE_P(z) == IS_REFERENCE) {
         s->kind = ID_REF;
         s->u.ref = Z_REF_P(z);
+        GC_ADDREF(s->u.ref);
     } else {
         /* Encoder always claimed an id for this slot; we must register
          * something to keep id counts aligned. Back-refs to a NULL slot
@@ -1073,7 +1092,17 @@ static void decode_destroy(decode_ctx *d) {
         efree(d->dict);
     }
     if (d->id_table) {
-        /* Entries are raw pointers (no refcount held); just free the table. */
+        /* Release the refcount we took at registration. ID_NULL slots
+         * own nothing; ID_OBJ / ID_REF release via the type-specific
+         * macro so destructors and ref-table teardown fire correctly. */
+        for (uint32_t i = 0; i < d->id_table_len; i++) {
+            id_slot *s = &d->id_table[i];
+            if (s->kind == ID_OBJ) {
+                OBJ_RELEASE(s->u.obj);
+            } else if (s->kind == ID_REF) {
+                GC_DTOR_NO_REF(s->u.ref);
+            }
+        }
         efree(d->id_table);
     }
     if (d->deferred) {
@@ -2009,10 +2038,15 @@ PHP_FUNCTION(phpser_unserialize_signed) {
 #include "phpser_arginfo.h"
 
 static PHP_MINIT_FUNCTION(phpser) {
-#if defined(COMPILE_DL_PHPSER) && defined(ZTS)
+#if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
     /* Populate our TLS slot from the host PHP's thread-local state pointer.
      * Required for dynamically-loaded extensions under ZTS — otherwise
-     * macros that touch CG/EG via the TSRMLS cache crash on lookup. */
+     * macros that touch CG/EG via the TSRMLS cache crash on lookup.
+     *
+     * The OR covers both build paths: phpize-generated config.m4 defines
+     * COMPILE_DL_<EXTNAME>; the hand-rolled Makefile defines the generic
+     * ZEND_COMPILE_DL_EXT. Without this widening, a ZTS build via the
+     * Makefile path would compile but crash on first CG/EG access. */
     ZEND_TSRMLS_CACHE_UPDATE();
 #endif
 #ifdef HAVE_PHP_SESSION
