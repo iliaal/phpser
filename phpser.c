@@ -30,6 +30,8 @@
 
 #include "Zend/zend_enum.h"
 #include "Zend/zend_exceptions.h"
+#include "Zend/zend_execute.h"          /* zend_verify_prop_assignable_by_ref */
+#include "Zend/zend_objects_API.h"      /* zend_get_typed_property_info_for_slot */
 #include "ext/standard/php_incomplete_class.h"
 #include "ext/hash/php_hash.h"
 
@@ -134,6 +136,40 @@ static inline int varint_read_i64(const uint8_t *buf, size_t buflen, size_t *pos
     if (varint_read_u64(buf, buflen, pos, &u) < 0) return -1;
     *out = zigzag_decode64(u);
     return 0;
+}
+
+/* Wire format pins doubles as 8-byte little-endian IEEE754. On x86/ARM
+ * host order already matches LE; both helpers degenerate to the same
+ * memcpy the original code did, with zero overhead. On a hypothetical
+ * big-endian host (POWER BE, S390x) we byte-reverse to keep the wire
+ * format portable per the README spec.
+ *
+ * smart_str_append_le64 writes directly through smart_str_appendl so we
+ * don't pay an intermediate stack-buffer memcpy on the LE fast path. */
+static inline void smart_str_append_le64(smart_str *s, double v) {
+#ifdef WORDS_BIGENDIAN
+    uint64_t bits;
+    memcpy(&bits, &v, 8);
+    char buf[8];
+    for (int i = 0; i < 8; i++) buf[i] = (char)((bits >> (i * 8)) & 0xff);
+    smart_str_appendl(s, buf, 8);
+#else
+    smart_str_appendl(s, (char *)&v, 8);
+#endif
+}
+
+static inline double le64_read(const uint8_t *src) {
+#ifdef WORDS_BIGENDIAN
+    uint64_t bits = 0;
+    for (int i = 0; i < 8; i++) bits |= ((uint64_t)src[i]) << (i * 8);
+    double v;
+    memcpy(&v, &bits, 8);
+    return v;
+#else
+    double v;
+    memcpy(&v, src, 8);
+    return v;
+#endif
 }
 
 /* -------------------------------------------------------------------------
@@ -483,8 +519,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
             return;
         case IS_DOUBLE: {
             smart_str_appendc(body, TAG_DOUBLE);
-            double d = Z_DVAL_P(v);
-            smart_str_appendl(body, (char *)&d, 8);
+            smart_str_append_le64(body, Z_DVAL_P(v));
             return;
         }
         case IS_STRING:
@@ -748,8 +783,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
             }
         } else if (tag == TAG_PACKED_DOUBLES) {
             for (uint32_t i = 0; i < n_used; i++) {
-                double d = Z_DVAL(zp[i]);
-                smart_str_appendl(body, (char *)&d, 8);
+                smart_str_append_le64(body, Z_DVAL(zp[i]));
             }
         } else if (tag == TAG_PACKED_STRINGS) {
             for (uint32_t i = 0; i < n_used; i++) {
@@ -948,7 +982,10 @@ static int dec_make_incomplete(zval *out, zend_string *original_class_name) {
     return 0;
 }
 
-static inline zend_string *dec_get_zstr(decode_ctx *d, uint32_t idx) {
+/* Takes a uint64 because varint_read_u64 produces uint64. Bound-check
+ * BEFORE narrowing — otherwise an attacker can craft idx = 2^32 (or any
+ * multiple of dict_len) and the uint32 truncation lands on a valid slot. */
+static inline zend_string *dec_get_zstr(decode_ctx *d, uint64_t idx) {
     if (UNEXPECTED(idx >= d->dict_len)) {
         d->error = 1;
         return NULL;
@@ -1021,7 +1058,7 @@ enum { KV_LONG, KV_DICT_STR, KV_OWNED_STR };
 typedef struct {
     int kind;
     int64_t lval;            /* KV_LONG */
-    uint32_t dict_idx;       /* KV_DICT_STR */
+    uint64_t dict_idx;       /* KV_DICT_STR — bound-check at decode time, not narrowed */
     zend_string *owned_str;  /* KV_OWNED_STR — refcount=1, caller releases */
 } key_val;
 
@@ -1035,7 +1072,7 @@ static int decode_key(decode_ctx *d, key_val *out_key) {
         uint64_t idx;
         if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) return -1;
         out_key->kind = KV_DICT_STR;
-        out_key->dict_idx = (uint32_t)idx;
+        out_key->dict_idx = idx;
         return 0;
     } else if (tag == KEY_STR_INLINE) {
         uint64_t slen;
@@ -1129,16 +1166,14 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
         }
         case TAG_DOUBLE: {
             if (d->pos + 8 > d->len) return -1;
-            double v;
-            memcpy(&v, d->buf + d->pos, 8);
+            ZVAL_DOUBLE(out, le64_read(d->buf + d->pos));
             d->pos += 8;
-            ZVAL_DOUBLE(out, v);
             return 0;
         }
         case TAG_STR_DICT: {
             uint64_t idx;
             if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) return -1;
-            zend_string *zs = dec_get_zstr(d, (uint32_t)idx);
+            zend_string *zs = dec_get_zstr(d, idx);
             if (!zs) return -1;
             ZVAL_STR_COPY(out, zs);  /* addrefs the cached string */
             return 0;
@@ -1188,10 +1223,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             zend_array *arr = zend_new_array((uint32_t)n);
             zend_hash_real_init_packed(arr);
             for (uint64_t i = 0; i < n; i++) {
-                double dv;
-                memcpy(&dv, d->buf + d->pos, 8);
+                ZVAL_DOUBLE(&arr->arPacked[i], le64_read(d->buf + d->pos));
                 d->pos += 8;
-                ZVAL_DOUBLE(&arr->arPacked[i], dv);
             }
             arr->nNumUsed = (uint32_t)n;
             arr->nNumOfElements = (uint32_t)n;
@@ -1212,7 +1245,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                     zend_array_destroy(arr);
                     return -1;
                 }
-                zend_string *zs = dec_get_zstr(d, (uint32_t)idx);
+                zend_string *zs = dec_get_zstr(d, idx);
                 if (!zs) {
                     arr->nNumUsed = (uint32_t)i;
                     zend_array_destroy(arr);
@@ -1251,7 +1284,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             if (varint_read_u64(d->buf, d->len, &d->pos, &blen) < 0) return -1;
             if (blen > UINT32_MAX || d->pos + blen > d->len) return -1;
 
-            zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
+            zend_string *class_name = dec_get_zstr(d, class_idx);
             if (!class_name) return -1;
 
             /* allowed_classes filter: if this class is disallowed, build an
@@ -1290,7 +1323,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
         case TAG_OBJECT_MAGIC: {
             uint64_t class_idx;
             if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
-            zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
+            zend_string *class_name = dec_get_zstr(d, class_idx);
             if (!class_name) return -1;
 
             /* allowed_classes filter: build incomplete-class, decode the
@@ -1335,8 +1368,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             uint64_t class_idx, case_idx;
             if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
             if (varint_read_u64(d->buf, d->len, &d->pos, &case_idx) < 0) return -1;
-            zend_string *cname = dec_get_zstr(d, (uint32_t)class_idx);
-            zend_string *casename = dec_get_zstr(d, (uint32_t)case_idx);
+            zend_string *cname = dec_get_zstr(d, class_idx);
+            zend_string *casename = dec_get_zstr(d, case_idx);
             if (!cname || !casename) return -1;
             /* allowed_classes also gates enum cases. PHP's serialize emits
              * enums as "E:..." and the filter applies the same as for O:. */
@@ -1359,7 +1392,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             if (varint_read_u64(d->buf, d->len, &d->pos, &nprops) < 0) return -1;
             /* Each prop is at least 2 bytes (key idx varint + value tag). */
             if (nprops > UINT32_MAX || nprops > (d->len - d->pos) / 2) return -1;
-            zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
+            zend_string *class_name = dec_get_zstr(d, class_idx);
             if (!class_name) return -1;
 
             /* allowed_classes filter: disallowed classes decode into
@@ -1398,7 +1431,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             for (uint64_t i = 0; i < nprops; i++) {
                 uint64_t key_idx;
                 if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx) < 0) goto obj_fail;
-                zend_string *key = dec_get_zstr(d, (uint32_t)key_idx);
+                zend_string *key = dec_get_zstr(d, key_idx);
                 if (!key) goto obj_fail;
                 zval tmp;
                 if (decode_value(d, &tmp) < 0) goto obj_fail;
@@ -1406,11 +1439,38 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 zval *existing = zend_hash_find(obj_props, key);
                 if (existing) {
                     if (Z_TYPE_P(existing) == IS_INDIRECT) {
-                        /* Declared prop — write into the slot. The indirect
-                         * value is the actual slot in properties_table. */
+                        /* Declared prop — write into the slot. The
+                         * indirect value is the actual slot in
+                         * properties_table. For typed slots, verify the
+                         * incoming value satisfies the declared type
+                         * before installing, mirroring
+                         * var_unserializer.re:608-708. Without this, a
+                         * crafted payload can plant a string in an
+                         * int-typed slot and downstream code trips on the
+                         * mismatch. */
                         zval *slot = Z_INDIRECT_P(existing);
+                        zend_property_info *info =
+                            zend_get_typed_property_info_for_slot(obj, slot);
+                        if (info != NULL) {
+                            if (!zend_verify_prop_assignable_by_ref(
+                                    info, &tmp, /*strict*/ 1)) {
+                                zval_ptr_dtor(&tmp);
+                                goto obj_fail;
+                            }
+                            /* Drop the old type-source if slot held a
+                             * typed reference we're about to overwrite. */
+                            if (Z_ISREF_P(slot)) {
+                                ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
+                            }
+                        }
                         zval_ptr_dtor(slot);
                         ZVAL_COPY_VALUE(slot, &tmp);
+                        /* If we just installed a reference into a typed
+                         * slot, propagate the type as a source on the ref
+                         * so future writes through any alias get checked. */
+                        if (info != NULL && Z_ISREF_P(slot)) {
+                            ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
+                        }
                     } else {
                         /* Existing dynamic prop — overwrite in place. */
                         zval_ptr_dtor(existing);
@@ -1444,27 +1504,35 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             if (n > UINT32_MAX || n > (d->len - d->pos) / 2) return -1;
             zend_array *arr = zend_new_array((uint32_t)n);
             for (uint64_t i = 0; i < n; i++) {
-                key_val k;
+                /* Zero-init so gcc's -Wmaybe-uninitialized doesn't false-
+                 * positive on k.lval/k.owned_str: decode_key sets k.kind
+                 * AND the corresponding union member before returning 0,
+                 * but compiler flow analysis can't see the invariant. */
+                key_val k = {0};
                 if (decode_key(d, &k) < 0) goto assoc_fail;
                 zval tmp;
                 if (decode_value(d, &tmp) < 0) {
                     if (k.kind == KV_OWNED_STR) zend_string_release(k.owned_str);
                     goto assoc_fail;
                 }
-                /* _add_new variants skip the existence check — we know the
-                 * encoder doesn't emit duplicate keys per bucket. */
+                /* Use update semantics so a crafted payload with duplicate
+                 * keys collapses to the last value (matches PHP's native
+                 * unserialize behavior) rather than producing a corrupt
+                 * HT where count() and $arr[key] disagree. The encoder
+                 * doesn't emit duplicates from trusted sources — but the
+                 * decoder is the security boundary. */
                 switch (k.kind) {
                     case KV_LONG:
-                        zend_hash_index_add_new(arr, (zend_ulong)k.lval, &tmp);
+                        zend_hash_index_update(arr, (zend_ulong)k.lval, &tmp);
                         break;
                     case KV_DICT_STR: {
                         zend_string *zs = dec_get_zstr(d, k.dict_idx);
                         if (!zs) { zval_ptr_dtor(&tmp); goto assoc_fail; }
-                        zend_hash_add_new(arr, zs, &tmp);
+                        zend_hash_update(arr, zs, &tmp);
                         break;
                     }
                     case KV_OWNED_STR:
-                        zend_hash_add_new(arr, k.owned_str, &tmp);
+                        zend_hash_update(arr, k.owned_str, &tmp);
                         /* hash addref'd it for the bucket; drop our ref. */
                         zend_string_release(k.owned_str);
                         break;
@@ -1535,6 +1603,15 @@ static int phpser_hmac_sha256(
     ops->hash_update(ctx, K, bs);
     ops->hash_update(ctx, out, ops->digest_size);
     ops->hash_final(out, ctx);
+    /* Wipe key material before returning. After the outer XOR pass K
+     * still holds K^opad — XOR with 0x5c…5c recovers K. A separate
+     * stack-read primitive elsewhere in the process would otherwise
+     * leak the signing key. Also wipe the hash context (SHA256 internal
+     * state derived from the key) before freeing. ZEND_SECURE_ZERO ==
+     * explicit_bzero on glibc / RtlSecureZeroMemory on Windows — the
+     * compiler cannot optimize it away. */
+    ZEND_SECURE_ZERO(K, sizeof(K));
+    ZEND_SECURE_ZERO(ctx, ops->context_size);
     efree(ctx);
     return 0;
 }
@@ -1712,6 +1789,15 @@ PS_SERIALIZER_DECODE_FUNC(phpser) {
     }
     ZVAL_NEW_REF(&PS(http_session_vars), &decoded);
     Z_ADDREF_P(&PS(http_session_vars));
+    /* Re-bind the userland $_SESSION symbol to the new reference. Without
+     * this, user code reads the previous request's array via the stale
+     * symbol-table entry — the PS(http_session_vars) slot is updated but
+     * $_SESSION still aliases the old one. PHP's own session decoders
+     * (php_serialize, php) do this. See session.c:986 (PS_SERIALIZER_
+     * DECODE_FUNC(php_serialize)). */
+    zend_string *var_name = ZSTR_INIT_LITERAL("_SESSION", 0);
+    zend_hash_update_ind(&EG(symbol_table), var_name, &PS(http_session_vars));
+    zend_string_release_ex(var_name, 0);
     return SUCCESS;
 }
 #endif /* HAVE_PHP_SESSION */
@@ -1742,7 +1828,20 @@ static int parse_unserialize_options(
                        NULL, NULL, 0);
         zval *cn;
         ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ac), cn) {
-            if (Z_TYPE_P(cn) != IS_STRING) continue;
+            if (Z_TYPE_P(cn) != IS_STRING) {
+                /* Match PHP's native unserialize: non-string entry in
+                 * the allowed_classes array is a TypeError. Silently
+                 * skipping would let a misconfigured allowlist pass
+                 * unflagged. */
+                zend_hash_destroy(*out_set);
+                efree(*out_set);
+                *out_set = NULL;
+                zend_type_error(
+                    "phpser_unserialize(): allowed_classes option must "
+                    "be an array of class names, %s given",
+                    zend_zval_value_name(cn));
+                return -1;
+            }
             zend_string *lc = zend_string_tolower(Z_STR_P(cn));
             zval one; ZVAL_TRUE(&one);
             zend_hash_add(*out_set, lc, &one);
@@ -1866,6 +1965,12 @@ PHP_FUNCTION(phpser_unserialize_signed) {
 #include "phpser_arginfo.h"
 
 static PHP_MINIT_FUNCTION(phpser) {
+#if defined(COMPILE_DL_PHPSER) && defined(ZTS)
+    /* Populate our TLS slot from the host PHP's thread-local state pointer.
+     * Required for dynamically-loaded extensions under ZTS — otherwise
+     * macros that touch CG/EG via the TSRMLS cache crash on lookup. */
+    ZEND_TSRMLS_CACHE_UPDATE();
+#endif
 #ifdef HAVE_PHP_SESSION
     /* Register session.serialize_handler = phpser. Best-effort: the session
      * extension may not be loaded (rare in shared-build setups), and we
@@ -1936,5 +2041,12 @@ zend_module_entry phpser_module_entry = {
     PHP_PHPSER_VERSION,
     STANDARD_MODULE_PROPERTIES,
 };
+
+/* Under ZTS, a dynamically-loaded extension needs its own TLS slot cache
+ * because the host PHP's per-thread state pointer isn't accessible
+ * through static linkage. Config defines ZEND_ENABLE_STATIC_TSRMLS_CACHE;
+ * the matching cache_define + cache_update at MINIT completes the wiring.
+ * On NTS builds both macros expand to nothing. */
+ZEND_TSRMLS_CACHE_DEFINE()
 
 ZEND_GET_MODULE(phpser)

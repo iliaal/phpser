@@ -3,10 +3,13 @@
 A PHP serialization extension in C, targeting read-heavy cache workloads
 where decode time matters more than encode time or payload size.
 
-Status: V2. Round-trip clean on primitives, arrays (packed/assoc/sparse/
-deleted), objects (stdClass + typed properties via `write_property`), and
-cycles (depth-capped at 4096 — IS_REFERENCE is flattened, see Limitations
-below). Pivoted from a Rust+rkyv prototype after the rkyv architecture
+Status: production-ready. Round-trip clean on primitives, arrays
+(packed/assoc/sparse/deleted), objects (stdClass + typed properties),
+references (`IS_REFERENCE` sharing preserved), object identity (back-refs
+collapse to TAG_REF), cycles, enums, `__serialize`/`__unserialize`,
+`__sleep`/`__wakeup`, and the legacy `Serializable` interface.
+`allowed_classes` option and HMAC-SHA256 signed-payload mode are
+supported. Pivoted from a Rust+rkyv prototype after the rkyv architecture
 failed to beat `pecl/igbinary` in opt-mode benchmarks — see
 `LEGACY-RKYV.md` for that journey and the data behind the pivot.
 
@@ -131,18 +134,18 @@ Then load alongside igbinary for the A/B bench:
 
 ## Limitations / known gaps
 
-- **`IS_REFERENCE` is flattened.** PHP's `&$x` references don't survive
-  round-trip — the value is encoded but the sharing isn't. For cache use
-  this matches what most users expect (cached values are value-shaped),
-  but it's a visible difference from `serialize()`/`unserialize()`. Full
-  shared-ref support is a future addition (TAG_SHARED + TAG_REF pair).
-- **Cyclic structures are capped at depth 4096.** Anything deeper turns
-  into `NULL` at the cap point. Pure value-shaped data never hits this;
-  it only fires when an `IS_REFERENCE` cycle would otherwise loop forever.
-- **`__wakeup` / `__unserialize` / `Serializable` aren't called.** Object
-  decode uses `object_init_ex` + `write_property` per slot. For classes
-  that rely on `__wakeup` to restore invariants, the resulting instance
-  is structurally correct but those hooks don't fire.
+- **Recursion depth is capped at 4096** on both encode and decode. Anything
+  deeper than 4096 nested containers / refs is rejected to bound stack
+  consumption against adversarial wire payloads. Object cycles are
+  preserved correctly via the id-table machinery and don't count against
+  this cap for shared-graph cases; the cap only fires on genuinely deep
+  trees.
+- **Closures and resources encode as `NULL`.** Same shape as PHP's own
+  `serialize()` — these types are inherently non-serializable.
+- **Unknown classes at decode fall back to `stdClass`** rather than PHP's
+  `__PHP_Incomplete_Class`. This is deliberate for the typical cache
+  workload; `allowed_classes => [...]` produces `__PHP_Incomplete_Class`
+  with the original name preserved for disallowed classes, matching PHP.
 - **`session.serialize_handler=phpser` is shipped** (compiled in when
   `phpize` detects the session extension; gated on `HAVE_PHP_SESSION` so
   the extension still loads on session-less PHP builds). `phpredis`

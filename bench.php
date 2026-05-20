@@ -1,7 +1,7 @@
 <?php
 // bench.php — A/B vs igbinary on shapes that actually show up in cache.
-// Run after: cargo build --release && cp target/release/librkyvser.so /path/to/php/ext/rkyvser.so
-// and add extension=rkyvser to php.ini (alongside extension=igbinary).
+// Run after: make && load both extensions, e.g.:
+//   php -d extension=./modules/phpser.so -d extension=igbinary.so bench.php
 
 declare(strict_types=1);
 
@@ -36,7 +36,7 @@ function mk_deep_nested(int $depth): array {
 function bench(string $label, $data, int $iters = 1000): void {
     // size
     $ig = igbinary_serialize($data);
-    $rk = rkyv_serialize($data);
+    $ps = phpser_serialize($data);
 
     // serialize timing
     $t = hrtime(true);
@@ -44,8 +44,8 @@ function bench(string $label, $data, int $iters = 1000): void {
     $ig_ser = (hrtime(true) - $t) / $iters;
 
     $t = hrtime(true);
-    for ($i = 0; $i < $iters; $i++) rkyv_serialize($data);
-    $rk_ser = (hrtime(true) - $t) / $iters;
+    for ($i = 0; $i < $iters; $i++) phpser_serialize($data);
+    $ps_ser = (hrtime(true) - $t) / $iters;
 
     // unserialize timing — read-heavy, the metric that matters
     $t = hrtime(true);
@@ -53,14 +53,14 @@ function bench(string $label, $data, int $iters = 1000): void {
     $ig_uns = (hrtime(true) - $t) / $iters;
 
     $t = hrtime(true);
-    for ($i = 0; $i < $iters; $i++) rkyv_unserialize($rk);
-    $rk_uns = (hrtime(true) - $t) / $iters;
+    for ($i = 0; $i < $iters; $i++) phpser_unserialize($ps);
+    $ps_uns = (hrtime(true) - $t) / $iters;
 
-    printf("%-22s | size: ig=%7d rk=%7d (%+5.1f%%) | ser ns: ig=%8.0f rk=%8.0f (%+5.1f%%) | uns ns: ig=%8.0f rk=%8.0f (%+5.1f%%)\n",
+    printf("%-22s | size: ig=%7d ps=%7d (%+5.1f%%) | ser ns: ig=%8.0f ps=%8.0f (%+5.1f%%) | uns ns: ig=%8.0f ps=%8.0f (%+5.1f%%)\n",
         $label,
-        strlen($ig), strlen($rk), (strlen($rk) - strlen($ig)) * 100.0 / strlen($ig),
-        $ig_ser, $rk_ser, ($rk_ser - $ig_ser) * 100.0 / $ig_ser,
-        $ig_uns, $rk_uns, ($rk_uns - $ig_uns) * 100.0 / $ig_uns);
+        strlen($ig), strlen($ps), (strlen($ps) - strlen($ig)) * 100.0 / strlen($ig),
+        $ig_ser, $ps_ser, ($ps_ser - $ig_ser) * 100.0 / $ig_ser,
+        $ig_uns, $ps_uns, ($ps_uns - $ig_uns) * 100.0 / $ig_uns);
 }
 
 // correctness first
@@ -78,7 +78,7 @@ $cases = [
 ];
 
 foreach ($cases as $k => $v) {
-    $rt = rkyv_unserialize(rkyv_serialize($v));
+    $rt = phpser_unserialize(phpser_serialize($v));
     if (serialize($rt) !== serialize($v)) {
         echo "ROUND-TRIP MISMATCH: $k\n";
         var_dump($v, $rt);
