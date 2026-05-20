@@ -104,14 +104,29 @@ static inline void emit_tag_and_varint(smart_str *s, uint8_t tag, uint64_t v) {
 }
 
 static inline int varint_read_u64(const uint8_t *buf, size_t buflen, size_t *pos, uint64_t *out) {
-    uint64_t v = 0;
-    int shift = 0;
-    while (*pos < buflen) {
-        uint8_t b = buf[(*pos)++];
+    /* Fast path: 1-byte varint (value < 128). The vast majority of varints
+     * in rowset-shaped payloads are dict_idx / key_idx values < 128, plus
+     * small assoc counts and key/value lengths. Inlining this case saves
+     * the loop init + bounds re-check that the multi-byte path needs. */
+    size_t p = *pos;
+    if (UNEXPECTED(p >= buflen)) return -1;
+    uint8_t b = buf[p];
+    if (EXPECTED((b & 0x80) == 0)) {
+        *out = b;
+        *pos = p + 1;
+        return 0;
+    }
+    /* Slow path: 2+ byte varint. */
+    uint64_t v = b & 0x7f;
+    p++;
+    int shift = 7;
+    while (p < buflen) {
+        b = buf[p++];
         if (shift >= 64) return -1;
         v |= ((uint64_t)(b & 0x7f)) << shift;
         if ((b & 0x80) == 0) {
             *out = v;
+            *pos = p;
             return 0;
         }
         shift += 7;
