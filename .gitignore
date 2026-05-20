@@ -5,3 +5,7 @@ modules/
 *.swo
 .idea/
 .vscode/
+codesage/
+.codesage/
+AGENTS.md
+CLAUDE.md
