@@ -29,6 +29,7 @@
 #include "Zend/zend_hash.h"
 
 #include "Zend/zend_enum.h"
+#include "ext/standard/php_incomplete_class.h"
 
 #ifdef HAVE_PHP_SESSION
 # include "ext/session/php_session.h"
@@ -838,8 +839,18 @@ typedef struct {
     zend_object **wakeup;
     uint32_t wakeup_len;
     uint32_t wakeup_cap;
+    /* allowed_classes: mirrors PHP unserialize()'s 2nd-arg option.
+     *   ALLOWED_ALL — no filter (default, or options['allowed_classes']===true)
+     *   ALLOWED_NONE — no classes; every object decodes to __PHP_Incomplete_Class
+     *   ALLOWED_SET — only classes in `allowed_set` decode normally
+     * The set is keyed by lowercased class name (PHP class names are
+     * case-insensitive). Owned by the caller of phpser_decode_buf. */
+    int allowed_mode;
+    HashTable *allowed_set;
     int error;
 } decode_ctx;
+
+enum { ALLOWED_ALL = 0, ALLOWED_NONE, ALLOWED_SET };
 
 /* Register the GC entity at `z` (must be IS_OBJECT or IS_REFERENCE), claiming
  * the next id. No refcount bump: the entity's primary owner (the parent
@@ -882,6 +893,32 @@ static int dec_defer_wakeup(decode_ctx *d, zend_object *obj) {
         d->wakeup = erealloc(d->wakeup, d->wakeup_cap * sizeof(zend_object *));
     }
     d->wakeup[d->wakeup_len++] = obj;
+    return 0;
+}
+
+/* Returns 1 if `class_name` is allowed by the current decode_ctx filter.
+ * The set is pre-lowercased on caller side. */
+static inline int dec_class_allowed(decode_ctx *d, zend_string *class_name) {
+    if (EXPECTED(d->allowed_mode == ALLOWED_ALL)) return 1;
+    if (d->allowed_mode == ALLOWED_NONE) return 0;
+    /* ALLOWED_SET: case-insensitive lookup. PHP class names are stored
+     * lowercased in the engine class table, and user-supplied names in
+     * allowed_classes get pre-lowercased into d->allowed_set. */
+    zend_string *lc = zend_string_tolower(class_name);
+    int ok = zend_hash_exists(d->allowed_set, lc);
+    zend_string_release(lc);
+    return ok;
+}
+
+/* Build an __PHP_Incomplete_Class instance with the original class name
+ * stored in the magic property. The caller decodes any subsequent props
+ * into this object; they land alongside the magic name. */
+static int dec_make_incomplete(zval *out, zend_string *original_class_name) {
+    if (object_init_ex(out, PHP_IC_ENTRY) != SUCCESS) {
+        ZVAL_NULL(out);
+        return -1;
+    }
+    php_store_class_name(out, original_class_name);
     return 0;
 }
 
@@ -1150,6 +1187,16 @@ static int decode_value(decode_ctx *d, zval *out) {
             zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
             if (!class_name) return -1;
 
+            /* allowed_classes filter: if this class is disallowed, build an
+             * incomplete-class instance and skip the legacy serializer
+             * payload. ce->unserialize would otherwise instantiate the real
+             * class, which the option exists to prevent. */
+            if (!dec_class_allowed(d, class_name)) {
+                d->pos += blen;
+                if (dec_make_incomplete(out, class_name) < 0) return -1;
+                dec_register(d, out);
+                return 0;
+            }
             zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
             if (!ce || ce->unserialize == NULL) {
                 /* Unknown class or no C-level unserializer — skip past the
@@ -1179,13 +1226,19 @@ static int decode_value(decode_ctx *d, zval *out) {
             zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
             if (!class_name) return -1;
 
-            zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
-            if (!ce) ce = zend_standard_class_def;
+            /* allowed_classes filter: build incomplete-class, decode the
+             * data array, and discard it. We still have to consume the
+             * data tree from the stream to keep id counts aligned. */
+            int allowed = dec_class_allowed(d, class_name);
+            zend_class_entry *ce = allowed
+                ? zend_lookup_class_ex(class_name, NULL, 0) : NULL;
+            if (!ce) ce = allowed ? zend_standard_class_def : PHP_IC_ENTRY;
 
             if (object_init_ex(out, ce) != SUCCESS) {
                 ZVAL_NULL(out);
                 return -1;
             }
+            if (!allowed) php_store_class_name(out, class_name);
             /* Register the empty object NOW, before decoding the data array.
              * A back-ref inside the data array can then resolve to this very
              * object (cycles through __serialize-class payloads). __unserialize
@@ -1203,7 +1256,7 @@ static int decode_value(decode_ctx *d, zval *out) {
                 zval_ptr_dtor(&data);
                 return -1;
             }
-            if (ce->__unserialize != NULL) {
+            if (allowed && ce->__unserialize != NULL) {
                 dec_defer_unserialize(d, Z_OBJ_P(out), &data);
                 /* Ownership of `data` transferred to deferred list. */
             } else {
@@ -1218,6 +1271,13 @@ static int decode_value(decode_ctx *d, zval *out) {
             zend_string *cname = dec_get_zstr(d, (uint32_t)class_idx);
             zend_string *casename = dec_get_zstr(d, (uint32_t)case_idx);
             if (!cname || !casename) return -1;
+            /* allowed_classes also gates enum cases. PHP's serialize emits
+             * enums as "E:..." and the filter applies the same as for O:. */
+            if (!dec_class_allowed(d, cname)) {
+                if (dec_make_incomplete(out, cname) < 0) return -1;
+                dec_register(d, out);
+                return 0;
+            }
             zend_class_entry *ce = zend_lookup_class_ex(cname, NULL, 0);
             if (!ce || !(ce->ce_flags & ZEND_ACC_ENUM)) return -1;
             zend_object *obj = zend_enum_get_case(ce, casename);
@@ -1235,16 +1295,23 @@ static int decode_value(decode_ctx *d, zval *out) {
             zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
             if (!class_name) return -1;
 
+            /* allowed_classes filter: disallowed classes decode into
+             * __PHP_Incomplete_Class with the original name attached as
+             * the magic property. Properties below still land via the
+             * normal IS_INDIRECT / dynamic-prop write path. */
+            int allowed = dec_class_allowed(d, class_name);
+            zend_class_entry *ce = allowed
+                ? zend_lookup_class_ex(class_name, NULL, 0) : PHP_IC_ENTRY;
             /* Resolve the class. If autoloading fails or the class doesn't
              * exist, fall back to stdClass — refusing would break round-trips
              * of payloads written before a class was registered. */
-            zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
             if (!ce) ce = zend_standard_class_def;
 
             if (object_init_ex(out, ce) != SUCCESS) {
                 ZVAL_NULL(out);
                 return -1;
             }
+            if (!allowed) php_store_class_name(out, class_name);
             zend_object *obj = Z_OBJ_P(out);
             /* Register before decoding properties so a back-ref inside a
              * property value (cycles, shared subobjects) can resolve to this
@@ -1374,11 +1441,19 @@ static zend_string *phpser_encode_zval(zval *value) {
 }
 
 /* Reusable decode: parse a framed payload into `out`. Returns 0 on success,
- * -1 on any framing/buffer error. On error, `out` is set to NULL. */
-static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
+ * -1 on any framing/buffer error. On error, `out` is set to NULL.
+ *
+ * allowed_mode + allowed_set control which classes can decode normally; the
+ * rest land in __PHP_Incomplete_Class. NULL/ALLOWED_ALL means no filter. */
+static int phpser_decode_buf_opts(
+    const char *str, size_t str_len, zval *out,
+    int allowed_mode, HashTable *allowed_set)
+{
     decode_ctx d = {0};
     d.buf = (const uint8_t *)str;
     d.len = str_len;
+    d.allowed_mode = allowed_mode;
+    d.allowed_set = allowed_set;
 
     if (decode_header(&d) < 0) {
         decode_destroy(&d);
@@ -1426,6 +1501,13 @@ done:
     decode_destroy(&d);
     return 0;
 }
+
+#ifdef HAVE_PHP_SESSION
+/* Back-compat wrapper for the session handler, which doesn't take options. */
+static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
+    return phpser_decode_buf_opts(str, str_len, out, ALLOWED_ALL, NULL);
+}
+#endif
 
 PHP_FUNCTION(phpser_serialize) {
     zval *value;
@@ -1476,10 +1558,53 @@ PS_SERIALIZER_DECODE_FUNC(phpser) {
 PHP_FUNCTION(phpser_unserialize) {
     char *str;
     size_t str_len;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
+    HashTable *options_ht = NULL;
+    ZEND_PARSE_PARAMETERS_START(1, 2)
         Z_PARAM_STRING(str, str_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(options_ht)
     ZEND_PARSE_PARAMETERS_END();
-    phpser_decode_buf(str, str_len, return_value);
+
+    int allowed_mode = ALLOWED_ALL;
+    HashTable *allowed_set = NULL;
+    if (options_ht) {
+        zval *ac = zend_hash_str_find(options_ht, "allowed_classes",
+                                       sizeof("allowed_classes") - 1);
+        if (ac) {
+            if (Z_TYPE_P(ac) == IS_FALSE) {
+                allowed_mode = ALLOWED_NONE;
+            } else if (Z_TYPE_P(ac) == IS_TRUE) {
+                allowed_mode = ALLOWED_ALL;
+            } else if (Z_TYPE_P(ac) == IS_ARRAY) {
+                /* Build a lowercased-name lookup set. PHP class names are
+                 * case-insensitive; storing pre-lowered keeps the per-object
+                 * filter check to one zend_hash_exists. */
+                allowed_mode = ALLOWED_SET;
+                allowed_set = emalloc(sizeof(HashTable));
+                zend_hash_init(allowed_set, zend_hash_num_elements(Z_ARRVAL_P(ac)),
+                               NULL, NULL, 0);
+                zval *cn;
+                ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ac), cn) {
+                    if (Z_TYPE_P(cn) != IS_STRING) continue;
+                    zend_string *lc = zend_string_tolower(Z_STR_P(cn));
+                    zval one; ZVAL_TRUE(&one);
+                    zend_hash_add(allowed_set, lc, &one);
+                    zend_string_release(lc);
+                } ZEND_HASH_FOREACH_END();
+            } else {
+                zend_argument_value_error(2,
+                    "allowed_classes option must be array or bool");
+                RETURN_THROWS();
+            }
+        }
+    }
+
+    phpser_decode_buf_opts(str, str_len, return_value, allowed_mode, allowed_set);
+
+    if (allowed_set) {
+        zend_hash_destroy(allowed_set);
+        efree(allowed_set);
+    }
 }
 
 /* -------------------------------------------------------------------------
