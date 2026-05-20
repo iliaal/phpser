@@ -173,18 +173,30 @@ typedef struct {
  * self-ref turns into an infinite chase without this counter. */
 #define MAX_DEPTH 4096
 
+/* Flat open-addressed identity table: (ptr → id). Linear probing on a
+ * power-of-2 sized bucket array; empty slot is ptr==0. Way tighter than
+ * the general zend_hash_index_* in the hot path — ~3-5 instructions per
+ * probe vs ~25 for the HT. Heap-allocated lazily on first visit so
+ * payloads with no objects/refs pay nothing. */
+typedef struct {
+    uintptr_t ptr;   /* 0 = empty */
+    uint32_t  id;
+} id_entry;
+
 typedef struct {
     intern_slot inline_cache[INTERN_CACHE_SIZE];
     uint32_t cache_filled;
     uint32_t cache_next;
     HashTable hash_map;
-    /* Per-payload id table: maps (uintptr_t)(zend_object*|zend_reference*)
-     * to a uint32 id assigned in encounter order. First visit emits the
-     * usual container tag (which claims the next id); subsequent visits
-     * emit TAG_REF + id. Preserves object handle identity (PHP's `r:N`)
-     * and IS_REFERENCE sharing (`R:N`), plus terminates cycles in plain
-     * object graphs without losing the back-edge. */
-    HashTable id_assignments;
+    /* Per-payload id table for (zend_object*|zend_reference*) → uint32 id
+     * assigned in encounter order. First visit emits the usual container
+     * tag (claiming the next id implicitly); subsequent visits emit
+     * TAG_REF + id. Preserves object handle identity (PHP's `r:N`) and
+     * IS_REFERENCE sharing (`R:N`), and terminates cycles without
+     * losing back-edges. */
+    id_entry *id_buckets;
+    uint32_t id_mask;       /* capacity - 1, capacity is power of 2; 0 means unallocated */
+    uint32_t id_count;
     uint32_t next_id;
     zend_string **dict;
     uint32_t dict_len;
@@ -197,7 +209,9 @@ static void enc_ctx_init(encode_ctx *e) {
     e->cache_filled = 0;
     e->cache_next = 0;
     zend_hash_init(&e->hash_map, 16, NULL, NULL, 0);
-    zend_hash_init(&e->id_assignments, 8, NULL, NULL, 0);
+    e->id_buckets = NULL;
+    e->id_mask = 0;
+    e->id_count = 0;
     e->next_id = 0;
     e->dict = NULL;
     e->dict_len = 0;
@@ -207,26 +221,60 @@ static void enc_ctx_init(encode_ctx *e) {
 
 static void enc_ctx_destroy(encode_ctx *e) {
     zend_hash_destroy(&e->hash_map);
-    zend_hash_destroy(&e->id_assignments);
+    if (e->id_buckets) efree(e->id_buckets);
     if (e->dict) efree(e->dict);
 }
 
+/* Mix the pointer down: object/reference allocations are 8/16-byte aligned,
+ * so the low bits are useless. A Fibonacci-style multiply spreads them. */
+static inline uint32_t id_hash(uintptr_t p) {
+    return (uint32_t)((p * 11400714819323198485ULL) >> 32);
+}
+
+static void enc_id_grow(encode_ctx *e) {
+    uint32_t new_cap = e->id_mask ? (e->id_mask + 1) * 2 : 16;
+    id_entry *new_buckets = ecalloc(new_cap, sizeof(id_entry));
+    uint32_t new_mask = new_cap - 1;
+    if (e->id_buckets) {
+        for (uint32_t i = 0; i <= e->id_mask; i++) {
+            uintptr_t p = e->id_buckets[i].ptr;
+            if (!p) continue;
+            uint32_t h = id_hash(p) & new_mask;
+            while (new_buckets[h].ptr) h = (h + 1) & new_mask;
+            new_buckets[h] = e->id_buckets[i];
+        }
+        efree(e->id_buckets);
+    }
+    e->id_buckets = new_buckets;
+    e->id_mask = new_mask;
+}
+
 /* Returns 1 if this is the first time we've seen `ptr`, with the assigned
- * id written into *out_id (you don't actually need the id on first-visit
- * since the wire format claims it implicitly via encounter order — but
- * it's useful for debugging / sanity asserts).
+ * id written into *out_id (decoder doesn't need it on first-visit since the
+ * wire format claims it implicitly via encounter order, but it's useful for
+ * debugging / sanity asserts).
  *
  * Returns 0 if `ptr` is a repeat; *out_id holds its previously-assigned id. */
 static inline int enc_visit(encode_ctx *e, void *ptr, uint32_t *out_id) {
-    zend_ulong key = (zend_ulong)(uintptr_t)ptr;
-    zval *hit = zend_hash_index_find(&e->id_assignments, key);
-    if (hit) {
-        *out_id = (uint32_t)Z_LVAL_P(hit);
-        return 0;
+    /* Grow when load factor would exceed 50% (cap is power of 2; count+1
+     * after this call must not exceed cap/2). Keeps probe chains short. */
+    if (UNEXPECTED((e->id_count + 1) * 2 > e->id_mask + 1)) {
+        enc_id_grow(e);
+    }
+    uintptr_t pp = (uintptr_t)ptr;
+    uint32_t h = id_hash(pp) & e->id_mask;
+    id_entry *buckets = e->id_buckets;
+    while (buckets[h].ptr) {
+        if (buckets[h].ptr == pp) {
+            *out_id = buckets[h].id;
+            return 0;
+        }
+        h = (h + 1) & e->id_mask;
     }
     uint32_t id = e->next_id++;
-    zval iz; ZVAL_LONG(&iz, id);
-    zend_hash_index_add(&e->id_assignments, key, &iz);
+    buckets[h].ptr = pp;
+    buckets[h].id = id;
+    e->id_count++;
     *out_id = id;
     return 1;
 }
@@ -669,17 +717,32 @@ typedef struct {
     zval data;
 } deferred_unserialize;
 
+/* Entry kind discriminates how a back-ref reconstitutes the zval. We can't
+ * store a zval pointer (the slot location isn't stable across HT growth),
+ * and we don't want to bump refcount per registration in the no-sharing
+ * case. So we store the bare GC entity + a kind tag, and addref only when
+ * a back-ref actually hits. The entity stays alive via its primary owning
+ * slot for the duration of the decode pass. */
+enum { ID_OBJ, ID_REF, ID_NULL };
+
+typedef struct {
+    uint8_t kind;
+    union {
+        zend_object    *obj;
+        zend_reference *ref;
+    } u;
+} id_slot;
+
 typedef struct {
     const uint8_t *buf;
     size_t len;
     size_t pos;
     zend_string **dict;        /* eagerly allocated zend_strings per slot */
     uint32_t dict_len;
-    /* id_table holds one zval per registered container (object/reference).
-     * The slot holds a refcount on the underlying zend_object or
-     * zend_reference; we release them in decode_destroy after PHP has
-     * taken its own refs via the returned root zval. */
-    zval *id_table;
+    /* id_table maps encounter-order id → primary GC entity. NOT refcounted:
+     * the entity is owned by its primary slot in the materialized graph;
+     * back-refs addref at copy time only. */
+    id_slot *id_table;
     uint32_t id_table_len;
     uint32_t id_table_cap;
     deferred_unserialize *deferred;
@@ -688,16 +751,27 @@ typedef struct {
     int error;
 } decode_ctx;
 
-/* Register `z` in the id_table, claiming the next id. The slot stores an
- * addref'd copy via ZVAL_COPY so back-refs can resolve to the in-progress
- * container before its contents are fully decoded. */
+/* Register the GC entity at `z` (must be IS_OBJECT or IS_REFERENCE), claiming
+ * the next id. No refcount bump: the entity's primary owner (the parent
+ * container slot we just wrote into) keeps it alive for the decode pass. */
 static int dec_register(decode_ctx *d, zval *z) {
     if (d->id_table_len == d->id_table_cap) {
         d->id_table_cap = d->id_table_cap ? d->id_table_cap * 2 : 16;
-        d->id_table = erealloc(d->id_table, d->id_table_cap * sizeof(zval));
+        d->id_table = erealloc(d->id_table, d->id_table_cap * sizeof(id_slot));
     }
-    ZVAL_COPY(&d->id_table[d->id_table_len], z);
-    d->id_table_len++;
+    id_slot *s = &d->id_table[d->id_table_len++];
+    if (Z_TYPE_P(z) == IS_OBJECT) {
+        s->kind = ID_OBJ;
+        s->u.obj = Z_OBJ_P(z);
+    } else if (Z_TYPE_P(z) == IS_REFERENCE) {
+        s->kind = ID_REF;
+        s->u.ref = Z_REF_P(z);
+    } else {
+        /* Encoder always claimed an id for this slot; we must register
+         * something to keep id counts aligned. Back-refs to a NULL slot
+         * yield NULL on the decode side. */
+        s->kind = ID_NULL;
+    }
     return 0;
 }
 
@@ -756,9 +830,7 @@ static void decode_destroy(decode_ctx *d) {
         efree(d->dict);
     }
     if (d->id_table) {
-        for (uint32_t i = 0; i < d->id_table_len; i++) {
-            zval_ptr_dtor(&d->id_table[i]);
-        }
+        /* Entries are raw pointers (no refcount held); just free the table. */
         efree(d->id_table);
     }
     if (d->deferred) {
@@ -817,8 +889,13 @@ static int decode_value(decode_ctx *d, zval *out) {
             uint64_t id;
             if (varint_read_u64(d->buf, d->len, &d->pos, &id) < 0) return -1;
             if (id >= d->id_table_len) return -1;
-            ZVAL_COPY(out, &d->id_table[id]);
-            return 0;
+            id_slot *s = &d->id_table[id];
+            switch (s->kind) {
+                case ID_OBJ:  ZVAL_OBJ_COPY(out, s->u.obj); return 0;
+                case ID_REF:  ZVAL_REF(out, s->u.ref); GC_ADDREF(s->u.ref); return 0;
+                case ID_NULL: ZVAL_NULL(out); return 0;
+            }
+            return -1;
         }
         case TAG_NEW_REF: {
             /* Allocate the zend_reference now and register it BEFORE
