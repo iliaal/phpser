@@ -964,9 +964,12 @@ typedef struct {
     size_t pos;
     zend_string **dict;        /* eagerly allocated zend_strings per slot */
     uint32_t dict_len;
-    /* id_table maps encounter-order id → primary GC entity. NOT refcounted:
-     * the entity is owned by its primary slot in the materialized graph;
-     * back-refs addref at copy time only. */
+    /* id_table maps encounter-order id → primary GC entity. Holds an
+     * explicit refcount per entry (CR-001 fix): without it, a crafted
+     * payload with a duplicate assoc/property key can let zend_hash_update
+     * destroy the only bucket holding the entity while id_table still
+     * points at it, and a later TAG_REF deref's freed memory. The addref
+     * is released by decode_destroy. */
     id_slot *id_table;
     uint32_t id_table_len;
     uint32_t id_table_cap;
@@ -1503,9 +1506,12 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             zend_string *class_name = dec_get_zstr(d, class_idx);
             if (!class_name) return -1;
 
-            /* allowed_classes filter: build incomplete-class, decode the
-             * data array, and discard it. We still have to consume the
-             * data tree from the stream to keep id counts aligned. */
+            /* allowed_classes filter: build incomplete-class and decode
+             * the data array; the array is then applied as dynamic
+             * properties via dec_apply_data_as_props (round-3 fix —
+             * matches PHP's behavior of preserving serialized state on
+             * __PHP_Incomplete_Class). We must consume the data tree
+             * from the stream either way to keep id counts aligned. */
             int allowed = dec_class_allowed(d, class_name);
             zend_class_entry *ce = allowed
                 ? zend_lookup_class_ex(class_name, NULL, 0) : NULL;
