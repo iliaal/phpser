@@ -74,7 +74,7 @@ DTO workloads (Laravel-queue-style payloads, single-class arrays):
 dedup on prop names + the class-entry lookup cache that amortizes
 `zend_lookup_class_ex` across same-typed batches.
 
-`rowset_100` encode (+30%) is the durable gap — fixed-cost floor for
+`rowset_100` encode (+30%) is the durable gap: a fixed-cost floor for
 the dict header emission and first-row inline emissions, amortized
 over too few rows to recover. The absolute time is small (11 µs for
 the entire 100-row payload). Decode is essentially at parity (per-run
@@ -84,7 +84,7 @@ policy keeps `['a','b','c']`-style repeated values in DICT slots so
 instead of falling back to `PACKED_MIXED` mid-rowset.
 
 `dto_mixed` encode (+42%) is the durable encode gap on object-heavy
-shapes — `obj->handlers->get_properties` is called per object and
+shapes: `obj->handlers->get_properties` is called per object and
 isn't trivially avoidable without a custom fast path for default
 property layouts.
 
@@ -100,11 +100,11 @@ The core ideas that drive the perf wins above:
   `compact_strings`, except we emit the table once at the head and
   reference by varint index from values. Trade-off: not streamable.
 - **Refcount-reuse of zend_strings on decode.** Per-decode cache parallel
-  to the dict — first reference allocates, subsequent ones `addref`.
+  to the dict. First reference allocates, subsequent ones `addref`.
 - **HT_IS_PACKED detection via flag, not iteration.** Avoid scanning the
   buckets just to determine layout.
 - **`arPacked` stride awareness.** PHP 8+'s packed-array layout stores
-  zvals directly, not Buckets — stride is 16, not 32.
+  zvals directly, not Buckets. Stride is 16, not 32.
 - **Sparse-packed fallback.** Arrays with holes (post-`unset`) preserve
   original int keys via Assoc rather than silently re-indexing.
 
@@ -136,24 +136,25 @@ measurable perf to take, and that this project targets, are:
    Reverted to `zend_hash_update` for security-boundary correctness;
    `add_new` is a real but small perf win the cost of breaking adversarial
    payloads cleanly. **Shipped.**
-6. **Inline-short-string tag — shipped via upgrade-on-second-encounter.**
+6. **Inline-short-string tag with upgrade-on-second-encounter.**
    `TAG_STR_INLINE` (0x0c) and `KEY_STR_INLINE` (0x02) are emitted on a
    string's first occurrence; the next occurrence triggers an in-place
    upgrade to a dict entry, and all subsequent ones emit `TAG_STR_DICT`.
    Singletons (e.g. `row_X` values in a rowset) never hit the upgrade
-   branch — they cost nothing in the dict header. The intern cache
+   branch. They cost nothing in the dict header. The intern cache
    doubles as the "seen once?" signal: high bit of `idx` distinguishes
    `INLINE_EMITTED` from `DICT_IDX`. No pre-pass; single walk of the
    zval tree as before.
 
-   This is approach B from the design notes. An earlier attempt at the
-   two-pass version (approach A — count-then-emit) hit the
-   ~200-ns-per-string cost of the count pre-pass, which exceeded the
-   per-singleton savings; we left A out and shipped B. Effect:
-   `rowset_1000` encode improved from -8% to -20% to -25% vs igbinary;
-   payload size dropped from +5% to +2.7%.
+   A count-then-emit variant was tried first: pre-walk the zval tree
+   to tag occurrences, then emit inline for singletons and dict for
+   repeats. The pre-pass cost ~200 ns per string and ate the
+   per-singleton savings, so the single-walk upgrade-on-second-encounter
+   version above is what ships. `rowset_1000` encode landed at 25%
+   faster than igbinary (up from 8% in the pre-upgrade implementation),
+   with payload size dropping from +5% to +2.7%.
 7. **Skip refcount machinery during build.** All zvals built during decode
-   are fresh and unshared until handed back to PHP — internal writes can
+   are fresh and unshared until handed back to PHP. Internal writes can
    skip `Z_TRY_ADDREF` guards.
 
 ## Local dev build
@@ -189,7 +190,7 @@ as a `session.serialize_handler` when available.
   this cap for shared-graph cases; the cap only fires on genuinely deep
   trees.
 - **Closures and resources encode as `NULL`.** Same shape as PHP's own
-  `serialize()` — these types are inherently non-serializable.
+  `serialize()`; these types are inherently non-serializable.
 - **Unknown classes at decode fall back to `stdClass`** rather than PHP's
   `__PHP_Incomplete_Class`. This is deliberate for the typical cache
   workload; `allowed_classes => [...]` produces `__PHP_Incomplete_Class`
@@ -197,7 +198,7 @@ as a `session.serialize_handler` when available.
 - **`session.serialize_handler=phpser` is shipped** (compiled in when
   `phpize` detects the session extension; gated on `HAVE_PHP_SESSION` so
   the extension still loads on session-less PHP builds). `phpredis`
-  integration is not yet wired — call `phpser_serialize`/`unserialize`
+  integration is not yet wired; call `phpser_serialize`/`unserialize`
   directly when using the extension as a phpredis serializer.
 
 ## Wire format (V1)
@@ -220,15 +221,15 @@ value tags:
   0x08 PACKED_LONGS    varint(len), N×zigzag-varint
   0x09 PACKED_DOUBLES  varint(len), N×8-byte LE
   0x0a OBJECT          varint(class_idx), varint(nprops), N×(key_idx, val)
-  0x0b PACKED_STRINGS  varint(len), N×varint(dict_idx)  — typed string run
-  0x0c STR_INLINE      varint(len), bytes  — single-use string, skips dict
+  0x0b PACKED_STRINGS  varint(len), N×varint(dict_idx)  // typed string run
+  0x0c STR_INLINE      varint(len), bytes  // single-use string, skips dict
   0x0d ENUM            varint(class_idx), varint(case_name_idx)
-  0x0e OBJECT_MAGIC    varint(class_idx), value  — class with __serialize;
-                       value is the array __serialize returned
-  0x0f OBJECT_LEGACY   varint(class_idx), varint(len), bytes  — class with
-                       ce->serialize / ce->unserialize (Serializable etc.)
-  0x10 REF             varint(id)  — back-ref to a previously-emitted container
-  0x11 NEW_REF         value  — claims the next id for an IS_REFERENCE wrap
+  0x0e OBJECT_MAGIC    varint(class_idx), value  // class with __serialize;
+                       // value is the array __serialize returned
+  0x0f OBJECT_LEGACY   varint(class_idx), varint(len), bytes  // class with
+                       // ce->serialize / ce->unserialize (Serializable etc.)
+  0x10 REF             varint(id)  // back-ref to a previously-emitted container
+  0x11 NEW_REF         value  // claims the next id for an IS_REFERENCE wrap
 
 key tags:
   0x00 LONG            varint(zigzag)
