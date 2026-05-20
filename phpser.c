@@ -164,6 +164,14 @@ typedef struct {
     uint32_t cache_filled;
     uint32_t cache_next;
     HashTable hash_map;
+    /* Object handles we've already started encoding in this payload. Used
+     * to break cycles where two objects point at each other through a
+     * non-IS_REFERENCE prop (PHP objects pass by handle). The depth counter
+     * alone can't bound this — a parent/N-children/each-references-parent
+     * shape grows N^depth before the cap fires, which OOMs fast.
+     * Until we ship full shared-ref support (TAG_SHARED/TAG_REF), repeat
+     * visits of the same object handle emit NULL. */
+    HashTable visited_objs;
     zend_string **dict;
     uint32_t dict_len;
     uint32_t dict_cap;
@@ -175,6 +183,7 @@ static void enc_ctx_init(encode_ctx *e) {
     e->cache_filled = 0;
     e->cache_next = 0;
     zend_hash_init(&e->hash_map, 16, NULL, NULL, 0);
+    zend_hash_init(&e->visited_objs, 8, NULL, NULL, 0);
     e->dict = NULL;
     e->dict_len = 0;
     e->dict_cap = 0;
@@ -183,6 +192,7 @@ static void enc_ctx_init(encode_ctx *e) {
 
 static void enc_ctx_destroy(encode_ctx *e) {
     zend_hash_destroy(&e->hash_map);
+    zend_hash_destroy(&e->visited_objs);
     if (e->dict) efree(e->dict);
 }
 
@@ -384,6 +394,15 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
             return;
         case IS_OBJECT: {
             zend_object *obj = Z_OBJ_P(v);
+            /* Classes marked NOT_SERIALIZABLE (Closure, Generator, internal
+             * resources etc.) can't be reconstructed by object_init_ex —
+             * their create_object handlers reject external instantiation.
+             * Emit NULL like PHP's serialize() does (modulo the userland
+             * error PHP raises that we don't expose yet). */
+            if (obj->ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
+                smart_str_appendc(body, TAG_NULL);
+                return;
+            }
             /* Enums are class-controlled singletons — object_init_ex won't
              * recreate them on the decode side. Emit class + case name so
              * we can resolve via zend_enum_get_case during decode. */
@@ -395,6 +414,18 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 varint_write_u64(body, case_idx);
                 return;
             }
+            /* Cycle guard: emit NULL on revisit instead of recursing. Object
+             * cycles via plain property pointers (no IS_REFERENCE involved)
+             * can branch — N children, each pointing at the parent — and
+             * blow up exponentially before the depth cap fires. */
+            zend_ulong handle_key = (zend_ulong)obj->handle;
+            if (zend_hash_index_exists(&e->visited_objs, handle_key)) {
+                smart_str_appendc(body, TAG_NULL);
+                return;
+            }
+            zval marker; ZVAL_NULL(&marker);
+            zend_hash_index_add(&e->visited_objs, handle_key, &marker);
+
             uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
             HashTable *props = obj->handlers->get_properties(obj);
             /* Count live entries — get_properties can include $this-style
