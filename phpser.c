@@ -10,10 +10,15 @@
  *   - Sparse-packed (post-unset) arrays preserve original int keys via Assoc.
  */
 #include "php.h"
+#include "php_phpser.h"
 #include "ext/standard/info.h"
 #include "Zend/zend_API.h"
 #include "Zend/zend_smart_str.h"
 #include "Zend/zend_hash.h"
+
+#ifdef HAVE_PHP_SESSION
+# include "ext/session/php_session.h"
+#endif
 
 #include <stdint.h>
 #include <string.h>
@@ -666,12 +671,10 @@ static int decode_value(decode_ctx *d, zval *out) {
  * Public functions.
  * ------------------------------------------------------------------------- */
 
-PHP_FUNCTION(phpser_serialize) {
-    zval *value;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_ZVAL(value)
-    ZEND_PARSE_PARAMETERS_END();
-
+/* Reusable encode: produce a framed payload zend_string from a zval.
+ * Caller owns the returned zend_string. Never returns NULL — worst case
+ * is an empty TAG_NULL body. */
+static zend_string *phpser_encode_zval(zval *value) {
     encode_ctx ctx;
     enc_ctx_init(&ctx);
 
@@ -694,9 +697,76 @@ PHP_FUNCTION(phpser_serialize) {
     smart_str_0(&out);
 
     enc_ctx_destroy(&ctx);
-
-    RETVAL_STR(out.s);
+    return out.s;
 }
+
+/* Reusable decode: parse a framed payload into `out`. Returns 0 on success,
+ * -1 on any framing/buffer error. On error, `out` is set to NULL. */
+static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
+    decode_ctx d = {0};
+    d.buf = (const uint8_t *)str;
+    d.len = str_len;
+
+    if (decode_header(&d) < 0) {
+        decode_destroy(&d);
+        ZVAL_NULL(out);
+        return -1;
+    }
+    if (decode_value(&d, out) < 0) {
+        zval_ptr_dtor(out);
+        ZVAL_NULL(out);
+        decode_destroy(&d);
+        return -1;
+    }
+    decode_destroy(&d);
+    return 0;
+}
+
+PHP_FUNCTION(phpser_serialize) {
+    zval *value;
+    ZEND_PARSE_PARAMETERS_START(1, 1)
+        Z_PARAM_ZVAL(value)
+    ZEND_PARSE_PARAMETERS_END();
+    RETVAL_STR(phpser_encode_zval(value));
+}
+
+/* -------------------------------------------------------------------------
+ * Session serializer integration. Gated on HAVE_PHP_SESSION (set by config.m4
+ * when phpize detects the session extension). Compiled out under the local
+ * dev Makefile, which doesn't define the macro.
+ * ------------------------------------------------------------------------- */
+
+#ifdef HAVE_PHP_SESSION
+PS_SERIALIZER_ENCODE_FUNC(phpser) {
+    /* PS(http_session_vars) is the $_SESSION zval reference. Deref before
+     * encoding so the wire format stores a plain array, not IS_REFERENCE. */
+    zval *session_vars = &PS(http_session_vars);
+    if (Z_TYPE_P(session_vars) == IS_REFERENCE) {
+        session_vars = Z_REFVAL_P(session_vars);
+    }
+    return phpser_encode_zval(session_vars);
+}
+
+PS_SERIALIZER_DECODE_FUNC(phpser) {
+    zval decoded;
+    if (phpser_decode_buf(val, vallen, &decoded) < 0) {
+        return FAILURE;
+    }
+    /* Sessions expect an array on the way back; if the payload decoded to
+     * something else, swap in an empty array so PS(http_session_vars) stays
+     * sane for $_SESSION. */
+    if (Z_TYPE(decoded) != IS_ARRAY) {
+        zval_ptr_dtor(&decoded);
+        array_init(&decoded);
+    }
+    if (!Z_ISUNDEF(PS(http_session_vars))) {
+        zval_ptr_dtor(&PS(http_session_vars));
+    }
+    ZVAL_NEW_REF(&PS(http_session_vars), &decoded);
+    Z_ADDREF_P(&PS(http_session_vars));
+    return SUCCESS;
+}
+#endif /* HAVE_PHP_SESSION */
 
 PHP_FUNCTION(phpser_unserialize) {
     char *str;
@@ -704,20 +774,7 @@ PHP_FUNCTION(phpser_unserialize) {
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_STRING(str, str_len)
     ZEND_PARSE_PARAMETERS_END();
-
-    decode_ctx d = {0};
-    d.buf = (const uint8_t *)str;
-    d.len = str_len;
-
-    if (decode_header(&d) < 0) {
-        decode_destroy(&d);
-        RETURN_NULL();
-    }
-    if (decode_value(&d, return_value) < 0) {
-        zval_ptr_dtor(return_value);
-        ZVAL_NULL(return_value);
-    }
-    decode_destroy(&d);
+    phpser_decode_buf(str, str_len, return_value);
 }
 
 /* -------------------------------------------------------------------------
@@ -738,19 +795,39 @@ static const zend_function_entry phpser_functions[] = {
     PHP_FE_END
 };
 
+static PHP_MINIT_FUNCTION(phpser) {
+#ifdef HAVE_PHP_SESSION
+    /* Register session.serialize_handler = phpser. Best-effort: the session
+     * extension may not be loaded (rare in shared-build setups), and we
+     * tolerate that case silently. */
+    php_session_register_serializer(
+        PHP_PHPSER_EXTNAME,
+        PS_SERIALIZER_ENCODE_NAME(phpser),
+        PS_SERIALIZER_DECODE_NAME(phpser));
+#endif
+    return SUCCESS;
+}
+
 static PHP_MINFO_FUNCTION(phpser) {
     php_info_print_table_start();
     php_info_print_table_row(2, "phpser support", "enabled");
+    php_info_print_table_row(2, "version", PHP_PHPSER_VERSION);
+#ifdef HAVE_PHP_SESSION
+    php_info_print_table_row(2, "session.serialize_handler", "available");
+#else
+    php_info_print_table_row(2, "session.serialize_handler", "disabled (compiled without session)");
+#endif
     php_info_print_table_end();
 }
 
 zend_module_entry phpser_module_entry = {
     STANDARD_MODULE_HEADER,
-    "phpser",
+    PHP_PHPSER_EXTNAME,
     phpser_functions,
-    NULL, NULL, NULL, NULL,
+    PHP_MINIT(phpser),
+    NULL, NULL, NULL,
     PHP_MINFO(phpser),
-    "0.1.0",
+    PHP_PHPSER_VERSION,
     STANDARD_MODULE_PROPERTIES,
 };
 

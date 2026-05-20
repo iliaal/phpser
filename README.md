@@ -86,14 +86,30 @@ measurable perf to take, and that this project targets, are:
 
 ## Build
 
-phpser uses the standard PHP extension build system. Targets in-tree
-`~/php-src-8.4-opt` via a wrapper php-config:
+### Standard PECL build (against any installed PHP)
 
 ```sh
-phpize --with-php-config=$(pwd)/scripts/php-config-intree-opt
-./configure --with-php-config=$(pwd)/scripts/php-config-intree-opt
+phpize
+./configure --enable-phpser
 make -j$(nproc)
+sudo make install
 ```
+
+The `config.m4` auto-detects the session extension and registers phpser
+as a `session.serialize_handler` when available.
+
+### Local dev build (no install required)
+
+The hand-rolled `Makefile` builds against the in-tree `~/php-src-8.4-opt`
+without `phpize`/`autoconf`. Useful for hacking on the extension while
+also hacking on PHP itself:
+
+```sh
+make -j$(nproc)           # builds modules/phpser.so
+make test                 # runs tests/*.phpt via run-tests.php
+```
+
+Override `PHP_SRC=` to target a different in-tree PHP checkout.
 
 Then load alongside igbinary for the A/B bench:
 
@@ -118,8 +134,11 @@ Then load alongside igbinary for the A/B bench:
   decode uses `object_init_ex` + `write_property` per slot. For classes
   that rely on `__wakeup` to restore invariants, the resulting instance
   is structurally correct but those hooks don't fire.
-- **No `phpredis`/`session.serialize_handler` integration yet.** You call
-  `phpser_serialize`/`phpser_unserialize` directly.
+- **`session.serialize_handler=phpser` is shipped** (compiled in when
+  `phpize` detects the session extension; gated on `HAVE_PHP_SESSION` so
+  the extension still loads on session-less PHP builds). `phpredis`
+  integration is not yet wired — call `phpser_serialize`/`unserialize`
+  directly when using the extension as a phpredis serializer.
 
 ## Wire format (V1)
 

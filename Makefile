@@ -44,5 +44,17 @@ modules:
 clean:
 	rm -f $(OBJS) $(TARGET)
 	rm -rf modules
+	rm -rf tests/*.diff tests/*.out tests/*.exp tests/*.log tests/*.sh
 
-.PHONY: clean
+# Run the .phpt test suite via the PHP build's run-tests.php. TEST_PHP_ARGS
+# is what run-tests.php injects into every child PHP process — passing
+# `-d extension=...` to our parent invocation wouldn't propagate.
+test: $(TARGET)
+	TEST_PHP_EXECUTABLE=$(PHP_SRC)/sapi/cli/php \
+	TEST_PHP_ARGS="-d extension=$(CURDIR)/$(TARGET)" \
+	$(PHP_SRC)/sapi/cli/php \
+	  $(PHP_SRC)/run-tests.php \
+	  -P -q --show-diff \
+	  $(CURDIR)/tests
+
+.PHONY: clean test
