@@ -1,0 +1,19 @@
+[package]
+name = "rkyvser"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ext-php-rs = "0.15"
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck", "pointer_width_64"] }
+bytecheck = "0.8"
+ahash = { version = "0.8", default-features = false, features = ["std"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+panic = "abort"

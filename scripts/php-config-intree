@@ -1,0 +1,20 @@
+#!/bin/sh
+# Wrapper php-config that returns in-tree paths for ~/php-src-8.4.
+# Avoids `make install` so we don't pollute /usr/local.
+SRC="$HOME/php-src-8.4"
+case "$1" in
+--includes)       echo "-I$SRC -I$SRC/main -I$SRC/TSRM -I$SRC/Zend -I$SRC/ext -I$SRC/ext/date/lib" ;;
+--prefix)         echo "$SRC" ;;
+--php-binary)     echo "$SRC/sapi/cli/php" ;;
+--extension-dir)  echo "$SRC/modules" ;;
+--include-dir)    echo "$SRC" ;;
+--lib-dir)        echo "$SRC/libs" ;;
+--version)        echo "8.4.22-dev" ;;
+--vernum)         echo "80422" ;;
+--ldflags)        echo "" ;;
+--libs)           echo "" ;;
+--configure-options) echo "" ;;
+--php-sapis)      echo "cli" ;;
+*)                exit 0 ;;
+esac
+exit 0
