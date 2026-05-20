@@ -851,6 +851,12 @@ typedef struct {
      * case-insensitive). Owned by the caller of phpser_decode_buf. */
     int allowed_mode;
     HashTable *allowed_set;
+    /* C-stack recursion guard: TAG_NEW_REF / TAG_PACKED_MIXED / TAG_ASSOC /
+     * TAG_OBJECT / TAG_OBJECT_MAGIC all recurse through decode_value.
+     * Without a cap, attacker-controlled wire format can blow the pthread
+     * stack at ~100K nested frames. Bracket decode_value with ++/-- and
+     * reject when >= MAX_DEPTH. */
+    uint32_t depth;
     int error;
 } decode_ctx;
 
@@ -885,6 +891,12 @@ static int dec_defer_unserialize(decode_ctx *d, zend_object *obj, zval *data) {
         d->deferred_cap = d->deferred_cap ? d->deferred_cap * 2 : 4;
         d->deferred = erealloc(d->deferred, d->deferred_cap * sizeof(deferred_unserialize));
     }
+    /* Hold a ref while queued. The deferred __unserialize call runs user
+     * PHP, which can drop references that would otherwise free `obj`. PHP's
+     * COW separates the $data param so deferred[i].data is safe, but the
+     * obj pointer needs explicit ownership for symmetry with the wakeup
+     * queue. Released in decode_destroy. */
+    GC_ADDREF(obj);
     d->deferred[d->deferred_len].obj = obj;
     ZVAL_COPY_VALUE(&d->deferred[d->deferred_len].data, data);
     d->deferred_len++;
@@ -896,6 +908,11 @@ static int dec_defer_wakeup(decode_ctx *d, zend_object *obj) {
         d->wakeup_cap = d->wakeup_cap ? d->wakeup_cap * 2 : 4;
         d->wakeup = erealloc(d->wakeup, d->wakeup_cap * sizeof(zend_object *));
     }
+    /* Hold a ref while queued. An earlier wakeup hook can mutate its own
+     * properties to drop the last reference to a sibling object that's
+     * also queued; without this addref the next iteration deref's a freed
+     * pointer (UAF). Released in decode_destroy. */
+    GC_ADDREF(obj);
     d->wakeup[d->wakeup_len++] = obj;
     return 0;
 }
@@ -975,13 +992,15 @@ static void decode_destroy(decode_ctx *d) {
     }
     if (d->deferred) {
         for (uint32_t i = 0; i < d->deferred_len; i++) {
+            OBJ_RELEASE(d->deferred[i].obj);
             zval_ptr_dtor(&d->deferred[i].data);
         }
         efree(d->deferred);
     }
     if (d->wakeup) {
-        /* Bare pointer table — no refs held; the wakeup target stays alive
-         * via its primary slot in the materialized graph. */
+        for (uint32_t i = 0; i < d->wakeup_len; i++) {
+            OBJ_RELEASE(d->wakeup[i]);
+        }
         efree(d->wakeup);
     }
 }
@@ -1026,7 +1045,46 @@ static int decode_key(decode_ctx *d, key_val *out_key) {
     return -1;
 }
 
+static int decode_value_inner(decode_ctx *d, zval *out);
+
+/* Wrapper enforces two invariants the inner cases would otherwise have to
+ * pepper through every error path:
+ *   1. C-stack guard — adversarial wire format can recurse arbitrarily;
+ *      reject when d->depth hits MAX_DEPTH.
+ *   2. On -1 return, *out is always IS_UNDEF. Callers may safely
+ *      `zval_ptr_dtor(out)` (no-op) or ignore *out entirely. Without this,
+ *      inner cases that partially populate *out before failing (TAG_OBJECT*
+ *      after object_init_ex, TAG_NEW_REF after ZVAL_REF) leak the partial
+ *      value through caller code paths that assume "tmp" is uninitialized.
+ *
+ * `out` may be uninitialized on entry, so we don't read Z_TYPE_P(out) until
+ * after the inner has had a chance to set it. Inner is responsible for
+ * writing SOMETHING (either a real value, or IS_UNDEF, or a partial value
+ * we'll dtor) before returning. The dtor-then-UNDEF on -1 cleans up
+ * partials cascade-style. */
 static int decode_value(decode_ctx *d, zval *out) {
+    if (UNEXPECTED(d->depth >= MAX_DEPTH)) {
+        ZVAL_UNDEF(out);
+        return -1;
+    }
+    d->depth++;
+    int rc = decode_value_inner(d, out);
+    d->depth--;
+    /* Inner pre-sets *out to IS_UNDEF as its first action; subsequent
+     * writes may partially populate it (IS_OBJECT after object_init_ex,
+     * IS_REFERENCE after ZVAL_REF) before a downstream -1. Cascade-clean
+     * here so every caller can assume "*out is IS_UNDEF on -1". */
+    if (UNEXPECTED(rc < 0) && Z_TYPE_P(out) != IS_UNDEF) {
+        zval_ptr_dtor(out);
+        ZVAL_UNDEF(out);
+    }
+    return rc;
+}
+
+static int decode_value_inner(decode_ctx *d, zval *out) {
+    /* Baseline so the wrapper's Z_TYPE_P(out) check on -1 is well-defined
+     * regardless of whether the caller passed an initialized zval. */
+    ZVAL_UNDEF(out);
     if (d->pos >= d->len) return -1;
     uint8_t tag = d->buf[d->pos++];
     switch (tag) {
@@ -1569,7 +1627,13 @@ static int phpser_decode_buf_opts(
     }
 done:
     decode_destroy(&d);
-    return 0;
+    /* If a deferred __unserialize or __wakeup threw, signal failure to C
+     * callers. PHP-level callers are unwound by Zend's exception handling
+     * at the function boundary regardless, but the session handler
+     * (PS_SERIALIZER_DECODE_FUNC) reads our return value to decide whether
+     * to persist `$_SESSION` — a swallowed exception would let it commit
+     * a partially-stitched graph. */
+    return UNEXPECTED(EG(exception)) ? -1 : 0;
 }
 
 #ifdef HAVE_PHP_SESSION
