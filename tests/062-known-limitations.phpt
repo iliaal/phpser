@@ -33,19 +33,7 @@ $rt = phpser_unserialize(phpser_serialize($a));
 $rt[0] = 99;
 echo $rt[1] === 1 ? "ref_flattened OK\n" : "ref_flattened FAIL\n";
 
-// --- __serialize / __unserialize magic methods (PHP 7.4+) ---
-// Not called yet. The default get_properties path captures declared
-// props, so the object round-trips structurally — but any custom logic
-// in __serialize is ignored.
-class WithMagicSer {
-    public int $x = 10;
-    public function __serialize(): array { return ['magic_called' => true]; }
-    public function __unserialize(array $data): void { $this->x = 999; }
-}
-$rt = phpser_unserialize(phpser_serialize(new WithMagicSer()));
-// We bypass __serialize; we read $x via get_properties; we bypass
-// __unserialize; constructor doesn't fire; $x stays at the encoded 10.
-echo $rt->x === 10 ? "magic_methods_bypassed OK\n" : "magic_methods_bypassed FAIL\n";
+// __serialize / __unserialize: SUPPORTED — see 063-magic-serialize.phpt.
 
 // --- Object cycle via property pointer (no IS_REFERENCE) ---
 // Cycle detection via visited_objs: second visit emits NULL. The cycle
@@ -78,7 +66,6 @@ fclose($r);
 --EXPECT--
 arrayobject_class OK
 ref_flattened OK
-magic_methods_bypassed OK
 obj_cycle_break OK
 obj_cycle_null_backedge OK
 closure_null OK

@@ -43,6 +43,13 @@
 #define TAG_PACKED_STRINGS  0x0b   /* varint(len), N×varint(dict_idx) — typed string run */
 #define TAG_STR_INLINE      0x0c   /* varint(len), bytes — single-use string, skips dict */
 #define TAG_ENUM            0x0d   /* varint(class_idx), varint(case_name_idx) */
+#define TAG_OBJECT_MAGIC    0x0e   /* varint(class_idx), value — class with __serialize/__unserialize.
+                                      The value is whatever __serialize() returned (always an array,
+                                      enforced by PHP). On decode we instantiate + call __unserialize. */
+#define TAG_OBJECT_LEGACY   0x0f   /* varint(class_idx), varint(len), bytes — class with the C-level
+                                      ce->serialize / ce->unserialize hook (Serializable interface and
+                                      old SPL classes that haven't migrated to __serialize). The bytes
+                                      are opaque output from ce->serialize. */
 
 /* Assoc key tags (one byte before the key's payload). */
 #define KEY_LONG        0x00
@@ -401,6 +408,55 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
              * error PHP raises that we don't expose yet). */
             if (obj->ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
                 smart_str_appendc(body, TAG_NULL);
+                return;
+            }
+            /* Legacy C-level serializer (Serializable interface or built-in
+             * SPL classes that haven't migrated to __serialize). PHP checks
+             * __serialize FIRST and falls through to this if it's absent.
+             * SplPriorityQueue, SplMinHeap, SplMaxHeap, SplFileInfo all
+             * land here. */
+            if (obj->ce->__serialize == NULL && obj->ce->serialize != NULL) {
+                unsigned char *data = NULL;
+                size_t len = 0;
+                /* var_hash is NULL — we don't share its ref-tracking state
+                 * with PHP's serialize() pipeline, which means SPL serializers
+                 * that record back-refs internally get a fresh slate. For
+                 * isolated cache values this is fine; for payloads with
+                 * shared subobjects across the boundary, the dedup gets
+                 * dropped but correctness holds. */
+                if (obj->ce->serialize(v, &data, &len, NULL) != SUCCESS) {
+                    if (data) efree(data);
+                    smart_str_appendc(body, TAG_NULL);
+                    return;
+                }
+                uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
+                emit_tag_and_varint(body, TAG_OBJECT_LEGACY, class_idx);
+                varint_write_u64(body, len);
+                if (len > 0 && data) smart_str_appendl(body, (const char *)data, len);
+                if (data) efree(data);
+                return;
+            }
+            /* __serialize() takes precedence over property iteration for
+             * any class that defines it (PHP 7.4+). This unlocks ArrayObject,
+             * SplObjectStorage, DateTime, and the rest of the SPL classes
+             * that have migrated to the modern magic methods. */
+            if (obj->ce->__serialize != NULL) {
+                zval retval;
+                ZVAL_UNDEF(&retval);
+                zend_call_known_instance_method_with_0_params(
+                    obj->ce->__serialize, obj, &retval);
+                if (UNEXPECTED(EG(exception)) || Z_TYPE(retval) != IS_ARRAY) {
+                    /* Match PHP's behavior: type error / exception during
+                     * __serialize → emit NULL and bail. Don't swallow the
+                     * exception silently — PHP propagates it. */
+                    zval_ptr_dtor(&retval);
+                    smart_str_appendc(body, TAG_NULL);
+                    return;
+                }
+                uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
+                emit_tag_and_varint(body, TAG_OBJECT_MAGIC, class_idx);
+                encode_value(body, e, &retval);
+                zval_ptr_dtor(&retval);
                 return;
             }
             /* Enums are class-controlled singletons — object_init_ex won't
@@ -785,6 +841,79 @@ static int decode_value(decode_ctx *d, zval *out) {
             arr->nNumOfElements = (uint32_t)n;
             arr->nNextFreeElement = (zend_long)n;
             ZVAL_ARR(out, arr);
+            return 0;
+        }
+        case TAG_OBJECT_LEGACY: {
+            uint64_t class_idx, blen;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &blen) < 0) return -1;
+            if (blen > UINT32_MAX || d->pos + blen > d->len) return -1;
+
+            zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
+            if (!class_name) return -1;
+
+            zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
+            if (!ce || ce->unserialize == NULL) {
+                /* Unknown class or no C-level unserializer — skip past the
+                 * payload bytes and yield NULL. */
+                d->pos += blen;
+                ZVAL_NULL(out);
+                return 0;
+            }
+            /* ce->unserialize is responsible for initializing *out; we don't
+             * pre-init it. var_hash is NULL — same caveat as the encode side. */
+            const unsigned char *payload = d->buf + d->pos;
+            d->pos += blen;
+            if (ce->unserialize(out, ce, payload, (size_t)blen, NULL) != SUCCESS) {
+                if (Z_TYPE_P(out) != IS_UNDEF) zval_ptr_dtor(out);
+                ZVAL_NULL(out);
+                return -1;
+            }
+            return 0;
+        }
+        case TAG_OBJECT_MAGIC: {
+            uint64_t class_idx;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
+            zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
+            if (!class_name) return -1;
+
+            zval data;
+            ZVAL_UNDEF(&data);
+            if (decode_value(d, &data) < 0) {
+                zval_ptr_dtor(&data);
+                return -1;
+            }
+            if (Z_TYPE(data) != IS_ARRAY) {
+                zval_ptr_dtor(&data);
+                return -1;
+            }
+
+            zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
+            if (!ce) {
+                /* Unknown class — fall back to stdClass holding the data
+                 * array. PHP throws on unknown classes; we choose to be
+                 * lenient because the payload may have been emitted before
+                 * the class was registered. */
+                ce = zend_standard_class_def;
+            }
+            if (object_init_ex(out, ce) != SUCCESS) {
+                zval_ptr_dtor(&data);
+                ZVAL_NULL(out);
+                return -1;
+            }
+            /* If the class has __unserialize, call it with the data array.
+             * Otherwise the payload was emitted by a class that only had
+             * __serialize at write time — defensively, stash the array as
+             * a dynamic 'data' property (lossy but better than dropping). */
+            if (ce->__unserialize != NULL) {
+                zend_call_known_instance_method_with_1_params(
+                    ce->__unserialize, Z_OBJ_P(out), NULL, &data);
+                if (EG(exception)) {
+                    zval_ptr_dtor(&data);
+                    return -1;
+                }
+            }
+            zval_ptr_dtor(&data);
             return 0;
         }
         case TAG_ENUM: {
