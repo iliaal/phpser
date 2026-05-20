@@ -123,7 +123,15 @@ static inline int varint_read_u64(const uint8_t *buf, size_t buflen, size_t *pos
     while (p < buflen) {
         b = buf[p++];
         if (shift >= 64) return -1;
-        v |= ((uint64_t)(b & 0x7f)) << shift;
+        uint64_t chunk = b & 0x7f;
+        /* Overflow guard for the 10th byte. uint64_t holds 64 bits; at
+         * shift=63 only bit 0 of `chunk` is in range. Bits 1-6 of the
+         * 10th byte would shift past bit 64 and silently wrap modulo
+         * 2^64, so a crafted payload encoding 2^64 (0x80*9 + 0x02)
+         * decodes as 0 — aliasing dict_idx 0 from the attacker's perspective.
+         * Reject any non-zero high bits on the final byte. */
+        if (UNEXPECTED(shift == 63 && chunk > 1)) return -1;
+        v |= chunk << shift;
         if ((b & 0x80) == 0) {
             *out = v;
             *pos = p;
@@ -189,15 +197,16 @@ static inline double le64_read(const uint8_t *src) {
 
 /* -------------------------------------------------------------------------
  * Encode state. Two-tier intern:
- *   - inline_cache: 16-slot ring of (zend_string*, dict_idx). Hit rate on
- *     rowset shapes is near 100% after the first row because PHP shares
- *     interned literal pointers across all rows. ~5-10 cmps per lookup;
- *     no hash function call, no HashTable bucket walk.
- *   - hash_map: HashTable keyed by zend_string content. ONLY consulted on
- *     inline-cache miss AND only meaningful when two distinct zend_string
- *     allocations share content (e.g., runtime-built strings that happen
- *     to equal a literal). For typical cache payloads it's mostly dead
- *     weight, but we keep it for correctness.
+ *   - inline_cache: 16-slot ring of (zend_string*, dict_idx). Linear-scan
+ *     pointer-equality probe; near-zero cost on hits when PHP literals
+ *     share interned zend_string allocations across rows.
+ *   - hash_map: HashTable keyed by zend_string content. Consulted on
+ *     inline-cache miss once dict_len crosses HASH_MAP_THRESHOLD. Catches
+ *     both "same content, different allocation" (runtime-built strings
+ *     equaling a literal) AND "cache slot evicted, dict entry still
+ *     present" — the dominant case on rowset workloads, where row_X
+ *     allocations push prop-key slots out of the 16-slot cache after
+ *     ~16 rows.
  *   - dict: index→zend_string* array we emit at the head.
  * ------------------------------------------------------------------------- */
 
@@ -394,8 +403,22 @@ static inline intern_slot *enc_cache_alloc_slot(encode_ctx *e, zend_string *zs) 
     if (e->cache_filled < INTERN_CACHE_SIZE) {
         slot = e->cache_filled++;
     } else {
+        /* FIFO ring eviction, but skip past slots that hold a "graduated"
+         * DICT_IDX entry. On rowset workloads the prop-key slots
+         * (graduated to DICT after row 2) would otherwise get evicted
+         * by row_X unique-string allocations; that triggers cache misses
+         * + hash_map fallback for every subsequent prop access. By
+         * preferring to evict INLINE_EMITTED (singleton) slots, we keep
+         * the hot DICT slots warm. Worst-case probe is INTERN_CACHE_SIZE
+         * (all slots are DICT — then we evict the first one and accept
+         * the cost), but typical case finds a non-DICT slot in 1-2
+         * probes. */
         slot = e->cache_next;
-        e->cache_next = (e->cache_next + 1) % INTERN_CACHE_SIZE;
+        for (uint32_t i = 0; i < INTERN_CACHE_SIZE; i++) {
+            if (!SLOT_IS_DICT(e->inline_cache[slot])) break;
+            slot = (slot + 1) % INTERN_CACHE_SIZE;
+        }
+        e->cache_next = (slot + 1) % INTERN_CACHE_SIZE;
     }
     e->inline_cache[slot].ptr = zs;
     return &e->inline_cache[slot];
@@ -971,7 +994,6 @@ typedef struct {
      * stack at ~100K nested frames. Bracket decode_value with ++/-- and
      * reject when >= MAX_DEPTH. */
     uint32_t depth;
-    int error;
 } decode_ctx;
 
 enum { ALLOWED_ALL = 0, ALLOWED_NONE, ALLOWED_SET };
@@ -1053,6 +1075,71 @@ static inline int dec_class_allowed(decode_ctx *d, zend_string *class_name) {
     return ok;
 }
 
+/* Install one decoded value as a property on `obj`. Mirrors TAG_OBJECT's
+ * IS_INDIRECT-vs-dynamic dispatch with typed-slot checking. Used by both
+ * TAG_OBJECT and TAG_OBJECT_MAGIC's __unserialize-missing fallback.
+ *
+ * Takes ownership of *tmp: on success it's moved into the slot; on
+ * type-mismatch it's dtor'd. Returns 0/-1. */
+static int dec_install_prop(zend_object *obj, HashTable *obj_props,
+                            zend_string *key, zval *tmp) {
+    zval *existing = zend_hash_find(obj_props, key);
+    if (existing) {
+        if (Z_TYPE_P(existing) == IS_INDIRECT) {
+            zval *slot = Z_INDIRECT_P(existing);
+            zend_property_info *info =
+                zend_get_typed_property_info_for_slot(obj, slot);
+            if (info != NULL) {
+                if (!zend_verify_prop_assignable_by_ref(
+                        info, tmp, /*strict*/ 1)) {
+                    zval_ptr_dtor(tmp);
+                    return -1;
+                }
+                if (Z_ISREF_P(slot)) {
+                    ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
+                }
+            }
+            zval_ptr_dtor(slot);
+            ZVAL_COPY_VALUE(slot, tmp);
+            if (info != NULL && Z_ISREF_P(slot)) {
+                ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
+            }
+        } else {
+            zval_ptr_dtor(existing);
+            ZVAL_COPY_VALUE(existing, tmp);
+        }
+    } else {
+        zend_hash_add_new(obj_props, key, tmp);
+    }
+    return 0;
+}
+
+/* Apply a data array (from __serialize) to an object's properties when
+ * __unserialize is unavailable. Matches PHP's native fallback: each
+ * string key becomes a property write (typed or dynamic), int keys
+ * become string-cast dynamic properties. Both regular classes without
+ * __unserialize AND __PHP_Incomplete_Class for disallowed classes use
+ * this path. */
+static void dec_apply_data_as_props(zend_object *obj, HashTable *data_ht) {
+    HashTable *obj_props = zend_std_get_properties(obj);
+    zend_string *key;
+    zend_ulong h;
+    zval *val;
+    ZEND_HASH_FOREACH_KEY_VAL(data_ht, h, key, val) {
+        zval tmp;
+        ZVAL_COPY(&tmp, val);  /* addref for the new owner */
+        if (key) {
+            (void)dec_install_prop(obj, obj_props, key, &tmp);
+        } else {
+            /* Int key — convert to string for the dynamic-property table,
+             * matching PHP's behavior (creates property "0", "1", etc.). */
+            zend_string *str_key = zend_long_to_str((zend_long)h);
+            (void)dec_install_prop(obj, obj_props, str_key, &tmp);
+            zend_string_release(str_key);
+        }
+    } ZEND_HASH_FOREACH_END();
+}
+
 /* Build an __PHP_Incomplete_Class instance with the original class name
  * stored in the magic property. The caller decodes any subsequent props
  * into this object; they land alongside the magic name. */
@@ -1069,10 +1156,7 @@ static int dec_make_incomplete(zval *out, zend_string *original_class_name) {
  * BEFORE narrowing — otherwise an attacker can craft idx = 2^32 (or any
  * multiple of dict_len) and the uint32 truncation lands on a valid slot. */
 static inline zend_string *dec_get_zstr(decode_ctx *d, uint64_t idx) {
-    if (UNEXPECTED(idx >= d->dict_len)) {
-        d->error = 1;
-        return NULL;
-    }
+    if (UNEXPECTED(idx >= d->dict_len)) return NULL;
     return d->dict[idx];
 }
 
@@ -1453,6 +1537,15 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 dec_defer_unserialize(d, Z_OBJ_P(out), &data);
                 /* Ownership of `data` transferred to deferred list. */
             } else {
+                /* No __unserialize (either class lacks it, or class is
+                 * disallowed/incomplete). Apply the data array as
+                 * properties — matches PHP's native fallback: a class
+                 * with __serialize() but no __unserialize() round-trips
+                 * via the regular O: format, and a disallowed class
+                 * preserves the serialized props on __PHP_Incomplete_Class.
+                 * Without this, the serialized state is silently
+                 * dropped. */
+                dec_apply_data_as_props(Z_OBJ_P(out), Z_ARRVAL(data));
                 zval_ptr_dtor(&data);
             }
             return 0;
@@ -1528,54 +1621,11 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 if (!key) goto obj_fail;
                 zval tmp;
                 if (decode_value(d, &tmp) < 0) goto obj_fail;
-
-                zval *existing = zend_hash_find(obj_props, key);
-                if (existing) {
-                    if (Z_TYPE_P(existing) == IS_INDIRECT) {
-                        /* Declared prop — write into the slot. The
-                         * indirect value is the actual slot in
-                         * properties_table. For typed slots, verify the
-                         * incoming value satisfies the declared type
-                         * before installing, mirroring
-                         * var_unserializer.re:608-708. Without this, a
-                         * crafted payload can plant a string in an
-                         * int-typed slot and downstream code trips on the
-                         * mismatch. */
-                        zval *slot = Z_INDIRECT_P(existing);
-                        zend_property_info *info =
-                            zend_get_typed_property_info_for_slot(obj, slot);
-                        if (info != NULL) {
-                            if (!zend_verify_prop_assignable_by_ref(
-                                    info, &tmp, /*strict*/ 1)) {
-                                zval_ptr_dtor(&tmp);
-                                goto obj_fail;
-                            }
-                            /* Drop the old type-source if slot held a
-                             * typed reference we're about to overwrite. */
-                            if (Z_ISREF_P(slot)) {
-                                ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
-                            }
-                        }
-                        zval_ptr_dtor(slot);
-                        ZVAL_COPY_VALUE(slot, &tmp);
-                        /* If we just installed a reference into a typed
-                         * slot, propagate the type as a source on the ref
-                         * so future writes through any alias get checked. */
-                        if (info != NULL && Z_ISREF_P(slot)) {
-                            ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
-                        }
-                    } else {
-                        /* Existing dynamic prop — overwrite in place. */
-                        zval_ptr_dtor(existing);
-                        ZVAL_COPY_VALUE(existing, &tmp);
-                    }
-                } else {
-                    /* No existing entry. Encoder guarantees no duplicate
-                     * property keys per object, so we can skip the
-                     * existence re-check that zend_hash_update_ind would
-                     * do — saves one probe per dynamic property. */
-                    zend_hash_add_new(obj_props, key, &tmp);
-                }
+                /* dec_install_prop mirrors var_unserializer.re:608-708:
+                 * IS_INDIRECT slots get typed-property verification, dynamic
+                 * props go through zend_hash_update with overwrite semantics.
+                 * On typed-mismatch tmp is dtor'd inside the helper. */
+                if (dec_install_prop(obj, obj_props, key, &tmp) < 0) goto obj_fail;
                 continue;
             obj_fail:
                 zval_ptr_dtor(out); ZVAL_NULL(out); return -1;
@@ -1732,17 +1782,17 @@ static zend_string *phpser_encode_zval(zval *value) {
     smart_str body = {0};
     /* Pre-size body to skip 5-6 geometric grow cycles that an unconfigured
      * smart_str does on its way up to a typical multi-KB cache payload.
-     * Estimate from top-level container size: an empty default of 256 for
-     * scalars, ~16 bytes per array element, ~256 for any object (cheap
-     * conservative lower bound — get_properties walk would defeat the
-     * purpose). Over-allocates for tiny payloads but the wasted bytes
-     * stay in one zend_mm slot. */
+     * Estimate from top-level array element count at ~16 bytes/elem; cap
+     * at 256 KB so a pathological top-level array doesn't request a
+     * gigabyte upfront. Beyond the cap, smart_str's geometric grow
+     * handles the rest. Scalars and objects get the 256-byte default. */
     size_t body_estimate = 256;
     if (Z_TYPE_P(value) == IS_ARRAY) {
         uint32_t n = zend_hash_num_elements(Z_ARRVAL_P(value));
-        if (n > 16) body_estimate = (size_t)n * 16;
-    } else if (Z_TYPE_P(value) == IS_OBJECT) {
-        body_estimate = 256;
+        if (n > 16) {
+            size_t est = (size_t)n * 16;
+            body_estimate = est > (256 * 1024) ? (256 * 1024) : est;
+        }
     }
     smart_str_alloc(&body, body_estimate, 0);
     encode_value(&body, &ctx, value);

@@ -17,24 +17,25 @@ failed to beat `pecl/igbinary` in opt-mode benchmarks — see
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → **4819** (**+5.4%**) | 9k → 12k ns (+27%) | 10k → 10k ns (+6%) |
-| rowset_1000 | 47K → 48K (**+2.1%**) | 150k → 120k ns (**-19%**) | 99k → 108k ns (+10%) |
-| packed_1k | 5495 → **1941** (**-65%**) | 4.2k → **1.4k** ns (**-67%**) | 7.0k → **1.8k** ns (**-76%**) |
-| packed_10k | 60K → **22K** (**-63%**) | 40k → **16k** ns (**-60%**) | 68k → **18k** ns (**-74%**) |
-| deep_50 | 419 → 424 (parity) | 1.3k → **0.6k** ns (**-54%**) | 1.6k → **1.5k** ns (**-11%**) |
+| rowset_100 | 4570 → **4771** (**+4.4%**) | 9k → 11k ns (+30%) | 9k → 10k ns (~parity) |
+| rowset_1000 | 47K → 48K (**+1.1%**) | 143k → 113k ns (**-25%**) | 93k → 98k ns (+5%) |
+| packed_1k | 5495 → **1941** (**-65%**) | 4.2k → **1.4k** ns (**-67%**) | 7.0k → **1.7k** ns (**-77%**) |
+| packed_10k | 60K → **22K** (**-63%**) | 41k → **16k** ns (**-61%**) | 67k → **17k** ns (**-73%**) |
+| deep_50 | 419 → 424 (parity) | 1.3k → **0.65k** ns (**-49%**) | 1.7k → **1.5k** ns (**-9%**) |
 
-Wins: packed numerics ~65% smaller + ~74% faster decode + ~60% faster
-encode. Deep-nested ~54% faster encode at parity size. **Rowset_1000
-encode beats igbinary by ~19%**, size within 2%; decode pays a ~10%
+Wins: packed numerics ~65% smaller + ~75% faster decode + ~61% faster
+encode. Deep-nested ~49% faster encode at parity size. **Rowset_1000
+encode beats igbinary by ~25%**, size within 1.1%; decode pays a ~5%
 tax for the front-loaded dict header walk + refcount-reuse machinery.
 
-`rowset_100` encode (+27%) is the one durable gap — fixed-cost floor
-for the dict header emission and first-row inline emissions, amortized
-over too few rows to recover. The absolute time is small (12 µs for
-the entire 100-row payload). The previously-large size gap (+12%) and
-decode gap (+15%) collapsed to +5% and +6% after the cache-miss
-hash_map fallback was wired up — see the encode-state comment about
-`HASH_MAP_THRESHOLD` for the mechanism.
+`rowset_100` encode (+30%) is the durable gap — fixed-cost floor for
+the dict header emission and first-row inline emissions, amortized
+over too few rows to recover. The absolute time is small (11 µs for
+the entire 100-row payload). Decode is essentially at parity (per-run
+delta median +0.4%, absolute ratio +6%): the skip-DICT cache-eviction
+policy keeps `['a','b','c']`-style repeated values in DICT slots so
+`detect_packed_run` picks the `TAG_PACKED_STRINGS` typed-run path
+instead of falling back to `PACKED_MIXED` mid-rowset.
 
 ## What we kept from the experiment
 
@@ -78,8 +79,13 @@ measurable perf to take, and that this project targets, are:
 4. **Eager dict materialization with warm hashes.** All dict zend_strings
    allocated up front during header parse and their hashes pre-computed.
    `zend_hash_add_new` reuses the cached hash. **Shipped.**
-5. **`add_new` insert path on assoc decode.** Skips the existence check
-   since we know the encoder doesn't emit duplicate keys. **Shipped.**
+5. **`update` insert on assoc decode.** Originally `add_new` to skip the
+   existence-check, but adversarial wire payloads with duplicate keys
+   would produce phantom buckets that violate PHP's last-write-wins
+   semantic (`count($arr) != count(array_unique(array_keys($arr)))`).
+   Reverted to `zend_hash_update` for security-boundary correctness;
+   `add_new` is a real but small perf win the cost of breaking adversarial
+   payloads cleanly. **Shipped.**
 6. **Inline-short-string tag — shipped via upgrade-on-second-encounter.**
    `TAG_STR_INLINE` (0x0c) and `KEY_STR_INLINE` (0x02) are emitted on a
    string's first occurrence; the next occurrence triggers an in-place
@@ -168,16 +174,31 @@ value tags:
   0x00 NULL
   0x01 FALSE
   0x02 TRUE
-  0x03 LONG          varint (zigzag-encoded)
-  0x04 DOUBLE        8 bytes (LE)
-  0x05 STR_DICT      varint dict_idx
-  0x06 ASSOC         varint(len), N×(key, val)
-  0x07 PACKED_MIXED  varint(len), N×val
-  0x08 PACKED_LONGS  varint(len), N×zigzag-varint
-  0x09 PACKED_DOUBLES varint(len), N×8-byte LE
-  0x0a OBJECT        varint(class_idx), varint(nprops), N×(key_idx, val)
+  0x03 LONG            varint (zigzag-encoded)
+  0x04 DOUBLE          8 bytes (LE)
+  0x05 STR_DICT        varint dict_idx
+  0x06 ASSOC           varint(len), N×(key, val)
+  0x07 PACKED_MIXED    varint(len), N×val
+  0x08 PACKED_LONGS    varint(len), N×zigzag-varint
+  0x09 PACKED_DOUBLES  varint(len), N×8-byte LE
+  0x0a OBJECT          varint(class_idx), varint(nprops), N×(key_idx, val)
+  0x0b PACKED_STRINGS  varint(len), N×varint(dict_idx)  — typed string run
+  0x0c STR_INLINE      varint(len), bytes  — single-use string, skips dict
+  0x0d ENUM            varint(class_idx), varint(case_name_idx)
+  0x0e OBJECT_MAGIC    varint(class_idx), value  — class with __serialize;
+                       value is the array __serialize returned
+  0x0f OBJECT_LEGACY   varint(class_idx), varint(len), bytes  — class with
+                       ce->serialize / ce->unserialize (Serializable etc.)
+  0x10 REF             varint(id)  — back-ref to a previously-emitted container
+  0x11 NEW_REF         value  — claims the next id for an IS_REFERENCE wrap
 
-key:
-  0x00 LONG          varint(zigzag)
-  0x01 STR           varint(dict_idx)
+key tags:
+  0x00 LONG            varint(zigzag)
+  0x01 STR             varint(dict_idx)
+  0x02 STR_INLINE      varint(len), bytes
 ```
+
+Varints are LEB128 (unsigned); signed values use zigzag encoding. Tags
+0x10/0x11 plus 0x0a/0x0d/0x0e/0x0f each implicitly claim the next id in
+encounter order, so the decoder reconstructs back-refs by counting
+container tags as it parses.
