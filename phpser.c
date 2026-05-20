@@ -205,6 +205,7 @@ typedef struct {
     uint32_t cache_filled;
     uint32_t cache_next;
     HashTable hash_map;
+    uint8_t   hash_map_inited;   /* lazy init: skipped for small payloads */
     /* Per-payload id table for (zend_object*|zend_reference*) → uint32 id
      * assigned in encounter order. First visit emits the usual container
      * tag (claiming the next id implicitly); subsequent visits emit
@@ -225,7 +226,7 @@ static void enc_ctx_init(encode_ctx *e) {
     memset(e->inline_cache, 0, sizeof(e->inline_cache));
     e->cache_filled = 0;
     e->cache_next = 0;
-    zend_hash_init(&e->hash_map, 16, NULL, NULL, 0);
+    e->hash_map_inited = 0;     /* zend_hash_init deferred until dict crosses HASH_MAP_THRESHOLD */
     e->id_buckets = NULL;
     e->id_mask = 0;
     e->id_count = 0;
@@ -237,7 +238,7 @@ static void enc_ctx_init(encode_ctx *e) {
 }
 
 static void enc_ctx_destroy(encode_ctx *e) {
-    zend_hash_destroy(&e->hash_map);
+    if (e->hash_map_inited) zend_hash_destroy(&e->hash_map);
     if (e->id_buckets) efree(e->id_buckets);
     if (e->dict) efree(e->dict);
 }
@@ -328,6 +329,10 @@ static uint32_t enc_dict_append(encode_ctx *e, zend_string *zs) {
     e->dict[idx] = zs;
 
     if (e->dict_len == HASH_MAP_THRESHOLD) {
+        /* Lazy init: pre-size the map to the threshold count to avoid an
+         * internal rehash on the batch insert below. */
+        zend_hash_init(&e->hash_map, HASH_MAP_THRESHOLD * 2, NULL, NULL, 0);
+        e->hash_map_inited = 1;
         for (uint32_t i = 0; i < e->dict_len; i++) {
             zval iz; ZVAL_LONG(&iz, i);
             zend_hash_add(&e->hash_map, e->dict[i], &iz);
@@ -1399,16 +1404,24 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 if (decode_value(d, &tmp) < 0) goto obj_fail;
 
                 zval *existing = zend_hash_find(obj_props, key);
-                if (existing && Z_TYPE_P(existing) == IS_INDIRECT) {
-                    /* Declared prop — write into the slot. The indirect
-                     * value is the actual slot in properties_table. */
-                    zval *slot = Z_INDIRECT_P(existing);
-                    zval_ptr_dtor(slot);
-                    ZVAL_COPY_VALUE(slot, &tmp);
+                if (existing) {
+                    if (Z_TYPE_P(existing) == IS_INDIRECT) {
+                        /* Declared prop — write into the slot. The indirect
+                         * value is the actual slot in properties_table. */
+                        zval *slot = Z_INDIRECT_P(existing);
+                        zval_ptr_dtor(slot);
+                        ZVAL_COPY_VALUE(slot, &tmp);
+                    } else {
+                        /* Existing dynamic prop — overwrite in place. */
+                        zval_ptr_dtor(existing);
+                        ZVAL_COPY_VALUE(existing, &tmp);
+                    }
                 } else {
-                    /* Dynamic prop (or no matching slot). update_ind keeps
-                     * any existing IS_INDIRECT redirection intact. */
-                    zend_hash_update_ind(obj_props, key, &tmp);
+                    /* No existing entry. Encoder guarantees no duplicate
+                     * property keys per object, so we can skip the
+                     * existence re-check that zend_hash_update_ind would
+                     * do — saves one probe per dynamic property. */
+                    zend_hash_add_new(obj_props, key, &tmp);
                 }
                 continue;
             obj_fail:
@@ -1548,9 +1561,23 @@ static zend_string *phpser_encode_zval(zval *value) {
 
     smart_str body = {0};
     encode_value(&body, &ctx, value);
+    size_t body_len = body.s ? ZSTR_LEN(body.s) : 0;
 
-    /* Frame: [version][varint ndict][per-entry varint(len)+bytes][body] */
+    /* Frame: [version][varint ndict][per-entry varint(len)+bytes][body].
+     *
+     * Pre-size `out` to skip smart_str's geometric grow-and-copy cascade.
+     * Worst-case header: 1 (version) + 5 (max varint for dict_len)
+     *                  + ndict * (5 max varint + name bytes).
+     * Add body_len for the final concat. Single allocation, no realloc. */
+    size_t header_max = 1 + 5;
+    for (uint32_t i = 0; i < ctx.dict_len; i++) {
+        header_max += 5 + ZSTR_LEN(ctx.dict[i]);
+    }
+
     smart_str out = {0};
+    /* +1 for the smart_str_0 NUL terminator at the end. */
+    smart_str_alloc(&out, header_max + body_len + 1, 0);
+
     smart_str_appendc(&out, PHPSER_VERSION);
     varint_write_u64(&out, ctx.dict_len);
     for (uint32_t i = 0; i < ctx.dict_len; i++) {
@@ -1559,7 +1586,7 @@ static zend_string *phpser_encode_zval(zval *value) {
         smart_str_appendl(&out, ZSTR_VAL(zs), ZSTR_LEN(zs));
     }
     if (body.s) {
-        smart_str_appendl(&out, ZSTR_VAL(body.s), ZSTR_LEN(body.s));
+        smart_str_appendl(&out, ZSTR_VAL(body.s), body_len);
         smart_str_free(&body);
     }
     smart_str_0(&out);
