@@ -1,0 +1,158 @@
+--TEST--
+phpser: signed mode (HMAC-SHA256) — round-trip, tamper detection, key isolation
+--EXTENSIONS--
+phpser
+--FILE--
+<?php
+
+// --- Round-trip: same key encodes + decodes a value cleanly. ---
+$value = ['user' => 'alice', 'id' => 42, 'tags' => ['a', 'b']];
+$key = 'shared-secret-key';
+$sig = phpser_serialize_signed($value, $key);
+$rt = phpser_unserialize_signed($sig, $key);
+echo ($rt === $value) ? "roundtrip OK\n" : "roundtrip FAIL\n";
+
+// --- Tag is appended (32 bytes for SHA256). ---
+$unsigned = phpser_serialize($value);
+echo (strlen($sig) === strlen($unsigned) + 32) ? "tag_size OK\n" : "tag_size FAIL\n";
+
+// --- Wrong key: must throw, must not return the value (no oracle). ---
+$caught = false;
+try {
+    phpser_unserialize_signed($sig, 'different-key');
+} catch (Exception $e) {
+    $caught = str_contains($e->getMessage(), 'signature');
+}
+echo $caught ? "wrong_key OK\n" : "wrong_key FAIL\n";
+
+// --- Empty key (legal but weak — accepted to match HMAC RFC; not our policy
+// to enforce minimum key length). ---
+$sig0 = phpser_serialize_signed($value, '');
+$rt0 = phpser_unserialize_signed($sig0, '');
+echo ($rt0 === $value) ? "empty_key OK\n" : "empty_key FAIL\n";
+
+// --- Long key (> 64 bytes block size): RFC says hash it first. We do. ---
+$long = str_repeat('a', 200);
+$siglong = phpser_serialize_signed($value, $long);
+$rtlong = phpser_unserialize_signed($siglong, $long);
+echo ($rtlong === $value) ? "long_key OK\n" : "long_key FAIL\n";
+
+// --- Binary-safe key (NUL bytes etc). ---
+$binkey = "key\x00with\x01nul\x02bytes";
+$sigbin = phpser_serialize_signed($value, $binkey);
+$rtbin = phpser_unserialize_signed($sigbin, $binkey);
+echo ($rtbin === $value) ? "binary_key OK\n" : "binary_key FAIL\n";
+
+// --- Tamper: flip a single bit in the payload body. ---
+$tampered = $sig;
+$tampered[0] = chr(ord($tampered[0]) ^ 0x01);
+$caught = false;
+try {
+    phpser_unserialize_signed($tampered, $key);
+} catch (Exception $e) {
+    $caught = true;
+}
+echo $caught ? "tamper_body OK\n" : "tamper_body FAIL\n";
+
+// --- Tamper: flip a bit in the HMAC tag itself. ---
+$tampered = $sig;
+$last = strlen($tampered) - 1;
+$tampered[$last] = chr(ord($tampered[$last]) ^ 0x80);
+$caught = false;
+try {
+    phpser_unserialize_signed($tampered, $key);
+} catch (Exception $e) {
+    $caught = true;
+}
+echo $caught ? "tamper_tag OK\n" : "tamper_tag FAIL\n";
+
+// --- Truncate: payload shorter than 32 bytes can't possibly carry a tag. ---
+$caught = false;
+try {
+    phpser_unserialize_signed("short", $key);
+} catch (Exception $e) {
+    $caught = str_contains($e->getMessage(), 'too short');
+}
+echo $caught ? "too_short OK\n" : "too_short FAIL\n";
+
+// --- Truncate by exactly one byte off the end (drops part of the tag). ---
+$shortened = substr($sig, 0, -1);
+$caught = false;
+try {
+    phpser_unserialize_signed($shortened, $key);
+} catch (Exception $e) {
+    $caught = true;
+}
+echo $caught ? "truncated_one OK\n" : "truncated_one FAIL\n";
+
+// --- Determinism: same key + same value → same signed bytes. ---
+$s1 = phpser_serialize_signed($value, $key);
+$s2 = phpser_serialize_signed($value, $key);
+echo ($s1 === $s2) ? "deterministic OK\n" : "deterministic FAIL\n";
+
+// --- Signed payload through unsigned unserialize: garbage trail (the HMAC
+// looks like more data to the unsigned decoder). Should NOT throw, just
+// produce some value or NULL — never crash. ---
+$rt_unsigned = @phpser_unserialize($sig);
+echo "no_crash_unsigned_path OK\n";
+
+// --- allowed_classes still works in signed path. ---
+class Approved { public int $n = 7; }
+class Rejected { public int $n = 8; }
+$sigA = phpser_serialize_signed([new Approved(), new Rejected()], $key);
+$rt = phpser_unserialize_signed($sigA, $key, ['allowed_classes' => [Approved::class]]);
+$ok = $rt[0] instanceof Approved && $rt[1] instanceof __PHP_Incomplete_Class;
+echo $ok ? "signed_allowed_classes OK\n" : "signed_allowed_classes FAIL\n";
+
+// --- Cross-encode unsigned/signed: an unsigned payload through signed
+// unserialize fails verification (because there's no valid HMAC suffix). ---
+$caught = false;
+try {
+    phpser_unserialize_signed($unsigned . str_repeat("\x00", 32), $key);
+} catch (Exception $e) {
+    $caught = true;
+}
+echo $caught ? "unsigned_in_signed_rejected OK\n" : "unsigned_in_signed_rejected FAIL\n";
+
+// --- Encoded values can include null and false (which the legacy
+// "false=failure" pattern would have ambiguity for — we throw on bad sig
+// instead, so the return slot is free). ---
+$signull = phpser_serialize_signed(null, $key);
+$rtnull = phpser_unserialize_signed($signull, $key);
+echo ($rtnull === null) ? "null_value OK\n" : "null_value FAIL\n";
+
+$sigfalse = phpser_serialize_signed(false, $key);
+$rtfalse = phpser_unserialize_signed($sigfalse, $key);
+echo ($rtfalse === false) ? "false_value OK\n" : "false_value FAIL\n";
+
+// --- Known-answer test: pin one HMAC tag to catch a future drift in the
+// underlying SHA256 (e.g. accidental algorithm swap, endianness bug).
+// `phpser_serialize("test")` produces a stable byte string in our wire
+// format; we sign with a known key and compare the resulting tag hex. ---
+$known = phpser_serialize_signed("test", "key");
+// The first bytes are the unsigned payload; the last 32 are the HMAC.
+$unsigned_test = phpser_serialize("test");
+$tag_hex = bin2hex(substr($known, strlen($unsigned_test)));
+// Compute the expected tag via PHP's hash_hmac for cross-validation.
+$expected_hex = hash_hmac("sha256", $unsigned_test, "key");
+echo ($tag_hex === $expected_hex) ? "known_answer OK\n" : "known_answer FAIL ($tag_hex vs $expected_hex)\n";
+
+?>
+--EXPECT--
+roundtrip OK
+tag_size OK
+wrong_key OK
+empty_key OK
+long_key OK
+binary_key OK
+tamper_body OK
+tamper_tag OK
+too_short OK
+truncated_one OK
+deterministic OK
+no_crash_unsigned_path OK
+signed_allowed_classes OK
+unsigned_in_signed_rejected OK
+null_value OK
+false_value OK
+known_answer OK

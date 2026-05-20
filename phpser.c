@@ -29,11 +29,15 @@
 #include "Zend/zend_hash.h"
 
 #include "Zend/zend_enum.h"
+#include "Zend/zend_exceptions.h"
 #include "ext/standard/php_incomplete_class.h"
+#include "ext/hash/php_hash.h"
 
 #ifdef HAVE_PHP_SESSION
 # include "ext/session/php_session.h"
 #endif
+
+#define PHPSER_HMAC_TAG_LEN 32  /* SHA256 output size */
 
 #include <stdint.h>
 #include <string.h>
@@ -1408,6 +1412,72 @@ static int decode_value(decode_ctx *d, zval *out) {
 }
 
 /* -------------------------------------------------------------------------
+ * HMAC-SHA256 over framed payloads. Used by phpser_serialize_signed /
+ * phpser_unserialize_signed to detect tampered cache entries when the
+ * storage layer is untrusted (e.g. shared Memcached).
+ *
+ * Wire format for signed payloads: [raw frame bytes][32-byte HMAC tag].
+ * The tag is computed over the raw frame only. Separate function names
+ * (vs. a flag in unserialize) mean the caller's intent is explicit at the
+ * call site — no magic-byte detection, no chance of accidentally accepting
+ * an unsigned payload through the signed path.
+ * ------------------------------------------------------------------------- */
+
+/* Cached at MINIT. ext/hash is mandatory since PHP 7.4 and lookup never
+ * fails for a builtin algo; we still null-check defensively. */
+static const php_hash_ops *phpser_sha256_ops = NULL;
+static zend_string *phpser_sha256_name = NULL;
+
+/* HMAC-SHA256 of `data` under `key`. Writes a 32-byte tag to `out`.
+ * Returns 0 on success, -1 if SHA256 ops aren't available. */
+static int phpser_hmac_sha256(
+    const unsigned char *key, size_t key_len,
+    const unsigned char *data, size_t data_len,
+    unsigned char out[PHPSER_HMAC_TAG_LEN])
+{
+    const php_hash_ops *ops = phpser_sha256_ops;
+    if (UNEXPECTED(!ops)) return -1;
+    size_t bs = ops->block_size;
+    /* SHA256 block size is 64 — small enough for a stack buffer. */
+    unsigned char K[64];
+    if (UNEXPECTED(bs > sizeof(K))) return -1;
+
+    void *ctx = emalloc(ops->context_size);
+    if (key_len > bs) {
+        ops->hash_init(ctx, NULL);
+        ops->hash_update(ctx, key, key_len);
+        ops->hash_final(K, ctx);
+        memset(K + ops->digest_size, 0, bs - ops->digest_size);
+    } else {
+        memcpy(K, key, key_len);
+        if (key_len < bs) memset(K + key_len, 0, bs - key_len);
+    }
+    /* Inner: H((K^ipad) || data) */
+    for (size_t i = 0; i < bs; i++) K[i] ^= 0x36;
+    ops->hash_init(ctx, NULL);
+    ops->hash_update(ctx, K, bs);
+    ops->hash_update(ctx, data, data_len);
+    ops->hash_final(out, ctx);
+    /* Outer: H((K^opad) || inner) */
+    for (size_t i = 0; i < bs; i++) K[i] ^= (0x36 ^ 0x5c);
+    ops->hash_init(ctx, NULL);
+    ops->hash_update(ctx, K, bs);
+    ops->hash_update(ctx, out, ops->digest_size);
+    ops->hash_final(out, ctx);
+    efree(ctx);
+    return 0;
+}
+
+/* Constant-time byte compare. Returns 1 if all `n` bytes are equal.
+ * Mirrors the pattern PHP's hash_equals() uses internally — avoids the
+ * early-exit timing leak that memcmp would have. */
+static int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n) {
+    unsigned char r = 0;
+    for (size_t i = 0; i < n; i++) r |= (unsigned char)(a[i] ^ b[i]);
+    return r == 0;
+}
+
+/* -------------------------------------------------------------------------
  * Public functions.
  * ------------------------------------------------------------------------- */
 
@@ -1555,6 +1625,45 @@ PS_SERIALIZER_DECODE_FUNC(phpser) {
 }
 #endif /* HAVE_PHP_SESSION */
 
+/* Parse a phpser_unserialize options array. On success, *out_set may be
+ * non-NULL and the caller must free it. Returns -1 on type error (an
+ * exception is already thrown). param_idx is the arg position for the
+ * error message (2 for unserialize, 3 for unserialize_signed). */
+static int parse_unserialize_options(
+    HashTable *options_ht, int param_idx,
+    int *out_mode, HashTable **out_set)
+{
+    *out_mode = ALLOWED_ALL;
+    *out_set = NULL;
+    if (!options_ht) return 0;
+    zval *ac = zend_hash_str_find(options_ht, "allowed_classes",
+                                   sizeof("allowed_classes") - 1);
+    if (!ac) return 0;
+    if (Z_TYPE_P(ac) == IS_FALSE) { *out_mode = ALLOWED_NONE; return 0; }
+    if (Z_TYPE_P(ac) == IS_TRUE)  { *out_mode = ALLOWED_ALL;  return 0; }
+    if (Z_TYPE_P(ac) == IS_ARRAY) {
+        /* Build a lowercased-name lookup set. PHP class names are
+         * case-insensitive; storing pre-lowered keeps the per-object
+         * filter check to one zend_hash_exists. */
+        *out_mode = ALLOWED_SET;
+        *out_set = emalloc(sizeof(HashTable));
+        zend_hash_init(*out_set, zend_hash_num_elements(Z_ARRVAL_P(ac)),
+                       NULL, NULL, 0);
+        zval *cn;
+        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ac), cn) {
+            if (Z_TYPE_P(cn) != IS_STRING) continue;
+            zend_string *lc = zend_string_tolower(Z_STR_P(cn));
+            zval one; ZVAL_TRUE(&one);
+            zend_hash_add(*out_set, lc, &one);
+            zend_string_release(lc);
+        } ZEND_HASH_FOREACH_END();
+        return 0;
+    }
+    zend_argument_value_error(param_idx,
+        "allowed_classes option must be array or bool");
+    return -1;
+}
+
 PHP_FUNCTION(phpser_unserialize) {
     char *str;
     size_t str_len;
@@ -1565,41 +1674,93 @@ PHP_FUNCTION(phpser_unserialize) {
         Z_PARAM_ARRAY_HT(options_ht)
     ZEND_PARSE_PARAMETERS_END();
 
-    int allowed_mode = ALLOWED_ALL;
-    HashTable *allowed_set = NULL;
-    if (options_ht) {
-        zval *ac = zend_hash_str_find(options_ht, "allowed_classes",
-                                       sizeof("allowed_classes") - 1);
-        if (ac) {
-            if (Z_TYPE_P(ac) == IS_FALSE) {
-                allowed_mode = ALLOWED_NONE;
-            } else if (Z_TYPE_P(ac) == IS_TRUE) {
-                allowed_mode = ALLOWED_ALL;
-            } else if (Z_TYPE_P(ac) == IS_ARRAY) {
-                /* Build a lowercased-name lookup set. PHP class names are
-                 * case-insensitive; storing pre-lowered keeps the per-object
-                 * filter check to one zend_hash_exists. */
-                allowed_mode = ALLOWED_SET;
-                allowed_set = emalloc(sizeof(HashTable));
-                zend_hash_init(allowed_set, zend_hash_num_elements(Z_ARRVAL_P(ac)),
-                               NULL, NULL, 0);
-                zval *cn;
-                ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ac), cn) {
-                    if (Z_TYPE_P(cn) != IS_STRING) continue;
-                    zend_string *lc = zend_string_tolower(Z_STR_P(cn));
-                    zval one; ZVAL_TRUE(&one);
-                    zend_hash_add(allowed_set, lc, &one);
-                    zend_string_release(lc);
-                } ZEND_HASH_FOREACH_END();
-            } else {
-                zend_argument_value_error(2,
-                    "allowed_classes option must be array or bool");
-                RETURN_THROWS();
-            }
-        }
+    int allowed_mode;
+    HashTable *allowed_set;
+    if (parse_unserialize_options(options_ht, 2, &allowed_mode, &allowed_set) < 0) {
+        RETURN_THROWS();
     }
 
     phpser_decode_buf_opts(str, str_len, return_value, allowed_mode, allowed_set);
+
+    if (allowed_set) {
+        zend_hash_destroy(allowed_set);
+        efree(allowed_set);
+    }
+}
+
+PHP_FUNCTION(phpser_serialize_signed) {
+    zval *value;
+    char *key;
+    size_t key_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_ZVAL(value)
+        Z_PARAM_STRING(key, key_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zend_string *frame = phpser_encode_zval(value);
+    /* Reallocate to add tag space. zend_string_extend grows the underlying
+     * allocation and bumps ZSTR_LEN. The 32 trailing bytes become the HMAC. */
+    size_t frame_len = ZSTR_LEN(frame);
+    zend_string *signed_str = zend_string_extend(frame, frame_len + PHPSER_HMAC_TAG_LEN, 0);
+    unsigned char *tag = (unsigned char *)ZSTR_VAL(signed_str) + frame_len;
+    if (phpser_hmac_sha256(
+            (const unsigned char *)key, key_len,
+            (const unsigned char *)ZSTR_VAL(signed_str), frame_len,
+            tag) < 0) {
+        zend_string_release(signed_str);
+        zend_throw_exception(zend_ce_exception,
+            "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
+        RETURN_THROWS();
+    }
+    ZSTR_VAL(signed_str)[frame_len + PHPSER_HMAC_TAG_LEN] = '\0';
+    RETURN_STR(signed_str);
+}
+
+PHP_FUNCTION(phpser_unserialize_signed) {
+    char *payload;
+    size_t payload_len;
+    char *key;
+    size_t key_len;
+    HashTable *options_ht = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STRING(payload, payload_len)
+        Z_PARAM_STRING(key, key_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(options_ht)
+    ZEND_PARSE_PARAMETERS_END();
+
+    /* Payload must include at least the 32-byte tag. Anything shorter is
+     * either truncated or never signed — reject without leaking which. */
+    if (payload_len < PHPSER_HMAC_TAG_LEN) {
+        zend_throw_exception(zend_ce_exception,
+            "phpser: signed payload too short", 0);
+        RETURN_THROWS();
+    }
+    size_t frame_len = payload_len - PHPSER_HMAC_TAG_LEN;
+    unsigned char expected[PHPSER_HMAC_TAG_LEN];
+    if (phpser_hmac_sha256(
+            (const unsigned char *)key, key_len,
+            (const unsigned char *)payload, frame_len,
+            expected) < 0) {
+        zend_throw_exception(zend_ce_exception,
+            "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
+        RETURN_THROWS();
+    }
+    if (!phpser_ct_eq(expected,
+                      (const unsigned char *)payload + frame_len,
+                      PHPSER_HMAC_TAG_LEN)) {
+        zend_throw_exception(zend_ce_exception,
+            "phpser: signature verification failed", 0);
+        RETURN_THROWS();
+    }
+
+    int allowed_mode;
+    HashTable *allowed_set;
+    if (parse_unserialize_options(options_ht, 3, &allowed_mode, &allowed_set) < 0) {
+        RETURN_THROWS();
+    }
+
+    phpser_decode_buf_opts(payload, frame_len, return_value, allowed_mode, allowed_set);
 
     if (allowed_set) {
         zend_hash_destroy(allowed_set);
@@ -1623,6 +1784,21 @@ static PHP_MINIT_FUNCTION(phpser) {
         PS_SERIALIZER_ENCODE_NAME(phpser),
         PS_SERIALIZER_DECODE_NAME(phpser));
 #endif
+    /* Cache SHA256 ops for HMAC signing. ext/hash is mandatory since PHP
+     * 7.4 so this never fails in normal builds; we still null-check at
+     * call time. The algo-name zend_string is interned/persistent for the
+     * module lifetime — `1` = persistent flag. */
+    phpser_sha256_name = zend_string_init("sha256", sizeof("sha256") - 1, 1);
+    phpser_sha256_ops = php_hash_fetch_ops(phpser_sha256_name);
+    return SUCCESS;
+}
+
+static PHP_MSHUTDOWN_FUNCTION(phpser) {
+    if (phpser_sha256_name) {
+        zend_string_release(phpser_sha256_name);
+        phpser_sha256_name = NULL;
+    }
+    phpser_sha256_ops = NULL;
     return SUCCESS;
 }
 
@@ -1646,6 +1822,10 @@ static PHP_MINFO_FUNCTION(phpser) {
  * See ~/ai/wiki/architecture/php-extension-c-conventions.md "Cross-extension
  * class lookup at MINIT" for the failure mode. */
 static const zend_module_dep phpser_deps[] = {
+    /* hash is mandatory since PHP 7.4 — we use its SHA256 ops for the
+     * signed-payload HMAC. ZEND_MOD_REQUIRED forces the engine to load
+     * hash's MINIT before ours so phpser_sha256_ops resolves cleanly. */
+    ZEND_MOD_REQUIRED("hash")
 #ifdef HAVE_PHP_SESSION
     ZEND_MOD_OPTIONAL("session")
 #endif
@@ -1659,7 +1839,8 @@ zend_module_entry phpser_module_entry = {
     PHP_PHPSER_EXTNAME,
     ext_functions,
     PHP_MINIT(phpser),
-    NULL, NULL, NULL,
+    PHP_MSHUTDOWN(phpser),
+    NULL, NULL,
     PHP_MINFO(phpser),
     PHP_PHPSER_VERSION,
     STANDARD_MODULE_PROPERTIES,
