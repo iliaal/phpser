@@ -22,11 +22,18 @@ failed to beat `pecl/igbinary` in opt-mode benchmarks — see
 | packed_1k | 5495 → **1941** (**-65%**) | 4.2k → **1.4k** ns (**-67%**) | 7.0k → **1.7k** ns (**-77%**) |
 | packed_10k | 60K → **22K** (**-63%**) | 41k → **16k** ns (**-61%**) | 67k → **17k** ns (**-73%**) |
 | deep_50 | 419 → 424 (parity) | 1.3k → **0.65k** ns (**-49%**) | 1.7k → **1.5k** ns (**-9%**) |
+| dto_100 | 7083 → **6362** (**-10%**) | 14k → 18k ns (+22%) | 25k → **22k** ns (**-11%**) |
+| dto_1000 | 73K → **65K** (**-12%**) | 175k → 173k ns (parity) | 250k → **214k** ns (**-14%**) |
+| dto_mixed | 22K → 29K (+33%) | 54k → 76k ns (+42%) | 103k → **88k** ns (**-14%**) |
 
 Wins: packed numerics ~65% smaller + ~75% faster decode + ~61% faster
 encode. Deep-nested ~49% faster encode at parity size. **Rowset_1000
 encode beats igbinary by ~25%**, size within 1.1%; decode pays a ~5%
 tax for the front-loaded dict header walk + refcount-reuse machinery.
+DTO workloads (Laravel-queue-style payloads, single-class arrays):
+**10-12% smaller, 11-14% faster decode** vs igbinary thanks to dict
+dedup on prop names + the class-entry lookup cache that amortizes
+`zend_lookup_class_ex` across same-typed batches.
 
 `rowset_100` encode (+30%) is the durable gap — fixed-cost floor for
 the dict header emission and first-row inline emissions, amortized
@@ -36,6 +43,11 @@ delta median +0.4%, absolute ratio +6%): the skip-DICT cache-eviction
 policy keeps `['a','b','c']`-style repeated values in DICT slots so
 `detect_packed_run` picks the `TAG_PACKED_STRINGS` typed-run path
 instead of falling back to `PACKED_MIXED` mid-rowset.
+
+`dto_mixed` encode (+42%) is the durable encode gap on object-heavy
+shapes — `obj->handlers->get_properties` is called per object and
+isn't trivially avoidable without a custom fast path for default
+property layouts.
 
 ## What we kept from the experiment
 
