@@ -1,4 +1,16 @@
 /*
+  +----------------------------------------------------------------------+
+  | Copyright (c) 2025-2026, Ilia Alshanetsky                            |
+  | Copyright (c) 2025-2026, Advanced Internet Designs Inc.              |
+  +----------------------------------------------------------------------+
+  | This source file is subject to the BSD 3-Clause license that is      |
+  | bundled with this package in the file LICENSE.                       |
+  +----------------------------------------------------------------------+
+  | Author: Ilia Alshanetsky <ilia@ilia.ws>                              |
+  +----------------------------------------------------------------------+
+*/
+
+/*
  * phpser — a PHP serialization extension targeting read-heavy cache workloads.
  *
  * Design notes (full discussion in README.md):
@@ -572,6 +584,77 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 return;
             }
             uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
+            /* __sleep: if defined, the method returns an array of property
+             * names to serialize. Unknown / static / IS_UNDEF entries are
+             * skipped (matches PHP behavior modulo the warnings PHP emits
+             * that we don't propagate). For declared props, ce->properties_info
+             * gives us the mangled name + offset; for dynamic props, fall
+             * back to obj->properties. Output stays TAG_OBJECT — the decode
+             * side doesn't need to know __sleep ran.
+             *
+             * Lookup pattern mirrors ext/standard/var.c:1216 — __sleep is not
+             * a struct member of zend_class_entry; PHP keeps it as a regular
+             * function and finds it via the function_table on demand. */
+            zval *sleep_fn_zv = zend_hash_find_known_hash(
+                &obj->ce->function_table, ZSTR_KNOWN(ZEND_STR_SLEEP));
+            if (sleep_fn_zv != NULL) {
+                zval names_zv;
+                ZVAL_UNDEF(&names_zv);
+                zend_call_known_instance_method_with_0_params(
+                    Z_FUNC_P(sleep_fn_zv), obj, &names_zv);
+                if (UNEXPECTED(EG(exception)) || Z_TYPE(names_zv) != IS_ARRAY) {
+                    zval_ptr_dtor(&names_zv);
+                    smart_str_appendc(body, TAG_NULL);
+                    return;
+                }
+                HashTable *names_ht = Z_ARRVAL(names_zv);
+                /* Two passes: count, then emit. Hash lookups are O(1) so
+                 * the extra walk is cheap; we need an accurate nprops for
+                 * the wire format ahead of the bucket emission. */
+                uint32_t nprops = 0;
+                zval *zv_name;
+                ZEND_HASH_FOREACH_VAL(names_ht, zv_name) {
+                    if (Z_TYPE_P(zv_name) != IS_STRING) continue;
+                    zend_string *nm = Z_STR_P(zv_name);
+                    zend_property_info *info = zend_hash_find_ptr(&obj->ce->properties_info, nm);
+                    if (info != NULL) {
+                        if (info->flags & ZEND_ACC_STATIC) continue;
+                        if (info->offset == (uint32_t)ZEND_VIRTUAL_PROPERTY_OFFSET) continue;
+                        zval *p = OBJ_PROP(obj, info->offset);
+                        if (Z_TYPE_P(p) == IS_UNDEF) continue;
+                        nprops++;
+                    } else if (obj->properties) {
+                        zval *p = zend_hash_find(obj->properties, nm);
+                        if (p && Z_TYPE_P(p) != IS_UNDEF) nprops++;
+                    }
+                } ZEND_HASH_FOREACH_END();
+                smart_str_appendc(body, TAG_OBJECT);
+                varint_write_u64(body, class_idx);
+                varint_write_u64(body, nprops);
+                ZEND_HASH_FOREACH_VAL(names_ht, zv_name) {
+                    if (Z_TYPE_P(zv_name) != IS_STRING) continue;
+                    zend_string *nm = Z_STR_P(zv_name);
+                    zend_property_info *info = zend_hash_find_ptr(&obj->ce->properties_info, nm);
+                    zend_string *key;
+                    zval *p;
+                    if (info != NULL) {
+                        if (info->flags & ZEND_ACC_STATIC) continue;
+                        if (info->offset == (uint32_t)ZEND_VIRTUAL_PROPERTY_OFFSET) continue;
+                        p = OBJ_PROP(obj, info->offset);
+                        if (Z_TYPE_P(p) == IS_UNDEF) continue;
+                        key = info->name;
+                    } else if (obj->properties && (p = zend_hash_find(obj->properties, nm)) != NULL
+                               && Z_TYPE_P(p) != IS_UNDEF) {
+                        key = nm;
+                    } else {
+                        continue;
+                    }
+                    varint_write_u64(body, enc_intern_zstr(e, key));
+                    encode_value(body, e, p);
+                } ZEND_HASH_FOREACH_END();
+                zval_ptr_dtor(&names_zv);
+                return;
+            }
             HashTable *props = obj->handlers->get_properties(obj);
             /* Count live entries — get_properties can include $this-style
              * entries we want to skip and tombstones (IS_UNDEF). */
@@ -748,6 +831,13 @@ typedef struct {
     deferred_unserialize *deferred;
     uint32_t deferred_len;
     uint32_t deferred_cap;
+    /* Separate __wakeup queue: TAG_OBJECT objects whose class defines
+     * __wakeup get queued here and fired after the deferred __unserialize
+     * loop, so the entire graph is materialized before any wakeup hook
+     * runs. PHP's var_unserializer uses the same two-phase ordering. */
+    zend_object **wakeup;
+    uint32_t wakeup_len;
+    uint32_t wakeup_cap;
     int error;
 } decode_ctx;
 
@@ -783,6 +873,15 @@ static int dec_defer_unserialize(decode_ctx *d, zend_object *obj, zval *data) {
     d->deferred[d->deferred_len].obj = obj;
     ZVAL_COPY_VALUE(&d->deferred[d->deferred_len].data, data);
     d->deferred_len++;
+    return 0;
+}
+
+static int dec_defer_wakeup(decode_ctx *d, zend_object *obj) {
+    if (d->wakeup_len == d->wakeup_cap) {
+        d->wakeup_cap = d->wakeup_cap ? d->wakeup_cap * 2 : 4;
+        d->wakeup = erealloc(d->wakeup, d->wakeup_cap * sizeof(zend_object *));
+    }
+    d->wakeup[d->wakeup_len++] = obj;
     return 0;
 }
 
@@ -838,6 +937,11 @@ static void decode_destroy(decode_ctx *d) {
             zval_ptr_dtor(&d->deferred[i].data);
         }
         efree(d->deferred);
+    }
+    if (d->wakeup) {
+        /* Bare pointer table — no refs held; the wakeup target stays alive
+         * via its primary slot in the materialized graph. */
+        efree(d->wakeup);
     }
 }
 
@@ -1181,6 +1285,14 @@ static int decode_value(decode_ctx *d, zval *out) {
             obj_fail:
                 zval_ptr_dtor(out); ZVAL_NULL(out); return -1;
             }
+            /* Queue __wakeup if the class defines it. Deferred to end-of-pass
+             * so the full graph is stitched before any wakeup hook runs and
+             * sees cycle back-edges intact. Lookup via function_table —
+             * __wakeup isn't cached on zend_class_entry. */
+            if (zend_hash_find_known_hash(&ce->function_table,
+                    ZSTR_KNOWN(ZEND_STR_WAKEUP)) != NULL) {
+                dec_defer_wakeup(d, obj);
+            }
             return 0;
         }
         case TAG_ASSOC: {
@@ -1292,8 +1404,25 @@ static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
         zend_call_known_instance_method_with_1_params(
             obj->ce->__unserialize, obj, &retval, data);
         zval_ptr_dtor(&retval);
-        if (UNEXPECTED(EG(exception))) break;
+        if (UNEXPECTED(EG(exception))) goto done;
     }
+    /* __wakeup runs strictly after every __unserialize has resolved, so a
+     * wakeup hook on object A sees a fully-stitched object B even when B's
+     * __unserialize would have rebuilt B's state. PHP's var_unserializer
+     * uses the same two-phase ordering. */
+    for (uint32_t i = 0; i < d.wakeup_len; i++) {
+        zend_object *obj = d.wakeup[i];
+        zval *wake_fn_zv = zend_hash_find_known_hash(
+            &obj->ce->function_table, ZSTR_KNOWN(ZEND_STR_WAKEUP));
+        if (!wake_fn_zv) continue;
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_known_instance_method_with_0_params(
+            Z_FUNC_P(wake_fn_zv), obj, &retval);
+        zval_ptr_dtor(&retval);
+        if (UNEXPECTED(EG(exception))) goto done;
+    }
+done:
     decode_destroy(&d);
     return 0;
 }

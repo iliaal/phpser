@@ -1,4 +1,16 @@
 /*
+  +----------------------------------------------------------------------+
+  | Copyright (c) 2025-2026, Ilia Alshanetsky                            |
+  | Copyright (c) 2025-2026, Advanced Internet Designs Inc.              |
+  +----------------------------------------------------------------------+
+  | This source file is subject to the BSD 3-Clause license that is      |
+  | bundled with this package in the file LICENSE.                       |
+  +----------------------------------------------------------------------+
+  | Author: Ilia Alshanetsky <ilia@ilia.ws>                              |
+  +----------------------------------------------------------------------+
+*/
+
+/*
  * phpser — public header.
  *
  * Re-exported via PHP_INSTALL_HEADERS so other extensions can call into
