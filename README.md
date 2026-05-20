@@ -14,23 +14,20 @@ failed to beat `pecl/igbinary` in opt-mode benchmarks — see
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → 4876 (+7%) | 8k → 11k ns (+38%) | 9k → 9.5k ns (parity) |
-| rowset_1000 | 47K → 50K (+5%) | 138k → 120k ns (**-13%**) | 92k → 97k ns (parity, +5%) |
+| rowset_100 | 4570 → 5095 (+12%) | 8k → 11k ns (+30%) | 9k → 9.8k ns (+8%) |
+| rowset_1000 | 47K → 49K (**+3%**) | 140k → 110k ns (**-22%**) | 95k → 99k ns (parity, +4%) |
 | packed_1k | 5495 → **1941** (**-65%**) | 3.7k → **1.2k** ns (**-66%**) | 6.4k → **1.8k** ns (**-73%**) |
 | packed_10k | 60K → **22K** (**-63%**) | 37k → **15k** ns (**-59%**) | 62k → **19k** ns (**-70%**) |
 | deep_50 | 419 → 420 (parity) | 1.2k → **0.7k** ns (**-41%**) | 1.6k → **1.3k** ns (**-20%**) |
 
 Wins: packed numerics ~65% smaller + ~70% faster decode + ~60% faster
-encode. Deep-nested ~20–40% faster on both sides at parity size.
-**Rowset_1000 encode now beats igbinary by 13%**, decode at parity (+5%).
+encode. Deep-nested ~20–55% faster encode at parity size. **Rowset_1000
+encode beats igbinary by ~22%**, decode at parity (+4%), size within 3%.
 
-`rowset_100` encode (+38%) is the one durable gap — it's fixed-cost
-floor for unique-per-row strings (`row_0`..`row_99`) that get dict-
-interned individually. igbinary emits these inline with no per-string
-dict overhead. Closing further would require an inline-string tag or
-a two-pass encoder that knows which strings appear `>= 2` times. The
-absolute time is small enough (11 µs for the entire 100-row payload)
-that it hasn't been worth the complexity.
+`rowset_100` encode (+30%) is the one durable gap — fixed-cost floor
+for the dict header emission and first-row inline emissions, amortized
+over too few rows to recover. The absolute time is small (10 µs for
+the entire 100-row payload).
 
 ## What we kept from the experiment
 
@@ -76,18 +73,22 @@ measurable perf to take, and that this project targets, are:
    `zend_hash_add_new` reuses the cached hash. **Shipped.**
 5. **`add_new` insert path on assoc decode.** Skips the existence check
    since we know the encoder doesn't emit duplicate keys. **Shipped.**
-6. **Inline-short-string tag — tried, didn't pay off.** Wire format reserves
-   `TAG_STR_INLINE` (0x0c) and `KEY_STR_INLINE` (0x02); the decoder
-   accepts them for forward-compat with future encoders. We implemented
-   a two-pass encoder that counts per-`zend_string*` use frequency, then
-   emits dict refs for repeated strings and inline bytes for singletons.
-   Result: size dropped from +5% to +1% on rowsets, but encode time
-   regressed catastrophically (`rowset_1000`: -13% → +131% vs igbinary).
-   The HashTable-based count pre-pass burns ~200 ns per string visit,
-   and we visit every string twice (count + emit). The savings per
-   inlined singleton string are ~100 ns — net loss. A custom open-
-   addressing counter array might tip the balance, but the size win
-   alone (~2 KB per 50 KB payload) doesn't justify the engineering.
+6. **Inline-short-string tag — shipped via upgrade-on-second-encounter.**
+   `TAG_STR_INLINE` (0x0c) and `KEY_STR_INLINE` (0x02) are emitted on a
+   string's first occurrence; the next occurrence triggers an in-place
+   upgrade to a dict entry, and all subsequent ones emit `TAG_STR_DICT`.
+   Singletons (e.g. `row_X` values in a rowset) never hit the upgrade
+   branch — they cost nothing in the dict header. The intern cache
+   doubles as the "seen once?" signal: high bit of `idx` distinguishes
+   `INLINE_EMITTED` from `DICT_IDX`. No pre-pass; single walk of the
+   zval tree as before.
+
+   This is approach B from the design notes. An earlier attempt at the
+   two-pass version (approach A — count-then-emit) hit the
+   ~200-ns-per-string cost of the count pre-pass, which exceeded the
+   per-singleton savings; we left A out and shipped B. Effect:
+   `rowset_1000` encode improved from -8% to -20% to -25% vs igbinary;
+   payload size dropped from +5% to +2.7%.
 7. **Skip refcount machinery during build.** All zvals built during decode
    are fresh and unshared until handed back to PHP — internal writes can
    skip `Z_TRY_ADDREF` guards.

@@ -126,9 +126,27 @@ static inline int varint_read_i64(const uint8_t *buf, size_t buflen, size_t *pos
  * Behavior remains correct — wire format just gets a bit larger. */
 #define HASH_MAP_THRESHOLD 32
 
+/* Slot kinds in the intern cache, encoded in the high bit of idx.
+ *
+ *   INLINE_EMITTED: we've seen this zend_string once and emitted its bytes
+ *                   inline. If we see it again, that's the signal to
+ *                   upgrade to a dict entry — the inline emission has
+ *                   already happened, future occurrences become refs.
+ *   DICT_IDX:       string lives in the dict at the recorded idx. All
+ *                   occurrences from here on emit a dict ref.
+ *
+ * Stuffing the kind into idx's high bit keeps intern_slot at 16 bytes
+ * (1 cache line stride friendly) and lets the cache scan stay a tight
+ * pointer-equality loop. INLINE_EMITTED slots use idx as a sentinel — we
+ * never read the idx for those, just check the kind. */
+#define SLOT_KIND_BIT       0x80000000u
+#define SLOT_IS_DICT(s)     (((s).idx & SLOT_KIND_BIT) == 0)
+#define SLOT_DICT_IDX(s)    ((s).idx)
+#define SLOT_INLINE_MARK    SLOT_KIND_BIT  /* sentinel idx for inline-only slots */
+
 typedef struct {
     zend_string *ptr;
-    uint32_t idx;
+    uint32_t idx;  /* high bit set = INLINE_EMITTED, clear = DICT_IDX with idx in low 31 bits */
 } intern_slot;
 
 /* Cycle guard for recursive encode. Cache payloads usually nest 5-10 deep;
@@ -165,7 +183,14 @@ static void enc_ctx_destroy(encode_ctx *e) {
     if (e->dict) efree(e->dict);
 }
 
-static inline void enc_cache_insert(encode_ctx *e, zend_string *zs, uint32_t idx) {
+static inline intern_slot *enc_cache_find(encode_ctx *e, zend_string *zs) {
+    for (uint32_t i = 0; i < e->cache_filled; i++) {
+        if (e->inline_cache[i].ptr == zs) return &e->inline_cache[i];
+    }
+    return NULL;
+}
+
+static inline intern_slot *enc_cache_alloc_slot(encode_ctx *e, zend_string *zs) {
     uint32_t slot;
     if (e->cache_filled < INTERN_CACHE_SIZE) {
         slot = e->cache_filled++;
@@ -174,28 +199,14 @@ static inline void enc_cache_insert(encode_ctx *e, zend_string *zs, uint32_t idx
         e->cache_next = (e->cache_next + 1) % INTERN_CACHE_SIZE;
     }
     e->inline_cache[slot].ptr = zs;
-    e->inline_cache[slot].idx = idx;
+    return &e->inline_cache[slot];
 }
 
-static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
-    /* Inline-cache pointer scan. Hot loop — straight comparisons, no hash. */
-    for (uint32_t i = 0; i < e->cache_filled; i++) {
-        if (e->inline_cache[i].ptr == zs) return e->inline_cache[i].idx;
-    }
-
-    /* Content lookup, only once the dict is large enough that the chance
-     * of two distinct allocations colliding by content matters. For small
-     * payloads this branch is skipped — saves the per-unique-string hash. */
-    if (e->dict_len >= HASH_MAP_THRESHOLD) {
-        zval *hit = zend_hash_find(&e->hash_map, zs);
-        if (hit) {
-            uint32_t idx = (uint32_t)Z_LVAL_P(hit);
-            enc_cache_insert(e, zs, idx);
-            return idx;
-        }
-    }
-
-    /* Append to dict. */
+/* Allocate a dict slot for `zs` and return its index. Also maintains the
+ * content hash_map once the dict has crossed HASH_MAP_THRESHOLD entries
+ * (small dicts skip the hash work entirely — pointer-equality via cache
+ * already catches the literal-interned case). */
+static uint32_t enc_dict_append(encode_ctx *e, zend_string *zs) {
     if (e->dict_len == e->dict_cap) {
         e->dict_cap = e->dict_cap ? e->dict_cap * 2 : 16;
         e->dict = erealloc(e->dict, e->dict_cap * sizeof(zend_string *));
@@ -203,8 +214,6 @@ static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
     uint32_t idx = e->dict_len++;
     e->dict[idx] = zs;
 
-    /* Once we cross the threshold, backfill the hash_map so subsequent
-     * misses can hit it. Pay this O(N) cost exactly once. */
     if (e->dict_len == HASH_MAP_THRESHOLD) {
         for (uint32_t i = 0; i < e->dict_len; i++) {
             zval iz; ZVAL_LONG(&iz, i);
@@ -214,8 +223,101 @@ static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
         zval iz; ZVAL_LONG(&iz, idx);
         zend_hash_add(&e->hash_map, zs, &iz);
     }
-    enc_cache_insert(e, zs, idx);
     return idx;
+}
+
+/* Always-dict intern path: used for object class names and property keys,
+ * which we don't try to inline (TAG_OBJECT wire format hardcodes dict refs
+ * for those slots). */
+static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
+    intern_slot *s = enc_cache_find(e, zs);
+    if (s && SLOT_IS_DICT(*s)) return SLOT_DICT_IDX(*s);
+
+    /* Cache miss or INLINE_EMITTED. Try content lookup once the dict is big
+     * enough to matter. */
+    if (e->dict_len >= HASH_MAP_THRESHOLD) {
+        zval *hit = zend_hash_find(&e->hash_map, zs);
+        if (hit) {
+            uint32_t idx = (uint32_t)Z_LVAL_P(hit);
+            if (s) { s->idx = idx; } else { enc_cache_alloc_slot(e, zs)->idx = idx; }
+            return idx;
+        }
+    }
+
+    uint32_t idx = enc_dict_append(e, zs);
+    if (s) { s->idx = idx; } else { enc_cache_alloc_slot(e, zs)->idx = idx; }
+    return idx;
+}
+
+/* Emit a string value, choosing between TAG_STR_INLINE (first encounter)
+ * and TAG_STR_DICT (second+ encounter via upgrade). Single-pass: we don't
+ * know if a string will repeat until we see it again. Subtle properties:
+ *
+ *   - First-time strings emit TAG_STR_INLINE — no dict insert cost.
+ *   - On the SECOND encounter we promote to the dict; the previous inline
+ *     emission stays as-is in the buffer (it's still a valid value), and
+ *     all subsequent occurrences emit TAG_STR_DICT with the assigned idx.
+ *   - For pure-singleton strings (e.g. row_X values in a rowset), we never
+ *     hit the upgrade branch — no dict header overhead either.
+ *   - Eviction from the 16-slot ring is benign: a later re-encounter of
+ *     an evicted INLINE_EMITTED string will inline-emit it a second time.
+ *     Decode is still correct; the wire just has the same bytes twice. */
+static void enc_emit_str_value(smart_str *body, encode_ctx *e, zend_string *zs) {
+    intern_slot *s = enc_cache_find(e, zs);
+    if (s) {
+        if (SLOT_IS_DICT(*s)) {
+            emit_tag_and_varint(body, TAG_STR_DICT, SLOT_DICT_IDX(*s));
+            return;
+        }
+        /* INLINE_EMITTED — upgrade in place. */
+        s->idx = enc_dict_append(e, zs);  /* writes into low 31 bits; high bit cleared */
+        emit_tag_and_varint(body, TAG_STR_DICT, s->idx);
+        return;
+    }
+    /* Cache miss above HASH_MAP_THRESHOLD: content dedup might still hit. */
+    if (e->dict_len >= HASH_MAP_THRESHOLD) {
+        zval *hit = zend_hash_find(&e->hash_map, zs);
+        if (hit) {
+            uint32_t idx = (uint32_t)Z_LVAL_P(hit);
+            enc_cache_alloc_slot(e, zs)->idx = idx;
+            emit_tag_and_varint(body, TAG_STR_DICT, idx);
+            return;
+        }
+    }
+    /* First encounter: emit inline, mark in cache as INLINE_EMITTED so the
+     * next occurrence triggers the upgrade above. */
+    smart_str_appendc(body, TAG_STR_INLINE);
+    varint_write_u64(body, ZSTR_LEN(zs));
+    smart_str_appendl(body, ZSTR_VAL(zs), ZSTR_LEN(zs));
+    enc_cache_alloc_slot(e, zs)->idx = SLOT_INLINE_MARK;
+}
+
+/* Same idea for assoc string keys: KEY_STR_INLINE on first occurrence,
+ * KEY_STR on subsequent. */
+static void enc_emit_str_key(smart_str *body, encode_ctx *e, zend_string *zs) {
+    intern_slot *s = enc_cache_find(e, zs);
+    if (s) {
+        if (SLOT_IS_DICT(*s)) {
+            emit_tag_and_varint(body, KEY_STR, SLOT_DICT_IDX(*s));
+            return;
+        }
+        s->idx = enc_dict_append(e, zs);
+        emit_tag_and_varint(body, KEY_STR, s->idx);
+        return;
+    }
+    if (e->dict_len >= HASH_MAP_THRESHOLD) {
+        zval *hit = zend_hash_find(&e->hash_map, zs);
+        if (hit) {
+            uint32_t idx = (uint32_t)Z_LVAL_P(hit);
+            enc_cache_alloc_slot(e, zs)->idx = idx;
+            emit_tag_and_varint(body, KEY_STR, idx);
+            return;
+        }
+    }
+    smart_str_appendc(body, KEY_STR_INLINE);
+    varint_write_u64(body, ZSTR_LEN(zs));
+    smart_str_appendl(body, ZSTR_VAL(zs), ZSTR_LEN(zs));
+    enc_cache_alloc_slot(e, zs)->idx = SLOT_INLINE_MARK;
 }
 
 /* -------------------------------------------------------------------------
@@ -267,15 +369,9 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
             smart_str_appendl(body, (char *)&d, 8);
             return;
         }
-        case IS_STRING: {
-            /* Always dict-intern. TAG_STR_INLINE exists in the wire format
-             * and the decoder handles it for forward-compat, but the two-
-             * pass count-then-emit encoder we'd need to choose intelligently
-             * costs more in pre-pass HashTable ops than the singleton-inline
-             * emission saves. See README for the experiment writeup. */
-            emit_tag_and_varint(body, TAG_STR_DICT, enc_intern_zstr(e, Z_STR_P(v)));
+        case IS_STRING:
+            enc_emit_str_value(body, e, Z_STR_P(v));
             return;
-        }
         case IS_ARRAY:
             encode_hashtable(body, e, Z_ARRVAL_P(v));
             return;
@@ -321,8 +417,14 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
 
 /* Homogeneity scan over a dense packed array. Determines whether we can use
  * a typed-run tag (PACKED_LONGS / PACKED_DOUBLES / PACKED_STRINGS) that skips
- * per-element tag emission and lets the decoder use a single tight loop. */
-static uint8_t detect_packed_run(HashTable *ht, uint32_t n_used) {
+ * per-element tag emission and lets the decoder use a single tight loop.
+ *
+ * For PACKED_STRINGS we additionally require every element to already be
+ * dict-bound — otherwise we'd lose the inline-singleton optimization. The
+ * common rowset case where the same `['a','b','c']` tags array appears in
+ * every row hits this fast path from row 2 onward (after the upgrade
+ * during row 1's PACKED_MIXED traversal). */
+static uint8_t detect_packed_run(encode_ctx *e, HashTable *ht, uint32_t n_used) {
     if (n_used == 0) return TAG_PACKED_MIXED;
     zval *zp = ht->arPacked;
     uint8_t first = Z_TYPE(zp[0]);
@@ -335,7 +437,13 @@ static uint8_t detect_packed_run(HashTable *ht, uint32_t n_used) {
     switch (first) {
         case IS_LONG:   return TAG_PACKED_LONGS;
         case IS_DOUBLE: return TAG_PACKED_DOUBLES;
-        case IS_STRING: return TAG_PACKED_STRINGS;
+        case IS_STRING: {
+            for (uint32_t i = 0; i < n_used; i++) {
+                intern_slot *s = enc_cache_find(e, Z_STR(zp[i]));
+                if (!s || !SLOT_IS_DICT(*s)) return TAG_PACKED_MIXED;
+            }
+            return TAG_PACKED_STRINGS;
+        }
         default:        return TAG_PACKED_MIXED; /* unreachable */
     }
 }
@@ -347,7 +455,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
 
     if (is_packed && n_used == n_elems && n_used > 0) {
         /* Dense packed — try to use a typed-run tag. */
-        uint8_t tag = detect_packed_run(ht, n_used);
+        uint8_t tag = detect_packed_run(e, ht, n_used);
         smart_str_appendc(body, tag);
         varint_write_u64(body, n_elems);
         zval *zp = ht->arPacked;
@@ -394,10 +502,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
     for (; b < end; b++) {
         if (Z_TYPE(b->val) == IS_UNDEF) continue;
         if (b->key) {
-            /* Always KEY_STR. KEY_STR_INLINE exists in the wire format and
-             * the decoder accepts it (forward-compat), but encoder doesn't
-             * emit it — see README for why two-pass didn't pay off. */
-            emit_tag_and_varint(body, KEY_STR, enc_intern_zstr(e, b->key));
+            enc_emit_str_key(body, e, b->key);
         } else {
             emit_tag_and_varint(body, KEY_LONG, zigzag_encode64((int64_t)b->h));
         }
