@@ -1,117 +1,97 @@
-# rkyvser
+# phpser
 
-A PHP serialization extension built on [rkyv](https://rkyv.org/), targeting
-read-heavy cache workloads where decode time matters more than encode time
-or payload size.
+A PHP serialization extension in C, targeting read-heavy cache workloads
+where decode time matters more than encode time or payload size.
 
-Status: working V2. Round-trip is clean on all primitive + array shapes.
-Object reconstruction is still a stub (round-trips through `stdClass` shape).
+Status: V1 in progress. Pivoted from a Rust+rkyv prototype after the rkyv
+architecture failed to beat `pecl/igbinary` in opt-mode benchmarks — see
+`LEGACY-RKYV.md` for that journey and the data behind the pivot.
 
-## What's here
+## What we kept from the experiment
 
-- `src/lib.rs` — the extension. Wire format is `PhpPayload { dict, root }`
-  with a front-loaded string dictionary. Decode caches `*mut zend_string`
-  per dict slot and reuses via refcount bumps, the same shape as igbinary's
-  `compact_strings`.
-- `bench.php` — A/B vs `pecl/igbinary` on rowset / packed / nested shapes.
-- `scripts/php-config-intree` — wrapper php-config that points at the in-tree
-  `~/php-src-8.4` headers, so we don't need `make install`.
+The rkyv attempt produced one solid finding and several reusable design
+ideas:
+
+- **Pointer-equality dict intern.** Encoding hits a `*zend_string == *zend_string`
+  check first; only on miss do we hash the bytes. Cuts intern cost to
+  near-zero for rowset-shaped data where PHP literals share interned
+  zend_strings.
+- **Front-loaded string dictionary.** Same shape as igbinary's
+  `compact_strings`, except we emit the table once at the head and
+  reference by varint index from values. Trade-off: not streamable.
+- **Refcount-reuse of zend_strings on decode.** Per-decode cache parallel
+  to the dict — first reference allocates, subsequent ones `addref`.
+- **HT_IS_PACKED detection via flag, not iteration.** Avoid scanning the
+  buckets just to determine layout.
+- **`arPacked` stride awareness.** PHP 8+'s packed-array layout stores
+  zvals directly, not Buckets — stride is 16, not 32.
+- **Sparse-packed fallback.** Arrays with holes (post-`unset`) preserve
+  original int keys via Assoc rather than silently re-indexing.
+
+## Where phpser diverges from igbinary
+
+igbinary is the closest reference point. The areas where there's still
+measurable perf to take, and that this project targets, are:
+
+1. **Pre-sized HT + direct `arPacked` writes on decode.** When the wire
+   format declares `PACKED_LEN N`, allocate the HT once via
+   `zend_new_array(N)` and write directly into `arPacked` with `ZVAL_*`
+   macros. Skips N `zend_hash_next_index_insert` calls, including their
+   hash computation, growth checks, and capacity tuning.
+2. **Tagged scalar runs.** `[1, 2, 3, ...]` (1000 longs) emits as a
+   single `PACKED_LONGS` header + N zigzag varints, not 1000 `(tag,
+   varint)` pairs. Decode is one tight loop with no per-element tag
+   dispatch.
+3. **Inline-string optimization (planned).** For string keys ≤7 bytes
+   (common: `"id"`, `"name"`...), pack the bytes into the wire tag
+   instead of going through the dict. Saves a dict entry and a pointer
+   indirection.
+4. **Skip refcount machinery during build.** All zvals built during decode
+   are fresh and unshared until handed back to PHP — internal writes can
+   skip `Z_TRY_ADDREF` guards.
 
 ## Build
 
+phpser uses the standard PHP extension build system. Targets in-tree
+`~/php-src-8.4-opt` via a wrapper php-config:
+
 ```sh
-PHP_CONFIG=$(pwd)/scripts/php-config-intree \
-PHP=$HOME/php-src-8.4/sapi/cli/php \
-cargo build --release
+phpize --with-php-config=$(pwd)/scripts/php-config-intree-opt
+./configure --with-php-config=$(pwd)/scripts/php-config-intree-opt
+make -j$(nproc)
 ```
 
-Then load both `librkyvser.so` and `igbinary.so` into the local PHP:
+Then load alongside igbinary for the A/B bench:
 
 ```sh
-~/php-src-8.4/sapi/cli/php \
+~/php-src-8.4-opt/sapi/cli/php \
   -d extension=$HOME/igbinary/modules/igbinary.so \
-  -d extension=$HOME/ai/phprkyv/target/release/librkyvser.so \
+  -d extension=$(pwd)/modules/phpser.so \
   bench.php
 ```
 
-## V3 baseline numbers
+## Wire format (V1 draft)
 
-PHP 8.4.22-dev **NTS DEBUG** build (debug build inflates both libraries'
-absolute ns/op ~5–10× vs release; relative ratios should hold roughly).
+```
+[u8 version=0x01]
+[varint ndict]
+  per entry: [varint len] [bytes]
+[value]
 
-| Shape | Size: ig → rk | Serialize: ig → rk | Unserialize: ig → rk |
-|---|---|---|---|
-| rowset_100 | 4.5K → 40K (+777%) | 17k ns → 257k ns (15×) | 103k ns → 142k ns (+38%) |
-| rowset_1000 | 47K → 399K (+741%) | 177k ns → 1.5M ns (8.5×) | 1001k ns → 1370k ns (+37%) |
-| packed_1k | 5.5K → 24K (+338%) | 7k ns → 65k ns (9.3×) | 36k ns → **27k ns (-26%)** |
-| packed_10k | 60K → 240K (+304%) | 63k ns → 581k ns (9.2×) | 334k ns → **266k ns (-20%)** |
-| deep_50 | 420 → 4144 (+889%) | 4k ns → 35k ns (8.6×) | 21k ns → 20k ns (parity) |
+value tags:
+  0x00 NULL
+  0x01 FALSE
+  0x02 TRUE
+  0x03 LONG          varint (zigzag-encoded)
+  0x04 DOUBLE        8 bytes (LE)
+  0x05 STR_DICT      varint dict_idx
+  0x06 ASSOC         varint(len), N×(key, val)
+  0x07 PACKED_MIXED  varint(len), N×val
+  0x08 PACKED_LONGS  varint(len), N×zigzag-varint
+  0x09 PACKED_DOUBLES varint(len), N×8-byte LE
+  0x0a OBJECT        varint(class_idx), varint(nprops), N×(key_idx, val)
 
-**Where rkyvser wins**: packed numeric arrays — about 20–26% faster decode
-than igbinary, validating the zero-copy architecture for this shape.
-
-**Where rkyvser loses**:
-- *Size*: 3–10× larger. rkyv pads everything for alignment to enable
-  pointer-cast access. This is inherent to the format — varint encoding
-  would fight rkyv's design.
-- *Encode speed*: 8.5–15× slower (was 16–42× in V2). V3's raw zend FFI on
-  HT iteration cut this in half. Remaining gap is rkyv's per-slot
-  alignment writes in `to_bytes` + the `PhpValue` tree allocation itself.
-  Closing further requires either a manual `Archive`/`Serialize` impl on
-  a `ZvalView` wrapper, or accepting that rkyv-class formats won't match
-  varint streamers on encode.
-- *Decode on rowsets*: 37–38% slower. Was 230% slower before V2's string
-  refcount reuse. Closing the remainder probably requires custom bucket
-  insertion that skips ext-php-rs's `into_zval` overhead per entry.
-
-## V0 → V1 → V2 → V3 progression
-
-| Version | Wire format | Encode model | Decode model | Headline change |
-|---|---|---|---|---|
-| V0 (skeleton) | Inline `Str(Vec<u8>)` | `zval_to_value` via `ext-php-rs` HT iter | Fresh `zend_string_init` per ref | Initial round-trip. |
-| V1 | `PhpPayload { dict, root }` with `Str(u32)` | Same | Same | -40% payload size. |
-| V2 | Same as V1 | Same | `StringCache<'a>` with refcount reuse | -60% rowset decode vs V1. Competitive with igbinary on reads. |
-| V3 | Same as V2 | Raw zend FFI: Bucket pointer math, `HT_IS_PACKED` via flag, pointer-keyed dict | Same as V2 | -50 to -73% encode time. Was 24× slower than igbinary on rowsets, now 8.5×. |
-
-## What's left (roadmap)
-
-1. **Encode-side: skip PhpValue materialization entirely.** Manual
-   `Archive`/`Serialize` impl on a `ZvalView<'a>(&'a Zval, &'a mut Interner)`
-   that emits rkyv bytes while walking. Realistic target: 3–5× igbinary on
-   encode (rkyv's per-slot alignment writes have inherent overhead vs
-   varint). Largest remaining lever on encode.
-2. **Object reconstruction.** Currently round-trips as `stdClass` with public
-   props via an assoc HashTable — `serialize($obj) !== serialize($rt)` is
-   the visible failure mode. Real impl needs `zend_lookup_class_ex`,
-   property table init, `__wakeup` invocation, typed-property coercion.
-   Read igbinary's `igbinary_unserialize_object_ser` before writing this.
-3. **References / `IS_REF` / recursion.** Currently flattens. Add a per-encode
-   id table, emit `Ref(u32)` variant. Detect cycles or refuse to encode them.
-4. **Custom HT insert that skips `into_zval`.** Decode side currently goes
-   through ext-php-rs's `ht.push` / `ht.insert_at_index`, which each call
-   `IntoZval::into_zval(zval, false)` even though our value is already a
-   zval. Direct `zend_hash_index_update(ht, idx, &mut zv)` would shave
-   per-entry overhead — visible on rowsets.
-5. **zstd compression option.** rkyv's padding compresses extremely well —
-   typically 5–10× on integer-heavy payloads. Opt-in 3rd arg or separate
-   `rkyv_serialize_compressed()` pair.
-6. **Non-debug PHP build for clean bench numbers.** Configure `~/php-src-8.4`
-   without `--enable-debug` (or stand up a separate `~/php-src-8.4-opt`).
-7. **phpredis serializer registration.** Hook `Redis::SERIALIZER_*`. Requires
-   either a small phpredis patch or a wrapper class.
-8. **`session.serialize_handler=rkyv`.** Needs `PS_SERIALIZER_ENCODE_FUNC` /
-   `PS_SERIALIZER_DECODE_FUNC` registration in MINIT.
-
-## Sharp edges already known
-
-- `ext-php-rs` 0.13 → 0.15 had real API drift (`ArrayKey::Str` was added,
-  `get_properties` switched from `Option` to `Result`, `insert_at_index` key
-  type changed to `i64`). Pin to 0.15 for now.
-- `zend_hash_update` (the `*zend_string`-keyed variant) isn't in ext-php-rs's
-  allowed_bindings. We declare it ourselves; signature is stable PHP API.
-- `rkyv::access` requires `bytecheck` feature; without it you get unsafe
-  `access_unchecked` only. Don't ship without validation on untrusted reads.
-- The local php-src `scripts/php-config` and `scripts/phpize` ship without
-  the executable bit set, and emit paths into `/usr/local/include/php`
-  (which only exist after `make install`). `scripts/php-config-intree`
-  works around the former; igbinary was rebuilt with that wrapper.
+key:
+  0x00 LONG          varint(zigzag)
+  0x01 STR           varint(dict_idx)
+```
