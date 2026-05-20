@@ -1,0 +1,21 @@
+// Windows build configuration for phpser.
+// Mirrors config.m4; no vendored dependencies, single .c source.
+
+ARG_ENABLE("phpser", "Enable phpser binary-serializer support", "no");
+
+if (PHP_PHPSER != "no") {
+    EXTENSION("phpser", "phpser.c", null,
+        "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
+
+    // Register as a session.serialize_handler when the session extension
+    // is part of this build. PHP_SESSION is defined by the session
+    // extension's own config.w32; default-on for standard Windows
+    // builds, so the guard mostly suppresses link errors on minimal
+    // SAPI configurations.
+    if (PHP_SESSION != "no") {
+        AC_DEFINE("HAVE_PHP_SESSION", 1, "session extension headers available");
+        ADD_EXTENSION_DEP("phpser", "session", true);
+    }
+
+    PHP_INSTALL_HEADERS("ext/phpser", "php_phpser.h");
+}

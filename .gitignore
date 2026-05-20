@@ -1,11 +1,51 @@
-target/
-modules/
+# phpize / autoconf build artifacts
+*.la
+*.lo
+*.dep
 *.o
+.libs/
+modules/
+autom4te.cache/
+build/
+configure
+configure~
+config.h
+config.h.in
+config.h.in~
+config.log
+config.nice
+config.status
+config.guess
+config.sub
+install-sh
+libtool
+ltmain.sh
+missing
+mkinstalldirs
+Makefile
+Makefile.fragments
+Makefile.objects
+run-tests.php
+acinclude.m4
+aclocal.m4
+*_arginfo.h.bak
+
+# Editor / IDE
 *.swp
 *.swo
+*~
 .idea/
 .vscode/
+
+# Build output
+target/
+
+# Codesage analysis cache (per-developer, untracked)
 codesage/
 .codesage/
+
+# Agent-tool scaffolding (per-developer, untracked)
+.claude/
 AGENTS.md
 CLAUDE.md
+.codex

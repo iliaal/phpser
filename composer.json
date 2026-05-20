@@ -1,0 +1,30 @@
+{
+    "name": "iliaal/phpser",
+    "type": "php-ext",
+    "description": "Fast binary serializer for PHP cache workloads. Decoder-optimized, beats igbinary on packed numerics, deep-nested structures, and same-class DTO batches.",
+    "keywords": ["serialization", "binary", "cache", "performance", "igbinary", "php-extension", "pie"],
+    "license": "BSD-3-Clause",
+    "homepage": "https://github.com/iliaal/phpser",
+    "authors": [
+        {
+            "name": "Ilia Alshanetsky",
+            "email": "ilia@ilia.ws"
+        }
+    ],
+    "require": {
+        "php": ">=8.3"
+    },
+    "php-ext": {
+        "extension-name": "phpser",
+        "configure-options": [
+            {
+                "name": "enable-phpser",
+                "description": "Enable phpser binary-serializer support",
+                "needs-value": false
+            }
+        ],
+        "support-zts": true,
+        "support-nts": true,
+        "download-url-method": ["pre-packaged-binary", "composer-default"]
+    }
+}

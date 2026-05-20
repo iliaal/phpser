@@ -1,5 +1,8 @@
 # phpser
 
+[![Tests](https://github.com/iliaal/phpser/actions/workflows/tests.yml/badge.svg)](https://github.com/iliaal/phpser/actions/workflows/tests.yml)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-green.svg)](https://opensource.org/licenses/BSD-3-Clause)
+
 A PHP serialization extension in C, targeting read-heavy cache workloads
 where decode time matters more than encode time or payload size.
 
@@ -9,9 +12,45 @@ references (`IS_REFERENCE` sharing preserved), object identity (back-refs
 collapse to TAG_REF), cycles, enums, `__serialize`/`__unserialize`,
 `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 `allowed_classes` option and HMAC-SHA256 signed-payload mode are
-supported. Pivoted from a Rust+rkyv prototype after the rkyv architecture
-failed to beat `pecl/igbinary` in opt-mode benchmarks — see
-`LEGACY-RKYV.md` for that journey and the data behind the pivot.
+supported.
+
+## Install
+
+```bash
+# PIE (PHP Foundation's extension installer; uses the composer.json
+# at the repo root with type: "php-ext")
+pie install iliaal/phpser
+```
+
+On a minimal PHP image (e.g. `php:8.x-cli` from Docker Hub), PIE needs a
+few build tools installed first:
+
+```bash
+# Debian/Ubuntu
+sudo apt install -y git bison libtool-bin
+
+# macOS
+brew install bison libtool
+```
+
+### From source
+
+```bash
+git clone https://github.com/iliaal/phpser.git
+cd phpser
+phpize && ./configure --enable-phpser
+make -j$(nproc)
+sudo make install
+echo 'extension=phpser.so' | sudo tee /etc/php/conf.d/phpser.ini
+```
+
+### Pre-built binaries
+
+Pre-built `.dll`s for Windows (PHP 8.3-8.5, TS/NTS, x64) and `.so`s for
+Linux glibc (x86_64, arm64) and macOS arm64 (PHP 8.4-8.5) are attached
+to each [GitHub release](https://github.com/iliaal/phpser/releases). PIE
+fetches the matching binary automatically; falls back to source-build
+when no asset matches.
 
 ## Bench (opt PHP 8.4.22-dev NTS release, 1000 iters, median of 9 runs)
 
@@ -49,10 +88,9 @@ shapes — `obj->handlers->get_properties` is called per object and
 isn't trivially avoidable without a custom fast path for default
 property layouts.
 
-## What we kept from the experiment
+## Design highlights
 
-The rkyv attempt produced one solid finding and several reusable design
-ideas:
+The core ideas that drive the perf wins above:
 
 - **Pointer-equality dict intern.** Encoding hits a `*zend_string == *zend_string`
   check first; only on miss do we hash the bytes. Cuts intern cost to
@@ -118,34 +156,19 @@ measurable perf to take, and that this project targets, are:
    are fresh and unshared until handed back to PHP — internal writes can
    skip `Z_TRY_ADDREF` guards.
 
-## Build
+## Local dev build
 
-### Standard PECL build (against any installed PHP)
-
-```sh
-phpize
-./configure --enable-phpser
-make -j$(nproc)
-sudo make install
-```
-
-The `config.m4` auto-detects the session extension and registers phpser
-as a `session.serialize_handler` when available.
-
-### Local dev build (no install required)
-
-The hand-rolled `Makefile` builds against the in-tree `~/php-src-8.4-opt`
-without `phpize`/`autoconf`. Useful for hacking on the extension while
-also hacking on PHP itself:
+The hand-rolled `Makefile` builds against an in-tree `~/php-src-8.4-opt`
+checkout without `phpize`/`autoconf`. Useful for hacking on the extension
+while also hacking on PHP itself:
 
 ```sh
 make -j$(nproc)           # builds modules/phpser.so
 make test                 # runs tests/*.phpt via run-tests.php
 ```
 
-Override `PHP_SRC=` to target a different in-tree PHP checkout.
-
-Then load alongside igbinary for the A/B bench:
+Override `PHP_SRC=` to target a different in-tree PHP checkout. Load
+alongside igbinary for the A/B bench:
 
 ```sh
 ~/php-src-8.4-opt/sapi/cli/php \
@@ -153,6 +176,9 @@ Then load alongside igbinary for the A/B bench:
   -d extension=$(pwd)/modules/phpser.so \
   bench.php
 ```
+
+The `config.m4` auto-detects the session extension and registers phpser
+as a `session.serialize_handler` when available.
 
 ## Limitations / known gaps
 
