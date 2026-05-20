@@ -78,17 +78,12 @@ jobs:
           fi
 
       - name: Run tests
+        env:
+          NO_INTERACTION: 1
         run: |
           export TEST_PHP_EXECUTABLE=$(which php)
           export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
-          export NO_INTERACTION=1
-          RESULT=$(php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/ 2>&1)
-          echo "$RESULT"
-          FAILED=$(echo "$RESULT" | grep 'Tests failed' | grep -oP '\d+' | head -1)
-          if [ "$FAILED" -gt 0 ]; then
-            echo "::error::$FAILED test(s) failed"
-            exit 1
-          fi
+          php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/
 
   linux-zts-canary:
     name: PHP 8.4 ZTS Linux (canary)
@@ -115,17 +110,12 @@ jobs:
           make -j$(nproc)
 
       - name: Run tests
+        env:
+          NO_INTERACTION: 1
         run: |
           export TEST_PHP_EXECUTABLE=$(which php)
           export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
-          export NO_INTERACTION=1
-          RESULT=$(php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/ 2>&1)
-          echo "$RESULT"
-          FAILED=$(echo "$RESULT" | grep 'Tests failed' | grep -oP '\d+' | head -1)
-          if [ "$FAILED" -gt 0 ]; then
-            echo "::error::$FAILED test(s) failed under ZTS"
-            exit 1
-          fi
+          php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/
 
   macos:
     name: PHP ${{ matrix.php }} - macOS
@@ -151,17 +141,45 @@ jobs:
           make -j$(sysctl -n hw.ncpu)
 
       - name: Run tests
+        env:
+          NO_INTERACTION: 1
         run: |
           export TEST_PHP_EXECUTABLE=$(which php)
           export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
-          export NO_INTERACTION=1
-          RESULT=$(php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/ 2>&1)
-          echo "$RESULT"
-          FAILED=$(echo "$RESULT" | grep 'Tests failed' | grep -oP '\d+' | head -1)
-          if [ "$FAILED" -gt 0 ]; then
-            echo "::error::$FAILED test(s) failed"
-            exit 1
-          fi
+          php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/
+
+  # Windows extension builds need the official PHP SDK + matching MSVC
+  # toolset, not the autotools phpize/configure flow. The php-org composite
+  # action below bundles SDK download, VS detection, phpize / configure /
+  # nmake invocation, and the .phpt test run.
+  windows-matrix:
+    name: Resolve Windows matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: matrix
+        uses: php/php-windows-builder/extension-matrix@v1
+        with:
+          php-version-list: '8.3, 8.4, 8.5'
+
+  windows:
+    name: Windows ${{ matrix.php-version }} ${{ matrix.ts }} ${{ matrix.arch }}
+    needs: windows-matrix
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.windows-matrix.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Build extension
+        uses: php/php-windows-builder/extension@v1
+        with:
+          php-version: ${{ matrix.php-version }}
+          arch: ${{ matrix.arch }}
+          ts: ${{ matrix.ts }}
+          run-tests: 'true'
 
   asan:
     name: PHP ${{ matrix.php }} - ASAN
@@ -184,7 +202,16 @@ jobs:
       - name: Install dependencies
         run: sudo apt-get update && sudo apt-get install -y llvm clang re2c bison autoconf
 
+      # Without this, conftest binaries linked with -shared-libasan can't
+      # find libclang_rt.asan-*.so at runtime, and ./configure aborts
+      # with "cannot run C compiled programs."
+      - name: Resolve clang runtime dir
+        id: clang_rt
+        run: echo "dir=$(clang -print-runtime-dir)" >> "$GITHUB_OUTPUT"
+
       - name: Build PHP with ASAN (-shared-libasan keeps __cxa_throw resolvable across dlopen)
+        env:
+          LD_LIBRARY_PATH: ${{ steps.clang_rt.outputs.dir }}
         run: |
           git clone --depth=1 --branch=PHP-${{ matrix.php }} https://github.com/php/php-src.git /tmp/php-src
           cd /tmp/php-src
@@ -198,12 +225,13 @@ jobs:
             --disable-all \
             --enable-cli \
             --enable-session \
-            --enable-hash \
             --prefix=/tmp/php-asan
           make -j$(nproc)
           make install
 
       - name: Build extension with ASAN
+        env:
+          LD_LIBRARY_PATH: ${{ steps.clang_rt.outputs.dir }}
         run: |
           export PATH="/tmp/php-asan/bin:$PATH"
           phpize
@@ -216,12 +244,10 @@ jobs:
           make -j$(nproc)
 
       - name: Run tests under ASAN
+        env:
+          LD_LIBRARY_PATH: ${{ steps.clang_rt.outputs.dir }}
+          NO_INTERACTION: 1
         run: |
           export TEST_PHP_EXECUTABLE=/tmp/php-asan/bin/php
           export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
-          export NO_INTERACTION=1
-          /tmp/php-asan/bin/php run-tests.php --show-diff --asan -g FAIL,BORK,LEAK,XLEAK tests/ 2>&1 | tee /tmp/test-output.txt || true
-          if grep -qP 'Tests failed\s*:\s*[1-9]' /tmp/test-output.txt; then
-            echo "::error::Tests failed under ASAN"
-            exit 1
-          fi
+          /tmp/php-asan/bin/php run-tests.php --show-diff --asan -g FAIL,BORK,LEAK,XLEAK tests/

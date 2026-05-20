@@ -751,7 +751,9 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     zend_property_info *info = zend_hash_find_ptr(&obj->ce->properties_info, nm);
                     if (info != NULL) {
                         if (info->flags & ZEND_ACC_STATIC) continue;
+#if PHP_VERSION_ID >= 80400
                         if (info->offset == (uint32_t)ZEND_VIRTUAL_PROPERTY_OFFSET) continue;
+#endif
                         zval *p = OBJ_PROP(obj, info->offset);
                         if (Z_TYPE_P(p) == IS_UNDEF) continue;
                         nprops++;
@@ -771,7 +773,9 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     zval *p;
                     if (info != NULL) {
                         if (info->flags & ZEND_ACC_STATIC) continue;
+#if PHP_VERSION_ID >= 80400
                         if (info->offset == (uint32_t)ZEND_VIRTUAL_PROPERTY_OFFSET) continue;
+#endif
                         p = OBJ_PROP(obj, info->offset);
                         if (Z_TYPE_P(p) == IS_UNDEF) continue;
                         key = info->name;

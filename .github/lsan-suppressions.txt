@@ -1,0 +1,13 @@
+# LeakSanitizer suppressions for phpser ASAN CI job.
+#
+# Format: one rule per line, "leak:<symbol-or-source-substring>".
+# Suppressed allocations show up under the LSAN "matched suppressions"
+# heading at process exit; new leaks still fail the run.
+#
+# Prefer narrow symbol-name suppressions over module-level "leak:libfoo"
+# patterns — the latter mask real bugs the moment a vendored lib gains
+# a new entry point.
+#
+# No suppressions currently. Add an entry only when you've audited the
+# leak (e.g. process-lifetime allocations in php-src own code) and
+# decided it's not actionable here.
