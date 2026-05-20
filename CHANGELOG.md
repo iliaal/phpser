@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-05-20
+
 ### Added
 
 - Initial release of the phpser binary serializer.
@@ -26,4 +28,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/commits/master
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.1.0...HEAD
+[0.1.0]: https://github.com/iliaal/phpser/releases/tag/0.1.0

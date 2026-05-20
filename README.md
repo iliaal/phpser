@@ -1,7 +1,11 @@
 # phpser
 
 [![Tests](https://github.com/iliaal/phpser/actions/workflows/tests.yml/badge.svg)](https://github.com/iliaal/phpser/actions/workflows/tests.yml)
+[![Version](https://img.shields.io/github/v/release/iliaal/phpser)](https://github.com/iliaal/phpser/releases)
 [![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD--3--Clause-green.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![Follow @iliaa](https://img.shields.io/badge/Follow-@iliaa-000000?style=flat&logo=x&logoColor=white)](https://x.com/intent/follow?screen_name=iliaa)
+
+![phpser: high-performance PHP serializer, decoder-optimized for cache workloads](images/phpser-hero.jpg)
 
 A PHP serialization extension in C, targeting read-heavy cache workloads
 where decode time matters more than encode time or payload size.
@@ -51,6 +55,50 @@ Linux glibc (x86_64, arm64) and macOS arm64 (PHP 8.4-8.5) are attached
 to each [GitHub release](https://github.com/iliaal/phpser/releases). PIE
 fetches the matching binary automatically; falls back to source-build
 when no asset matches.
+
+## Usage
+
+Basic round-trip. The encoded payload is opaque bytes; treat it as a
+binary blob in storage (no JSON-safety, no UTF-8 guarantees):
+
+```php
+$payload = phpser_serialize(['id' => 42, 'name' => 'row', 'tags' => ['a','b']]);
+$value   = phpser_unserialize($payload);
+// $value === ['id' => 42, 'name' => 'row', 'tags' => ['a','b']]
+```
+
+HMAC-signed mode for untrusted storage (memcached, redis, files,
+cookies). The signed entry points wrap the payload in a constant-time
+HMAC-SHA256 frame; tampered or foreign-keyed input is rejected before
+any decoding work runs:
+
+```php
+$key = random_bytes(32);  // store this key in your app config
+
+$payload = phpser_serialize_signed($cacheValue, $key);
+// ... later, possibly across a process boundary ...
+$value = phpser_unserialize_signed($payload, $key);
+// returns NULL if the payload was tampered or signed with a different key
+```
+
+`allowed_classes` option on both unserialize entry points. Same shape as
+PHP's native `unserialize($payload, ['allowed_classes' => ...])`:
+
+```php
+// Reject all classes (decode them as __PHP_Incomplete_Class)
+$value = phpser_unserialize($payload, ['allowed_classes' => false]);
+
+// Allowlist specific classes; everything else becomes __PHP_Incomplete_Class
+$value = phpser_unserialize($payload, ['allowed_classes' => [Foo::class, Bar::class]]);
+
+// Allow all (default)
+$value = phpser_unserialize($payload, ['allowed_classes' => true]);
+$value = phpser_unserialize($payload);  // same as above
+```
+
+When decoding attacker-controlled bytes, use one of the two restricted
+modes or the signed entry point. See `SECURITY.md` for the full threat
+model.
 
 ## Bench (opt PHP 8.4.22-dev NTS release, 1000 iters, median of 9 runs)
 
