@@ -1,7 +1,7 @@
 --TEST--
 phpser: float edge cases (INF, -INF, NAN, denormals)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 // INF / -INF survive equality

@@ -1,7 +1,7 @@
 --TEST--
 phpser: typed-property objects (int, string, nullable, default value)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 class Point

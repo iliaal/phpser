@@ -1,7 +1,7 @@
 --TEST--
 phpser: packed arrays (longs, doubles, strings, mixed)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 $cases = [

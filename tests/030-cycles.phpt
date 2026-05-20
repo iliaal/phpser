@@ -1,7 +1,7 @@
 --TEST--
 phpser: cycle safety (depth cap prevents crash, IS_REFERENCE flattens)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 // Self-referential array — would loop forever via the flatten path

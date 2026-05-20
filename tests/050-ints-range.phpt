@@ -1,7 +1,7 @@
 --TEST--
 phpser: integer round-trip across the full range (ext/standard 001, igbinary_004, igbinary_068)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 $cases = [

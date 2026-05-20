@@ -1,7 +1,7 @@
 --TEST--
 phpser: nested array shapes (igbinary_007/010, ext/standard array tests)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 $cases = [

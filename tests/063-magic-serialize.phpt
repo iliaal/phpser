@@ -1,8 +1,9 @@
 --TEST--
 phpser: __serialize / __unserialize magic methods (PHP 7.4+) — incl. SPL classes
+--EXTENSIONS--
+phpser
 --SKIPIF--
 <?php
-if (!extension_loaded("phpser")) print "skip phpser not loaded";
 if (PHP_VERSION_ID < 70400) print "skip PHP 7.4+ required for __serialize";
 ?>
 --FILE--

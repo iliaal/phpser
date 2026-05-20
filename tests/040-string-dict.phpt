@@ -1,7 +1,7 @@
 --TEST--
 phpser: string dictionary handles >32 unique strings (crosses hash_map threshold)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 // Force >32 unique strings to exercise the hash_map backfill path.

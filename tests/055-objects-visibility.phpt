@@ -1,7 +1,7 @@
 --TEST--
 phpser: protected/private property handling
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 

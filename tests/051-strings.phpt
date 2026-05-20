@@ -1,7 +1,7 @@
 --TEST--
 phpser: string round-trip (binary-safe, multibyte, long, exotic) — ext/standard 006, igbinary_006
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 $cases = [

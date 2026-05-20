@@ -1,7 +1,7 @@
 --TEST--
 phpser: malformed/truncated/random input safety (no crash, no read past buffer)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 

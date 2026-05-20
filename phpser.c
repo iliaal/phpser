@@ -1357,19 +1357,7 @@ PHP_FUNCTION(phpser_unserialize) {
  * Module plumbing.
  * ------------------------------------------------------------------------- */
 
-ZEND_BEGIN_ARG_INFO_EX(arginfo_phpser_serialize, 0, 0, 1)
-    ZEND_ARG_INFO(0, value)
-ZEND_END_ARG_INFO()
-
-ZEND_BEGIN_ARG_INFO_EX(arginfo_phpser_unserialize, 0, 0, 1)
-    ZEND_ARG_INFO(0, str)
-ZEND_END_ARG_INFO()
-
-static const zend_function_entry phpser_functions[] = {
-    PHP_FE(phpser_serialize,   arginfo_phpser_serialize)
-    PHP_FE(phpser_unserialize, arginfo_phpser_unserialize)
-    PHP_FE_END
-};
+#include "phpser_arginfo.h"
 
 static PHP_MINIT_FUNCTION(phpser) {
 #ifdef HAVE_PHP_SESSION
@@ -1396,10 +1384,26 @@ static PHP_MINFO_FUNCTION(phpser) {
     php_info_print_table_end();
 }
 
+/* Declare session as an OPTIONAL dependency. The runtime declaration
+ * (vs. only config.m4's PHP_ADD_EXTENSION_DEP) is what controls MINIT
+ * ordering — without it, alphabetical conf.d load order can put our
+ * MINIT before session's, and php_session_register_serializer runs
+ * against a session module that isn't ready yet.
+ * See ~/ai/wiki/architecture/php-extension-c-conventions.md "Cross-extension
+ * class lookup at MINIT" for the failure mode. */
+static const zend_module_dep phpser_deps[] = {
+#ifdef HAVE_PHP_SESSION
+    ZEND_MOD_OPTIONAL("session")
+#endif
+    ZEND_MOD_END
+};
+
 zend_module_entry phpser_module_entry = {
-    STANDARD_MODULE_HEADER,
+    STANDARD_MODULE_HEADER_EX,
+    NULL,
+    phpser_deps,
     PHP_PHPSER_EXTNAME,
-    phpser_functions,
+    ext_functions,
     PHP_MINIT(phpser),
     NULL, NULL, NULL,
     PHP_MINFO(phpser),

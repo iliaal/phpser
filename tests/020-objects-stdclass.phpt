@@ -1,7 +1,7 @@
 --TEST--
 phpser: stdClass round-trip (dynamic properties)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 $cases = [

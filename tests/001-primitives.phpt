@@ -1,7 +1,7 @@
 --TEST--
 phpser: scalar round-trip (null, bool, int, float, string)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 $cases = [

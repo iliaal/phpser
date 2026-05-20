@@ -1,7 +1,7 @@
 --TEST--
 phpser: shared references + object identity + cycles (TAG_REF / TAG_NEW_REF)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 

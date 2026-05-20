@@ -1,7 +1,7 @@
 --TEST--
 phpser: shapes from notable PHP serialize bug regressions (ext/standard/tests/serialize)
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 

@@ -1,7 +1,7 @@
 --TEST--
 phpser: documented limitations — features not yet supported, no-crash contract
---SKIPIF--
-<?php if (!extension_loaded("phpser")) print "skip phpser not loaded"; ?>
+--EXTENSIONS--
+phpser
 --FILE--
 <?php
 
