@@ -76,10 +76,18 @@ measurable perf to take, and that this project targets, are:
    `zend_hash_add_new` reuses the cached hash. **Shipped.**
 5. **`add_new` insert path on assoc decode.** Skips the existence check
    since we know the encoder doesn't emit duplicate keys. **Shipped.**
-6. **Inline-short-string tag (planned).** For string keys ≤7 bytes (common:
-   `"id"`, `"name"`...), pack the bytes into the wire tag instead of
-   going through the dict. Closes most of the remaining size gap on
-   rowsets.
+6. **Inline-short-string tag — tried, didn't pay off.** Wire format reserves
+   `TAG_STR_INLINE` (0x0c) and `KEY_STR_INLINE` (0x02); the decoder
+   accepts them for forward-compat with future encoders. We implemented
+   a two-pass encoder that counts per-`zend_string*` use frequency, then
+   emits dict refs for repeated strings and inline bytes for singletons.
+   Result: size dropped from +5% to +1% on rowsets, but encode time
+   regressed catastrophically (`rowset_1000`: -13% → +131% vs igbinary).
+   The HashTable-based count pre-pass burns ~200 ns per string visit,
+   and we visit every string twice (count + emit). The savings per
+   inlined singleton string are ~100 ns — net loss. A custom open-
+   addressing counter array might tip the balance, but the size win
+   alone (~2 KB per 50 KB payload) doesn't justify the engineering.
 7. **Skip refcount machinery during build.** All zvals built during decode
    are fresh and unshared until handed back to PHP — internal writes can
    skip `Z_TRY_ADDREF` guards.

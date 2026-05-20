@@ -39,10 +39,12 @@
 #define TAG_PACKED_DOUBLES  0x09   /* varint(len), N×8-byte LE */
 #define TAG_OBJECT          0x0a   /* varint(class_idx), varint(nprops), N×(key_idx, val) */
 #define TAG_PACKED_STRINGS  0x0b   /* varint(len), N×varint(dict_idx) — typed string run */
+#define TAG_STR_INLINE      0x0c   /* varint(len), bytes — single-use string, skips dict */
 
 /* Assoc key tags (one byte before the key's payload). */
-#define KEY_LONG  0x00
-#define KEY_STR   0x01
+#define KEY_LONG        0x00
+#define KEY_STR         0x01   /* varint(dict_idx) */
+#define KEY_STR_INLINE  0x02   /* varint(len), bytes */
 
 /* -------------------------------------------------------------------------
  * Varint helpers. Unsigned varint (LEB128) for lengths/indices, zigzag for
@@ -138,10 +140,10 @@ typedef struct {
 
 typedef struct {
     intern_slot inline_cache[INTERN_CACHE_SIZE];
-    uint32_t cache_filled;        /* number of valid slots, up to INTERN_CACHE_SIZE */
-    uint32_t cache_next;          /* next replacement slot when full (LRU-ish ring) */
-    HashTable hash_map;           /* (zend_string content -> u32 dict_idx), only used past threshold */
-    zend_string **dict;           /* index -> zend_string* (borrowed) */
+    uint32_t cache_filled;
+    uint32_t cache_next;
+    HashTable hash_map;
+    zend_string **dict;
     uint32_t dict_len;
     uint32_t dict_cap;
     uint32_t depth;
@@ -266,8 +268,12 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
             return;
         }
         case IS_STRING: {
-            uint32_t idx = enc_intern_zstr(e, Z_STR_P(v));
-            emit_tag_and_varint(body, TAG_STR_DICT, idx);
+            /* Always dict-intern. TAG_STR_INLINE exists in the wire format
+             * and the decoder handles it for forward-compat, but the two-
+             * pass count-then-emit encoder we'd need to choose intelligently
+             * costs more in pre-pass HashTable ops than the singleton-inline
+             * emission saves. See README for the experiment writeup. */
+            emit_tag_and_varint(body, TAG_STR_DICT, enc_intern_zstr(e, Z_STR_P(v)));
             return;
         }
         case IS_ARRAY:
@@ -388,6 +394,9 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
     for (; b < end; b++) {
         if (Z_TYPE(b->val) == IS_UNDEF) continue;
         if (b->key) {
+            /* Always KEY_STR. KEY_STR_INLINE exists in the wire format and
+             * the decoder accepts it (forward-compat), but encoder doesn't
+             * emit it — see README for why two-pass didn't pay off. */
             emit_tag_and_varint(body, KEY_STR, enc_intern_zstr(e, b->key));
         } else {
             emit_tag_and_varint(body, KEY_LONG, zigzag_encode64((int64_t)b->h));
@@ -456,23 +465,39 @@ static void decode_destroy(decode_ctx *d) {
 
 /* Read an Assoc/Object key (one byte tag + payload). Stores result in out_key,
  * caller decides where to insert. Returns 0/-1. */
+/* Three flavors of assoc key: int, dict-indexed string, owned-string-inline.
+ * The "owned" case allocates a fresh zend_string; the caller releases its
+ * reference after handing it to zend_hash_add_new (which addrefs internally
+ * for non-interned strings). */
+enum { KV_LONG, KV_DICT_STR, KV_OWNED_STR };
+
 typedef struct {
-    int is_string;
-    int64_t lval;        /* when !is_string */
-    uint32_t dict_idx;   /* when is_string */
+    int kind;
+    int64_t lval;            /* KV_LONG */
+    uint32_t dict_idx;       /* KV_DICT_STR */
+    zend_string *owned_str;  /* KV_OWNED_STR — refcount=1, caller releases */
 } key_val;
 
 static int decode_key(decode_ctx *d, key_val *out_key) {
     if (d->pos >= d->len) return -1;
     uint8_t tag = d->buf[d->pos++];
     if (tag == KEY_LONG) {
-        out_key->is_string = 0;
+        out_key->kind = KV_LONG;
         return varint_read_i64(d->buf, d->len, &d->pos, &out_key->lval);
     } else if (tag == KEY_STR) {
         uint64_t idx;
         if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) return -1;
-        out_key->is_string = 1;
+        out_key->kind = KV_DICT_STR;
         out_key->dict_idx = (uint32_t)idx;
+        return 0;
+    } else if (tag == KEY_STR_INLINE) {
+        uint64_t slen;
+        if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
+        if (slen > UINT32_MAX || d->pos + slen > d->len) return -1;
+        out_key->kind = KV_OWNED_STR;
+        out_key->owned_str = zend_string_init(
+            (const char *)d->buf + d->pos, (size_t)slen, 0);
+        d->pos += slen;
         return 0;
     }
     return -1;
@@ -505,6 +530,18 @@ static int decode_value(decode_ctx *d, zval *out) {
             zend_string *zs = dec_get_zstr(d, (uint32_t)idx);
             if (!zs) return -1;
             ZVAL_STR_COPY(out, zs);  /* addrefs the cached string */
+            return 0;
+        }
+        case TAG_STR_INLINE: {
+            uint64_t slen;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
+            if (slen > UINT32_MAX || d->pos + slen > d->len) return -1;
+            /* Fresh allocation, refcount=1 — ZVAL_STR consumes it without
+             * bumping refcount, so no extra release is needed. */
+            zend_string *zs = zend_string_init(
+                (const char *)d->buf + d->pos, (size_t)slen, 0);
+            d->pos += slen;
+            ZVAL_STR(out, zs);
             return 0;
         }
         case TAG_PACKED_LONGS: {
@@ -644,15 +681,27 @@ static int decode_value(decode_ctx *d, zval *out) {
                 key_val k;
                 if (decode_key(d, &k) < 0) goto assoc_fail;
                 zval tmp;
-                if (decode_value(d, &tmp) < 0) goto assoc_fail;
-                if (k.is_string) {
-                    zend_string *zs = dec_get_zstr(d, k.dict_idx);
-                    if (!zs) { zval_ptr_dtor(&tmp); goto assoc_fail; }
-                    /* _add_new variants skip the existence check — we know the
-                     * encoder doesn't emit duplicate keys per bucket. */
-                    zend_hash_add_new(arr, zs, &tmp);
-                } else {
-                    zend_hash_index_add_new(arr, (zend_ulong)k.lval, &tmp);
+                if (decode_value(d, &tmp) < 0) {
+                    if (k.kind == KV_OWNED_STR) zend_string_release(k.owned_str);
+                    goto assoc_fail;
+                }
+                /* _add_new variants skip the existence check — we know the
+                 * encoder doesn't emit duplicate keys per bucket. */
+                switch (k.kind) {
+                    case KV_LONG:
+                        zend_hash_index_add_new(arr, (zend_ulong)k.lval, &tmp);
+                        break;
+                    case KV_DICT_STR: {
+                        zend_string *zs = dec_get_zstr(d, k.dict_idx);
+                        if (!zs) { zval_ptr_dtor(&tmp); goto assoc_fail; }
+                        zend_hash_add_new(arr, zs, &tmp);
+                        break;
+                    }
+                    case KV_OWNED_STR:
+                        zend_hash_add_new(arr, k.owned_str, &tmp);
+                        /* hash addref'd it for the bucket; drop our ref. */
+                        zend_string_release(k.owned_str);
+                        break;
                 }
                 continue;
             assoc_fail:
