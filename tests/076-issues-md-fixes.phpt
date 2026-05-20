@@ -149,6 +149,61 @@ $rt = phpser_unserialize(phpser_serialize($weird));
 echo ($rt[0] === PHP_FLOAT_MIN && $rt[1] === INF && $rt[2] === -INF && is_nan($rt[3]))
     ? "cr009_doubles_roundtrip OK\n" : "cr009_doubles_roundtrip FAIL\n";
 
+// =====================================================================
+// REGRESSION: uninitialized typed properties must be SKIPPED on encode
+// (not emitted as NULL). Before this fix, get_properties iteration saw
+// IS_INDIRECT pointing to IS_UNDEF and didn't deref, so the slot was
+// counted + emitted as TAG_NULL. Combined with CR-001's decoder type-
+// check, that produced "Cannot assign null to property of type int".
+// =====================================================================
+class Uninit {
+    public int $set = 1;
+    public int $uninit;           // never assigned
+    public ?string $nullable = null;
+    public string $also_set = "x";
+}
+$o = new Uninit();
+$rt = phpser_unserialize(phpser_serialize($o));
+echo ($rt->set === 1 && $rt->also_set === "x"
+      && !isset($rt->uninit) && $rt->nullable === null)
+    ? "uninit_typed_skip OK\n" : "uninit_typed_skip FAIL\n";
+
+// Same shape, but no typed props (the bug only manifested with typed) —
+// confirm we didn't accidentally lose untyped prop emission.
+class Untyped {
+    public $a = 1;
+    public $b = "x";
+    public $c = null;
+}
+$rt = phpser_unserialize(phpser_serialize(new Untyped()));
+echo ($rt->a === 1 && $rt->b === "x" && $rt->c === null)
+    ? "untyped_preserve OK\n" : "untyped_preserve FAIL\n";
+
+// =====================================================================
+// REGRESSION: encoder used to claim an id-table slot for __serialize /
+// __sleep failures (non-array return without throw), then emit TAG_NULL
+// without registering the corresponding slot on the decode side. Result:
+// any back-ref to the same object later in the payload deref'd the wrong
+// id_table slot — typically out-of-bounds, decoder rejected the WHOLE
+// payload as malformed. Fix: roll back the speculative enc_visit before
+// emitting TAG_NULL.
+// =====================================================================
+class BadMagic {
+    public function __serialize() { return 42; }     // non-array, no throw
+    public function __unserialize(array $d): void {}
+}
+class Wrap_ {
+    public $a; public $b; public $c;
+}
+$bad = new BadMagic();
+$w = new Wrap_();
+$w->a = $bad;
+$w->b = $bad;   // back-ref to $bad if encoder claimed an id
+$w->c = "tail"; // sentinel to verify decode reached the end
+$rt = phpser_unserialize(phpser_serialize($w));
+echo ($rt instanceof Wrap_ && $rt->a === null && $rt->b === null && $rt->c === "tail")
+    ? "magic_fail_no_desync OK\n" : "magic_fail_no_desync FAIL\n";
+
 ?>
 --EXPECT--
 cr001_typed_throws OK
@@ -166,3 +221,6 @@ cr008_valid OK
 cr009_double_le OK
 cr009_packed_doubles_le OK
 cr009_doubles_roundtrip OK
+uninit_typed_skip OK
+untyped_preserve OK
+magic_fail_no_desync OK

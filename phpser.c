@@ -333,6 +333,30 @@ static inline int enc_visit(encode_ctx *e, void *ptr, uint32_t *out_id) {
     return 1;
 }
 
+/* Roll back the most-recent enc_visit-claimed id. Used by the encode
+ * paths that call enc_visit speculatively (deciding to emit a TAG_NULL
+ * after __serialize/__sleep returns non-array, or ce->serialize returns
+ * FAILURE). Without rollback, the encoder claims id N but emits TAG_NULL
+ * — the decoder never registers id N — and the next id-claiming tag on
+ * the encoder side becomes id N+1 while the decoder thinks it's id N.
+ * Subsequent TAG_REF references then deref the wrong slot or OOB-reject.
+ *
+ * Safe only if no other enc_visit happened between the claim and this
+ * call (the bucket at the end of the probe chain is the one we just
+ * inserted into). Encoder dispatch holds this invariant: __serialize /
+ * __sleep / ce->serialize run user PHP but that user code can't reach
+ * back into our encoder's id-table. */
+static inline void enc_unvisit_last(encode_ctx *e, void *ptr) {
+    uintptr_t pp = (uintptr_t)ptr;
+    uint32_t h = id_hash(pp) & e->id_mask;
+    while (e->id_buckets[h].ptr != pp) {
+        h = (h + 1) & e->id_mask;
+    }
+    e->id_buckets[h].ptr = 0;
+    e->id_count--;
+    e->next_id--;
+}
+
 static inline intern_slot *enc_cache_find(encode_ctx *e, zend_string *zs) {
     for (uint32_t i = 0; i < e->cache_filled; i++) {
         if (e->inline_cache[i].ptr == zs) return &e->inline_cache[i];
@@ -584,6 +608,10 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                  * dropped but correctness holds. */
                 if (obj->ce->serialize(v, &data, &len, NULL) != SUCCESS) {
                     if (data) efree(data);
+                    /* Roll back the id we speculatively claimed — see
+                     * enc_unvisit_last comment. Otherwise back-refs to
+                     * this object later in the payload misalign. */
+                    enc_unvisit_last(e, obj);
                     smart_str_appendc(body, TAG_NULL);
                     return;
                 }
@@ -606,8 +634,11 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 if (UNEXPECTED(EG(exception)) || Z_TYPE(retval) != IS_ARRAY) {
                     /* Match PHP's behavior: type error / exception during
                      * __serialize → emit NULL and bail. Don't swallow the
-                     * exception silently — PHP propagates it. */
+                     * exception silently — PHP propagates it. Roll back
+                     * the speculative id-claim so back-refs to this
+                     * object later in the payload don't misalign. */
                     zval_ptr_dtor(&retval);
+                    enc_unvisit_last(e, obj);
                     smart_str_appendc(body, TAG_NULL);
                     return;
                 }
@@ -648,7 +679,9 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 zend_call_known_instance_method_with_0_params(
                     Z_FUNC_P(sleep_fn_zv), obj, &names_zv);
                 if (UNEXPECTED(EG(exception)) || Z_TYPE(names_zv) != IS_ARRAY) {
+                    /* Same id-rollback as the __serialize failure path. */
                     zval_ptr_dtor(&names_zv);
+                    enc_unvisit_last(e, obj);
                     smart_str_appendc(body, TAG_NULL);
                     return;
                 }
@@ -702,13 +735,21 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
             }
             HashTable *props = obj->handlers->get_properties(obj);
             /* Count live entries — get_properties can include $this-style
-             * entries we want to skip and tombstones (IS_UNDEF). */
+             * entries we want to skip and tombstones (IS_UNDEF). Declared
+             * props surface as IS_INDIRECT; we must deref to detect the
+             * uninitialized-typed-property case (slot is IS_UNDEF but the
+             * bucket val is IS_INDIRECT, not IS_UNDEF directly). Without
+             * the deref, encoder emits TAG_NULL and the decoder's typed-
+             * prop check rejects it as "cannot assign null to int". */
             uint32_t nprops = 0;
             if (props) {
                 Bucket *b = props->arData;
                 Bucket *end = b + props->nNumUsed;
                 for (; b < end; b++) {
-                    if (Z_TYPE(b->val) == IS_UNDEF || !b->key) continue;
+                    if (!b->key) continue;
+                    zval *v = &b->val;
+                    if (Z_TYPE_P(v) == IS_INDIRECT) v = Z_INDIRECT_P(v);
+                    if (Z_TYPE_P(v) == IS_UNDEF) continue;
                     nprops++;
                 }
             }
@@ -719,9 +760,12 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 Bucket *b = props->arData;
                 Bucket *end = b + props->nNumUsed;
                 for (; b < end; b++) {
-                    if (Z_TYPE(b->val) == IS_UNDEF || !b->key) continue;
+                    if (!b->key) continue;
+                    zval *v = &b->val;
+                    if (Z_TYPE_P(v) == IS_INDIRECT) v = Z_INDIRECT_P(v);
+                    if (Z_TYPE_P(v) == IS_UNDEF) continue;
                     varint_write_u64(body, enc_intern_zstr(e, b->key));
-                    encode_value(body, e, &b->val);
+                    encode_value(body, e, v);
                 }
             }
             return;
