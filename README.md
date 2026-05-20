@@ -13,24 +13,26 @@ supported. Pivoted from a Rust+rkyv prototype after the rkyv architecture
 failed to beat `pecl/igbinary` in opt-mode benchmarks — see
 `LEGACY-RKYV.md` for that journey and the data behind the pivot.
 
-## Bench (opt PHP 8.4.22-dev NTS release, 2000 iters)
+## Bench (opt PHP 8.4.22-dev NTS release, 1000 iters, median of 9 runs)
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → 5095 (+12%) | 8k → 11k ns (+30%) | 9k → 9.8k ns (+8%) |
-| rowset_1000 | 47K → 49K (**+3%**) | 140k → 110k ns (**-22%**) | 95k → 99k ns (parity, +4%) |
-| packed_1k | 5495 → **1941** (**-65%**) | 3.7k → **1.2k** ns (**-66%**) | 6.4k → **1.8k** ns (**-73%**) |
-| packed_10k | 60K → **22K** (**-63%**) | 37k → **15k** ns (**-59%**) | 62k → **19k** ns (**-70%**) |
-| deep_50 | 419 → 420 (parity) | 1.2k → **0.7k** ns (**-41%**) | 1.6k → **1.3k** ns (**-20%**) |
+| rowset_100 | 4570 → 5095 (+12%) | 10k → 13k ns (+26%) | 11k → 13k ns (+17%) |
+| rowset_1000 | 47K → 49K (**+3%**) | 170k → 130k ns (**-22%**) | 120k → 125k ns (+10%) |
+| packed_1k | 5495 → **1941** (**-65%**) | 4.4k → **1.5k** ns (**-66%**) | 8.0k → **2.1k** ns (**-72%**) |
+| packed_10k | 60K → **22K** (**-63%**) | 46k → **19k** ns (**-59%**) | 76k → **22k** ns (**-71%**) |
+| deep_50 | 419 → 424 (parity) | 1.5k → **0.7k** ns (**-51%**) | 1.9k → **1.6k** ns (**-14%**) |
 
-Wins: packed numerics ~65% smaller + ~70% faster decode + ~60% faster
-encode. Deep-nested ~20–55% faster encode at parity size. **Rowset_1000
-encode beats igbinary by ~22%**, decode at parity (+4%), size within 3%.
+Wins: packed numerics ~65% smaller + ~71% faster decode + ~59% faster
+encode. Deep-nested ~50% faster encode at parity size. **Rowset_1000
+encode beats igbinary by ~22%**, size within 3%; decode pays a ~10%
+tax for the front-loaded dict header walk + refcount-reuse machinery.
 
-`rowset_100` encode (+30%) is the one durable gap — fixed-cost floor
+`rowset_100` encode (+26%) is the one durable gap — fixed-cost floor
 for the dict header emission and first-row inline emissions, amortized
-over too few rows to recover. The absolute time is small (10 µs for
-the entire 100-row payload).
+over too few rows to recover. The absolute time is small (13 µs for
+the entire 100-row payload). Small-rowset decode (+17%) is the same
+shape: header + dict-warmup costs dominate when the body is short.
 
 ## What we kept from the experiment
 
