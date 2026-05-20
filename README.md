@@ -10,13 +10,13 @@
 A PHP serialization extension in C, targeting read-heavy cache workloads
 where decode time matters more than encode time or payload size.
 
-Status: production-ready. Round-trip clean on primitives, arrays
-(packed/assoc/sparse/deleted), objects (stdClass + typed properties),
-references (`IS_REFERENCE` sharing preserved), object identity (back-refs
-collapse to TAG_REF), cycles, enums, `__serialize`/`__unserialize`,
-`__sleep`/`__wakeup`, and the legacy `Serializable` interface.
-`allowed_classes` option and HMAC-SHA256 signed-payload mode are
-supported.
+## Why phpser?
+
+PHP cache workloads pay decode cost on every read. Encode happens once per write. The default `igbinary` was the right answer for over a decade, but lags on three shapes that show up everywhere: packed numeric arrays, deep-nested structures, and same-class DTO batches (Laravel queue payloads, cached models).
+
+phpser is decoder-optimized. Pointer-equality dict intern, refcount-reuse of zend_strings, pre-sized hash tables with direct `arPacked` writes, tagged scalar runs. On the shapes above, it cuts size by 60-65% and decode time by 70-77% vs igbinary. On general-purpose rowsets it sits within 1% of igbinary's size with 25% faster encode and ~5% slower decode.
+
+Not a universal win. Encode on small rowsets (100 rows) costs +30% over igbinary, and object-heavy mixed shapes pay +42% on encode because `obj->handlers->get_properties` is per-object. The bench table below has the full shape-by-shape breakdown.
 
 ## Install
 
@@ -99,6 +99,12 @@ $value = phpser_unserialize($payload);  // same as above
 When decoding attacker-controlled bytes, use one of the two restricted
 modes or the signed entry point. See `SECURITY.md` for the full threat
 model.
+
+## ✨ Features
+
+- **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder.
+- **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode, and assoc decode uses `zend_hash_update` so duplicate-key payloads collapse to last-write-wins rather than phantom buckets.
+- **PHP 8.3+ (8.4, 8.5, master).** BSD 3-Clause.
 
 ## Bench (opt PHP 8.4.22-dev NTS release, 1000 iters, median of 9 runs)
 
@@ -290,3 +296,18 @@ Varints are LEB128 (unsigned); signed values use zigzag encoding. Tags
 0x10/0x11 plus 0x0a/0x0d/0x0e/0x0f each implicitly claim the next id in
 encounter order, so the decoder reconstructs back-refs by counting
 container tags as it parses.
+
+## 🔗 PHP Performance Toolkit
+
+Companion native PHP extensions:
+
+- [php_excel](https://github.com/iliaal/php_excel): native XLS/XLSX read/write via LibXL
+- [mdparser](https://github.com/iliaal/mdparser): native CommonMark + GitHub Flavored Markdown parser
+- [php_clickhouse](https://github.com/iliaal/php_clickhouse): native ClickHouse client over the binary protocol
+- [fastchart](https://github.com/iliaal/fastchart): 19 chart types in one PHP extension
+- [fastjson](https://github.com/iliaal/fastjson): drop-in faster `ext/json`, backed by yyjson
+- [statgrab](https://github.com/iliaal/statgrab): system statistics wrapper around libstatgrab
+
+---
+
+[Follow on X](https://x.com/iliaa) • [Blog](https://ilia.ws) • If this cut your cache decode CPU, ⭐ star it!
