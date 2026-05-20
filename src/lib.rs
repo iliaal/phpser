@@ -1,12 +1,19 @@
 use ext_php_rs::prelude::*;
 use ext_php_rs::types::{Zval, ZendHashTable, ZendStr};
-use ext_php_rs::flags::DataType;
 use ext_php_rs::binary::Binary;
 use ext_php_rs::binary_slice::BinarySlice;
 use ext_php_rs::boxed::ZBox;
-use ext_php_rs::ffi::{ext_php_rs_zend_string_release, HashTable, zval};
+use ext_php_rs::ffi::{
+    ext_php_rs_zend_string_release, zval, zend_string, Bucket, HashTable,
+    IS_UNDEF, IS_NULL, IS_FALSE, IS_TRUE, IS_LONG, IS_DOUBLE, IS_STRING, IS_ARRAY, IS_OBJECT,
+};
 use rkyv::{Archive, Deserialize, Serialize, rancor::Error as RkyvError};
 use ahash::AHashMap;
+
+// HT_IS_PACKED: bit set in the HashTable flags byte when the array has only
+// sequential int keys 0..N-1. Lets us skip the O(N) iteration scan we used
+// to do in V2 just to detect this case.
+const HASH_FLAG_PACKED: u8 = 1 << 2;
 
 // zend_hash_update isn't in ext-php-rs's allowed_bindings, so we declare it
 // ourselves. Modern PHP exposes the function (not a macro) with this exact
@@ -72,12 +79,17 @@ const LINEAR_SCAN_THRESHOLD: usize = 16;
 
 struct Interner {
     map: AHashMap<Vec<u8>, u32>,
+    // Pointer-keyed cache for the common case where PHP hands us the same
+    // zend_string (interned literals, repeated bucket keys). Pointer equality
+    // is two cycles vs hashing dozens of key bytes — and this hit rate is
+    // extremely high for rowset shapes.
+    ptr_map: AHashMap<usize, u32>,
     dict: Vec<Vec<u8>>,
 }
 
 impl Default for Interner {
     fn default() -> Self {
-        Self { map: AHashMap::new(), dict: Vec::new() }
+        Self { map: AHashMap::new(), ptr_map: AHashMap::new(), dict: Vec::new() }
     }
 }
 
@@ -109,76 +121,173 @@ impl Interner {
         self.map.insert(self.dict[idx as usize].clone(), idx);
         idx
     }
+
+    /// Pointer-first intern. Reads the zend_string bytes only on a miss.
+    /// SAFETY: `zs` must be a valid, non-null *mut zend_string.
+    #[inline]
+    unsafe fn intern_zs(&mut self, zs: *mut zend_string) -> u32 {
+        let key = zs as usize;
+        if let Some(&idx) = self.ptr_map.get(&key) {
+            return idx;
+        }
+        let len = unsafe { (*zs).len };
+        let ptr = unsafe { (*zs).val.as_ptr() as *const u8 };
+        let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+        let idx = self.intern(bytes);
+        self.ptr_map.insert(key, idx);
+        idx
+    }
 }
 
-fn zval_to_value(z: &Zval, ix: &mut Interner) -> PhpValue {
-    match z.get_type() {
-        DataType::Null | DataType::Undef => PhpValue::Null,
-        DataType::False => PhpValue::Bool(false),
-        DataType::True => PhpValue::Bool(true),
-        DataType::Bool => PhpValue::Bool(z.bool().unwrap_or(false)),
-        DataType::Long => PhpValue::Long(z.long().unwrap_or(0)),
-        DataType::Double => PhpValue::Double(z.double().unwrap_or(0.0)),
-        DataType::String => {
-            let s = z.binary_slice().unwrap_or(&[]);
-            PhpValue::Str(ix.intern(s))
+/// SAFETY: `z` must be a valid zval pointer (alive, well-aligned).
+unsafe fn zval_raw(z: *const zval, ix: &mut Interner) -> PhpValue {
+    let ty = unsafe { (*z).u1.v.type_ } as u32;
+    match ty {
+        IS_UNDEF | IS_NULL => PhpValue::Null,
+        IS_FALSE => PhpValue::Bool(false),
+        IS_TRUE => PhpValue::Bool(true),
+        IS_LONG => PhpValue::Long(unsafe { (*z).value.lval }),
+        IS_DOUBLE => PhpValue::Double(unsafe { (*z).value.dval }),
+        IS_STRING => {
+            let zs = unsafe { (*z).value.str_ };
+            PhpValue::Str(unsafe { ix.intern_zs(zs) })
         }
-        DataType::Array => {
-            if let Some(arr) = z.array() {
-                hashtable_to_value(arr, ix)
-            } else {
-                PhpValue::Null
-            }
+        IS_ARRAY => {
+            let ht = unsafe { (*z).value.arr };
+            unsafe { hashtable_to_value_raw(ht, ix) }
         }
-        DataType::Object(_) => {
-            if let Some(obj) = z.object() {
-                let class_idx = ix.intern(obj.get_class_name().unwrap_or_default().as_bytes());
-                let mut props = Vec::new();
-                if let Ok(ht) = obj.get_properties() {
-                    for (k, v) in ht.iter() {
-                        let key_idx = match k {
-                            ext_php_rs::types::ArrayKey::String(s) => ix.intern(s.as_bytes()),
-                            ext_php_rs::types::ArrayKey::Long(n) => ix.intern(n.to_string().as_bytes()),
-                            ext_php_rs::types::ArrayKey::Str(s) => ix.intern(s.as_bytes()),
-                        };
-                        props.push((key_idx, zval_to_value(v, ix)));
-                    }
-                }
-                PhpValue::Object { class: class_idx, props }
-            } else {
-                PhpValue::Null
-            }
+        IS_OBJECT => {
+            // Object path stays on ext-php-rs's higher-level wrapper — properties
+            // touch handlers, lazy init, typed-prop guards. Not a hot path for
+            // cache shapes (usually arrays/scalars).
+            let zr: &Zval = unsafe { &*(z as *const Zval) };
+            object_to_value(zr, ix)
         }
         _ => PhpValue::Null,
     }
 }
 
-fn hashtable_to_value(ht: &ZendHashTable, ix: &mut Interner) -> PhpValue {
-    let len = ht.len();
-    let mut is_packed = true;
-    let mut expected: i64 = 0;
-    for (k, _) in ht.iter() {
-        match k {
-            ext_php_rs::types::ArrayKey::Long(n) if n == expected => expected += 1,
-            _ => { is_packed = false; break; }
+fn zval_to_value(z: &Zval, ix: &mut Interner) -> PhpValue {
+    // SAFETY: z came from PHP and is alive for the duration of this call.
+    unsafe { zval_raw(z as *const Zval as *const zval, ix) }
+}
+
+fn object_to_value(z: &Zval, ix: &mut Interner) -> PhpValue {
+    if let Some(obj) = z.object() {
+        let class_idx = ix.intern(obj.get_class_name().unwrap_or_default().as_bytes());
+        let mut props = Vec::new();
+        if let Ok(ht) = obj.get_properties() {
+            // Reuse the raw-FFI path for the property bag — it's a HashTable.
+            let ht_ptr = ht as *const ZendHashTable as *mut HashTable;
+            unsafe { ht_buckets_each(ht_ptr, |bkey, val| {
+                let key_idx = match bkey {
+                    BucketKey::Str(zs) => ix.intern_zs(zs),
+                    BucketKey::Long(n) => ix.intern(n.to_string().as_bytes()),
+                };
+                props.push((key_idx, zval_raw(val, ix)));
+            }) };
         }
-    }
-    if is_packed && len > 0 {
-        let mut out = Vec::with_capacity(len);
-        for (_, v) in ht.iter() {
-            out.push(zval_to_value(v, ix));
-        }
-        PhpValue::Packed(out)
+        PhpValue::Object { class: class_idx, props }
     } else {
-        let mut out = Vec::with_capacity(len);
-        for (k, v) in ht.iter() {
-            let key = match k {
-                ext_php_rs::types::ArrayKey::Long(n) => PhpKey::Int(n),
-                ext_php_rs::types::ArrayKey::String(s) => PhpKey::Str(ix.intern(s.as_bytes())),
-                ext_php_rs::types::ArrayKey::Str(s) => PhpKey::Str(ix.intern(s.as_bytes())),
-            };
-            out.push((key, zval_to_value(v, ix)));
+        PhpValue::Null
+    }
+}
+
+enum BucketKey {
+    Str(*mut zend_string),
+    Long(i64),
+}
+
+/// Iterate the live buckets of a HashTable, skipping IS_UNDEF tombstones.
+/// SAFETY: `ht` must be a valid HashTable pointer.
+#[inline]
+unsafe fn ht_buckets_each<F: FnMut(BucketKey, *mut zval)>(ht: *mut HashTable, mut f: F) {
+    let n_used = unsafe { (*ht).nNumUsed };
+    let ar_data: *mut Bucket = unsafe { (*ht).__bindgen_anon_1.arData };
+    for i in 0..n_used {
+        let b: *mut Bucket = unsafe { ar_data.add(i as usize) };
+        let val_ptr: *mut zval = unsafe { &raw mut (*b).val };
+        let ty = unsafe { (*val_ptr).u1.v.type_ } as u32;
+        if ty == IS_UNDEF {
+            continue;
         }
+        let key = unsafe { (*b).key };
+        let bkey = if key.is_null() {
+            BucketKey::Long(unsafe { (*b).h } as i64)
+        } else {
+            BucketKey::Str(key)
+        };
+        f(bkey, val_ptr);
+    }
+}
+
+/// SAFETY: `ht` must be a valid HashTable pointer.
+unsafe fn hashtable_to_value_raw(ht: *mut HashTable, ix: &mut Interner) -> PhpValue {
+    let n_used = unsafe { (*ht).nNumUsed };
+    let n_elems = unsafe { (*ht).nNumOfElements };
+    let flags = unsafe { (*ht).u.v.flags };
+    let is_packed_flag = (flags & HASH_FLAG_PACKED) != 0;
+
+    // PHP 8+ stores packed arrays as a flat zval[] at arPacked (union-aliased
+    // with arData). Stride is sizeof(zval)=16, not sizeof(Bucket)=32.
+    //
+    // n_used > n_elems means holes in the middle (post-unset). PHP still flags
+    // the array as packed, but the original indices have to be preserved on
+    // round-trip — falling back to Assoc here keeps the keys intact.
+    if is_packed_flag {
+        let ar_packed: *mut zval = unsafe { (*ht).__bindgen_anon_1.arData as *mut zval };
+        if n_used == n_elems {
+            // Dense packed — pure stream.
+            let mut out = Vec::with_capacity(n_elems as usize);
+            for i in 0..n_used {
+                let val_ptr: *mut zval = unsafe { ar_packed.add(i as usize) };
+                out.push(unsafe { zval_raw(val_ptr, ix) });
+            }
+            return PhpValue::Packed(out);
+        }
+        // Sparse packed — preserve original int keys via Assoc.
+        let mut out = Vec::with_capacity(n_elems as usize);
+        for i in 0..n_used {
+            let val_ptr: *mut zval = unsafe { ar_packed.add(i as usize) };
+            let ty = unsafe { (*val_ptr).u1.v.type_ } as u32;
+            if ty == IS_UNDEF { continue; }
+            out.push((PhpKey::Int(i as i64), unsafe { zval_raw(val_ptr, ix) }));
+        }
+        return PhpValue::Assoc(out);
+    }
+
+    // Non-packed (assoc) path. Walk Buckets; some may still have small
+    // sequential int keys without the packed flag — emit Packed in that case
+    // so the decode side benefits.
+    let mut out = Vec::with_capacity(n_elems as usize);
+    let mut seen_assoc = false;
+    let mut seq_next: i64 = 0;
+    let mut packed_candidate: Vec<PhpValue> = Vec::with_capacity(n_elems as usize);
+    unsafe {
+        ht_buckets_each(ht, |bkey, val| {
+            if !seen_assoc {
+                if let BucketKey::Long(n) = bkey {
+                    if n == seq_next {
+                        seq_next += 1;
+                        packed_candidate.push(zval_raw(val, ix));
+                        return;
+                    }
+                }
+                seen_assoc = true;
+                for (i, v) in std::mem::take(&mut packed_candidate).into_iter().enumerate() {
+                    out.push((PhpKey::Int(i as i64), v));
+                }
+            }
+            let key = match bkey {
+                BucketKey::Long(n) => PhpKey::Int(n),
+                BucketKey::Str(zs) => PhpKey::Str(ix.intern_zs(zs)),
+            };
+            out.push((key, zval_raw(val, ix)));
+        });
+    }
+    if !seen_assoc {
+        PhpValue::Packed(packed_candidate)
+    } else {
         PhpValue::Assoc(out)
     }
 }
