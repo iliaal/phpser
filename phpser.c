@@ -203,13 +203,18 @@ static inline double le64_read(const uint8_t *src) {
 
 #define INTERN_CACHE_SIZE 16
 
-/* Threshold under which we skip the hash_map check on miss and just add the
- * string to the dict. Rationale: for small dicts the chance of two distinct
- * zend_string allocations colliding by content is tiny, and we'd pay an
- * unconditional hash+probe per unique string. The risk: a duplicate slips
- * through if two same-content allocations show up in the first N strings.
- * Behavior remains correct — wire format just gets a bit larger. */
-#define HASH_MAP_THRESHOLD 32
+/* Threshold under which we skip the hash_map check on miss and just emit
+ * the string inline (potentially duplicating bytes for a key already in
+ * the dict). The 16-slot intern cache is FIFO-evicted, so on rowset-shape
+ * payloads with many unique string values (e.g. 1000 row_X) the prop-key
+ * cache slots get evicted after ~16 inserts. Without hash_map fallback,
+ * the next encounter of the prop key would re-emit it inline, bloating
+ * the wire format.
+ *
+ * Lowered from 32 to 4: above 4 dict entries the hash_map lookup cost
+ * (~15 cycles) is comfortably less than the inline-emit cost (~30 cycles
+ * + wasted wire bytes). Below 4, the cache rarely misses anyway. */
+#define HASH_MAP_THRESHOLD 4
 
 /* Slot kinds in the intern cache, encoded in the high bit of idx.
  *
@@ -1725,6 +1730,21 @@ static zend_string *phpser_encode_zval(zval *value) {
     enc_ctx_init(&ctx);
 
     smart_str body = {0};
+    /* Pre-size body to skip 5-6 geometric grow cycles that an unconfigured
+     * smart_str does on its way up to a typical multi-KB cache payload.
+     * Estimate from top-level container size: an empty default of 256 for
+     * scalars, ~16 bytes per array element, ~256 for any object (cheap
+     * conservative lower bound — get_properties walk would defeat the
+     * purpose). Over-allocates for tiny payloads but the wasted bytes
+     * stay in one zend_mm slot. */
+    size_t body_estimate = 256;
+    if (Z_TYPE_P(value) == IS_ARRAY) {
+        uint32_t n = zend_hash_num_elements(Z_ARRVAL_P(value));
+        if (n > 16) body_estimate = (size_t)n * 16;
+    } else if (Z_TYPE_P(value) == IS_OBJECT) {
+        body_estimate = 256;
+    }
+    smart_str_alloc(&body, body_estimate, 0);
     encode_value(&body, &ctx, value);
     size_t body_len = body.s ? ZSTR_LEN(body.s) : 0;
 
