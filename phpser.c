@@ -50,6 +50,13 @@
                                       ce->serialize / ce->unserialize hook (Serializable interface and
                                       old SPL classes that haven't migrated to __serialize). The bytes
                                       are opaque output from ce->serialize. */
+#define TAG_REF             0x10   /* varint(id) — back-reference to a previously-emitted container.
+                                      id counts in encounter order on both sides; tags TAG_OBJECT,
+                                      TAG_OBJECT_MAGIC, TAG_OBJECT_LEGACY, TAG_ENUM, and TAG_NEW_REF
+                                      each implicitly claim the next id. */
+#define TAG_NEW_REF         0x11   /* inner value follows — claims the next id for an IS_REFERENCE wrap.
+                                      On decode we allocate a fresh zend_reference, register it in the
+                                      id table, then decode the inner value into ref->val. */
 
 /* Assoc key tags (one byte before the key's payload). */
 #define KEY_LONG        0x00
@@ -171,14 +178,14 @@ typedef struct {
     uint32_t cache_filled;
     uint32_t cache_next;
     HashTable hash_map;
-    /* Object handles we've already started encoding in this payload. Used
-     * to break cycles where two objects point at each other through a
-     * non-IS_REFERENCE prop (PHP objects pass by handle). The depth counter
-     * alone can't bound this — a parent/N-children/each-references-parent
-     * shape grows N^depth before the cap fires, which OOMs fast.
-     * Until we ship full shared-ref support (TAG_SHARED/TAG_REF), repeat
-     * visits of the same object handle emit NULL. */
-    HashTable visited_objs;
+    /* Per-payload id table: maps (uintptr_t)(zend_object*|zend_reference*)
+     * to a uint32 id assigned in encounter order. First visit emits the
+     * usual container tag (which claims the next id); subsequent visits
+     * emit TAG_REF + id. Preserves object handle identity (PHP's `r:N`)
+     * and IS_REFERENCE sharing (`R:N`), plus terminates cycles in plain
+     * object graphs without losing the back-edge. */
+    HashTable id_assignments;
+    uint32_t next_id;
     zend_string **dict;
     uint32_t dict_len;
     uint32_t dict_cap;
@@ -190,7 +197,8 @@ static void enc_ctx_init(encode_ctx *e) {
     e->cache_filled = 0;
     e->cache_next = 0;
     zend_hash_init(&e->hash_map, 16, NULL, NULL, 0);
-    zend_hash_init(&e->visited_objs, 8, NULL, NULL, 0);
+    zend_hash_init(&e->id_assignments, 8, NULL, NULL, 0);
+    e->next_id = 0;
     e->dict = NULL;
     e->dict_len = 0;
     e->dict_cap = 0;
@@ -199,8 +207,28 @@ static void enc_ctx_init(encode_ctx *e) {
 
 static void enc_ctx_destroy(encode_ctx *e) {
     zend_hash_destroy(&e->hash_map);
-    zend_hash_destroy(&e->visited_objs);
+    zend_hash_destroy(&e->id_assignments);
     if (e->dict) efree(e->dict);
+}
+
+/* Returns 1 if this is the first time we've seen `ptr`, with the assigned
+ * id written into *out_id (you don't actually need the id on first-visit
+ * since the wire format claims it implicitly via encounter order — but
+ * it's useful for debugging / sanity asserts).
+ *
+ * Returns 0 if `ptr` is a repeat; *out_id holds its previously-assigned id. */
+static inline int enc_visit(encode_ctx *e, void *ptr, uint32_t *out_id) {
+    zend_ulong key = (zend_ulong)(uintptr_t)ptr;
+    zval *hit = zend_hash_index_find(&e->id_assignments, key);
+    if (hit) {
+        *out_id = (uint32_t)Z_LVAL_P(hit);
+        return 0;
+    }
+    uint32_t id = e->next_id++;
+    zval iz; ZVAL_LONG(&iz, id);
+    zend_hash_index_add(&e->id_assignments, key, &iz);
+    *out_id = id;
+    return 1;
 }
 
 static inline intern_slot *enc_cache_find(encode_ctx *e, zend_string *zs) {
@@ -395,10 +423,24 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
         case IS_ARRAY:
             encode_hashtable(body, e, Z_ARRVAL_P(v));
             return;
-        case IS_REFERENCE:
-            /* Flatten — proper ref handling is V2. */
+        case IS_REFERENCE: {
+            /* zend_reference identity: if we've seen this exact zend_reference
+             * struct, emit a back-ref. Otherwise claim a new id and emit
+             * TAG_NEW_REF + inner value. */
+            zend_reference *ref = Z_REF_P(v);
+            uint32_t id;
+            if (!enc_visit(e, ref, &id)) {
+                emit_tag_and_varint(body, TAG_REF, id);
+                return;
+            }
+            smart_str_appendc(body, TAG_NEW_REF);
+            /* id is implicitly id == enc_visit's assigned id; decoder will
+             * register the new zend_reference at next_id++ in encounter order
+             * BEFORE recursing into the inner value (so a back-ref inside
+             * the inner can resolve to this very reference). */
             encode_value(body, e, Z_REFVAL_P(v));
             return;
+        }
         case IS_OBJECT: {
             zend_object *obj = Z_OBJ_P(v);
             /* Classes marked NOT_SERIALIZABLE (Closure, Generator, internal
@@ -409,6 +451,17 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
             if (obj->ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
                 smart_str_appendc(body, TAG_NULL);
                 return;
+            }
+            /* Object handle identity: PHP's `r:N` semantics. If we've seen
+             * this exact zend_object before, emit a back-ref. Otherwise
+             * claim a new id and let the chosen container tag below take
+             * it implicitly via encounter order. */
+            {
+                uint32_t id;
+                if (!enc_visit(e, obj, &id)) {
+                    emit_tag_and_varint(body, TAG_REF, id);
+                    return;
+                }
             }
             /* Legacy C-level serializer (Serializable interface or built-in
              * SPL classes that haven't migrated to __serialize). PHP checks
@@ -470,18 +523,6 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 varint_write_u64(body, case_idx);
                 return;
             }
-            /* Cycle guard: emit NULL on revisit instead of recursing. Object
-             * cycles via plain property pointers (no IS_REFERENCE involved)
-             * can branch — N children, each pointing at the parent — and
-             * blow up exponentially before the depth cap fires. */
-            zend_ulong handle_key = (zend_ulong)obj->handle;
-            if (zend_hash_index_exists(&e->visited_objs, handle_key)) {
-                smart_str_appendc(body, TAG_NULL);
-                return;
-            }
-            zval marker; ZVAL_NULL(&marker);
-            zend_hash_index_add(&e->visited_objs, handle_key, &marker);
-
             uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
             HashTable *props = obj->handlers->get_properties(obj);
             /* Count live entries — get_properties can include $this-style
@@ -618,14 +659,58 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
  * strings get freed and ones that landed in zvals stay alive.
  * ------------------------------------------------------------------------- */
 
+/* A single deferred __unserialize call: we've materialized the object and
+ * decoded the data array, but the call itself is delayed until the rest of
+ * the tree finishes decoding. This ensures back-refs inside the array see
+ * the in-progress (empty) object, and lets __unserialize run with a fully-
+ * stitched object graph. PHP's var_unserializer uses the same pattern. */
+typedef struct {
+    zend_object *obj;
+    zval data;
+} deferred_unserialize;
+
 typedef struct {
     const uint8_t *buf;
     size_t len;
     size_t pos;
     zend_string **dict;        /* eagerly allocated zend_strings per slot */
     uint32_t dict_len;
+    /* id_table holds one zval per registered container (object/reference).
+     * The slot holds a refcount on the underlying zend_object or
+     * zend_reference; we release them in decode_destroy after PHP has
+     * taken its own refs via the returned root zval. */
+    zval *id_table;
+    uint32_t id_table_len;
+    uint32_t id_table_cap;
+    deferred_unserialize *deferred;
+    uint32_t deferred_len;
+    uint32_t deferred_cap;
     int error;
 } decode_ctx;
+
+/* Register `z` in the id_table, claiming the next id. The slot stores an
+ * addref'd copy via ZVAL_COPY so back-refs can resolve to the in-progress
+ * container before its contents are fully decoded. */
+static int dec_register(decode_ctx *d, zval *z) {
+    if (d->id_table_len == d->id_table_cap) {
+        d->id_table_cap = d->id_table_cap ? d->id_table_cap * 2 : 16;
+        d->id_table = erealloc(d->id_table, d->id_table_cap * sizeof(zval));
+    }
+    ZVAL_COPY(&d->id_table[d->id_table_len], z);
+    d->id_table_len++;
+    return 0;
+}
+
+static int dec_defer_unserialize(decode_ctx *d, zend_object *obj, zval *data) {
+    if (d->deferred_len == d->deferred_cap) {
+        d->deferred_cap = d->deferred_cap ? d->deferred_cap * 2 : 4;
+        d->deferred = erealloc(d->deferred, d->deferred_cap * sizeof(deferred_unserialize));
+    }
+    d->deferred[d->deferred_len].obj = obj;
+    ZVAL_COPY_VALUE(&d->deferred[d->deferred_len].data, data);
+    d->deferred_len++;
+    return 0;
+}
 
 static inline zend_string *dec_get_zstr(decode_ctx *d, uint32_t idx) {
     if (UNEXPECTED(idx >= d->dict_len)) {
@@ -669,6 +754,18 @@ static void decode_destroy(decode_ctx *d) {
             if (d->dict[i]) zend_string_release(d->dict[i]);
         }
         efree(d->dict);
+    }
+    if (d->id_table) {
+        for (uint32_t i = 0; i < d->id_table_len; i++) {
+            zval_ptr_dtor(&d->id_table[i]);
+        }
+        efree(d->id_table);
+    }
+    if (d->deferred) {
+        for (uint32_t i = 0; i < d->deferred_len; i++) {
+            zval_ptr_dtor(&d->deferred[i].data);
+        }
+        efree(d->deferred);
     }
 }
 
@@ -716,6 +813,26 @@ static int decode_value(decode_ctx *d, zval *out) {
     if (d->pos >= d->len) return -1;
     uint8_t tag = d->buf[d->pos++];
     switch (tag) {
+        case TAG_REF: {
+            uint64_t id;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &id) < 0) return -1;
+            if (id >= d->id_table_len) return -1;
+            ZVAL_COPY(out, &d->id_table[id]);
+            return 0;
+        }
+        case TAG_NEW_REF: {
+            /* Allocate the zend_reference now and register it BEFORE
+             * recursing, so a back-ref inside the inner value resolves to
+             * this very reference. */
+            zend_reference *ref = (zend_reference *)emalloc(sizeof(zend_reference));
+            GC_SET_REFCOUNT(ref, 1);
+            GC_TYPE_INFO(ref) = GC_REFERENCE;
+            ref->sources.ptr = NULL;
+            ZVAL_UNDEF(&ref->val);
+            ZVAL_REF(out, ref);
+            dec_register(d, out);
+            return decode_value(d, &ref->val);
+        }
         case TAG_NULL:  ZVAL_NULL(out); return 0;
         case TAG_FALSE: ZVAL_FALSE(out); return 0;
         case TAG_TRUE:  ZVAL_TRUE(out); return 0;
@@ -855,9 +972,12 @@ static int decode_value(decode_ctx *d, zval *out) {
             zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
             if (!ce || ce->unserialize == NULL) {
                 /* Unknown class or no C-level unserializer — skip past the
-                 * payload bytes and yield NULL. */
+                 * payload bytes, yield NULL, and register a NULL id-slot so
+                 * subsequent TAG_REFs to this position resolve to NULL
+                 * (matching what we'd see on a partial decode). */
                 d->pos += blen;
                 ZVAL_NULL(out);
+                dec_register(d, out);
                 return 0;
             }
             /* ce->unserialize is responsible for initializing *out; we don't
@@ -869,6 +989,7 @@ static int decode_value(decode_ctx *d, zval *out) {
                 ZVAL_NULL(out);
                 return -1;
             }
+            dec_register(d, out);
             return 0;
         }
         case TAG_OBJECT_MAGIC: {
@@ -876,6 +997,20 @@ static int decode_value(decode_ctx *d, zval *out) {
             if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
             zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
             if (!class_name) return -1;
+
+            zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
+            if (!ce) ce = zend_standard_class_def;
+
+            if (object_init_ex(out, ce) != SUCCESS) {
+                ZVAL_NULL(out);
+                return -1;
+            }
+            /* Register the empty object NOW, before decoding the data array.
+             * A back-ref inside the data array can then resolve to this very
+             * object (cycles through __serialize-class payloads). __unserialize
+             * is deferred to the end of the decode pass so the whole graph is
+             * stitched before any user code runs that might depend on it. */
+            dec_register(d, out);
 
             zval data;
             ZVAL_UNDEF(&data);
@@ -887,33 +1022,12 @@ static int decode_value(decode_ctx *d, zval *out) {
                 zval_ptr_dtor(&data);
                 return -1;
             }
-
-            zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
-            if (!ce) {
-                /* Unknown class — fall back to stdClass holding the data
-                 * array. PHP throws on unknown classes; we choose to be
-                 * lenient because the payload may have been emitted before
-                 * the class was registered. */
-                ce = zend_standard_class_def;
-            }
-            if (object_init_ex(out, ce) != SUCCESS) {
-                zval_ptr_dtor(&data);
-                ZVAL_NULL(out);
-                return -1;
-            }
-            /* If the class has __unserialize, call it with the data array.
-             * Otherwise the payload was emitted by a class that only had
-             * __serialize at write time — defensively, stash the array as
-             * a dynamic 'data' property (lossy but better than dropping). */
             if (ce->__unserialize != NULL) {
-                zend_call_known_instance_method_with_1_params(
-                    ce->__unserialize, Z_OBJ_P(out), NULL, &data);
-                if (EG(exception)) {
-                    zval_ptr_dtor(&data);
-                    return -1;
-                }
+                dec_defer_unserialize(d, Z_OBJ_P(out), &data);
+                /* Ownership of `data` transferred to deferred list. */
+            } else {
+                zval_ptr_dtor(&data);
             }
-            zval_ptr_dtor(&data);
             return 0;
         }
         case TAG_ENUM: {
@@ -928,6 +1042,7 @@ static int decode_value(decode_ctx *d, zval *out) {
             zend_object *obj = zend_enum_get_case(ce, casename);
             if (!obj) return -1;
             ZVAL_OBJ_COPY(out, obj);
+            dec_register(d, out);
             return 0;
         }
         case TAG_OBJECT: {
@@ -950,6 +1065,10 @@ static int decode_value(decode_ctx *d, zval *out) {
                 return -1;
             }
             zend_object *obj = Z_OBJ_P(out);
+            /* Register before decoding properties so a back-ref inside a
+             * property value (cycles, shared subobjects) can resolve to this
+             * in-progress object. */
+            dec_register(d, out);
 
             /* Mirror PHP's var_unserializer property installation. The
              * standard library bypasses write_property (which rejects
@@ -1082,6 +1201,21 @@ static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
         ZVAL_NULL(out);
         decode_destroy(&d);
         return -1;
+    }
+    /* Run deferred __unserialize calls in encounter order. The graph is now
+     * fully stitched, so cycles and shared subobjects are visible to user
+     * code. If a call throws, propagate by stopping; remaining data arrays
+     * (and partially populated objects) still get cleaned up by
+     * decode_destroy. */
+    for (uint32_t i = 0; i < d.deferred_len; i++) {
+        zend_object *obj = d.deferred[i].obj;
+        zval *data = &d.deferred[i].data;
+        zval retval;
+        ZVAL_UNDEF(&retval);
+        zend_call_known_instance_method_with_1_params(
+            obj->ce->__unserialize, obj, &retval, data);
+        zval_ptr_dtor(&retval);
+        if (UNEXPECTED(EG(exception))) break;
     }
     decode_destroy(&d);
     return 0;

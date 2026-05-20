@@ -23,35 +23,9 @@ $collection->append(new StorageBug054662());
 $rt = phpser_unserialize(phpser_serialize($collection));
 echo $rt instanceof ArrayObject ? "arrayobject_class OK\n" : "arrayobject_class FAIL\n";
 
-// --- IS_REFERENCE shared between values ---
-// PHP serialize emits two refs sharing one zend_reference; ours flattens
-// each ref-site to a copy, so post-decode the two slots are independent.
-// Document: NOT shared on round-trip.
-$x = 1;
-$a = [&$x, &$x];
-$rt = phpser_unserialize(phpser_serialize($a));
-$rt[0] = 99;
-echo $rt[1] === 1 ? "ref_flattened OK\n" : "ref_flattened FAIL\n";
-
 // __serialize / __unserialize: SUPPORTED — see 063-magic-serialize.phpt.
-
-// --- Object cycle via property pointer (no IS_REFERENCE) ---
-// Cycle detection via visited_objs: second visit emits NULL. The cycle
-// is broken; the structure decodes successfully but loses the back-edge.
-class CycleNode {
-    public ?CycleNode $other = null;
-    public string $name;
-    public function __construct(string $name) { $this->name = $name; }
-}
-$a = new CycleNode("A");
-$b = new CycleNode("B");
-$a->other = $b;
-$b->other = $a;
-$rt = phpser_unserialize(phpser_serialize($a));
-echo ($rt->name === "A" && $rt->other instanceof CycleNode && $rt->other->name === "B")
-    ? "obj_cycle_break OK\n" : "obj_cycle_break FAIL\n";
-// Back-edge from b to a was emitted as NULL because $a was already visited.
-echo ($rt->other->other === null) ? "obj_cycle_null_backedge OK\n" : "obj_cycle_null_backedge FAIL\n";
+// IS_REFERENCE sharing, object identity, and cycles: SUPPORTED —
+// see 065-shared-refs.phpt.
 
 // --- Closures and resources — emit NULL, no crash ---
 $f = function () { return 42; };
@@ -65,8 +39,5 @@ fclose($r);
 ?>
 --EXPECT--
 arrayobject_class OK
-ref_flattened OK
-obj_cycle_break OK
-obj_cycle_null_backedge OK
 closure_null OK
 resource_null OK
