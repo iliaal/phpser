@@ -16,6 +16,8 @@
 #include "Zend/zend_smart_str.h"
 #include "Zend/zend_hash.h"
 
+#include "Zend/zend_enum.h"
+
 #ifdef HAVE_PHP_SESSION
 # include "ext/session/php_session.h"
 #endif
@@ -40,6 +42,7 @@
 #define TAG_OBJECT          0x0a   /* varint(class_idx), varint(nprops), N×(key_idx, val) */
 #define TAG_PACKED_STRINGS  0x0b   /* varint(len), N×varint(dict_idx) — typed string run */
 #define TAG_STR_INLINE      0x0c   /* varint(len), bytes — single-use string, skips dict */
+#define TAG_ENUM            0x0d   /* varint(class_idx), varint(case_name_idx) */
 
 /* Assoc key tags (one byte before the key's payload). */
 #define KEY_LONG        0x00
@@ -381,6 +384,17 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
             return;
         case IS_OBJECT: {
             zend_object *obj = Z_OBJ_P(v);
+            /* Enums are class-controlled singletons — object_init_ex won't
+             * recreate them on the decode side. Emit class + case name so
+             * we can resolve via zend_enum_get_case during decode. */
+            if (obj->ce->ce_flags & ZEND_ACC_ENUM) {
+                uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
+                zval *cname = zend_enum_fetch_case_name(obj);
+                uint32_t case_idx = enc_intern_zstr(e, Z_STR_P(cname));
+                emit_tag_and_varint(body, TAG_ENUM, class_idx);
+                varint_write_u64(body, case_idx);
+                return;
+            }
             uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
             HashTable *props = obj->handlers->get_properties(obj);
             /* Count live entries — get_properties can include $this-style
@@ -545,7 +559,10 @@ static int decode_header(decode_ctx *d) {
     if (d->buf[d->pos++] != PHPSER_VERSION) return -1;
     uint64_t n;
     if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-    if (n > UINT32_MAX) return -1;
+    /* Each dict entry is at least 2 bytes (varint(0) + 0 content, but a
+     * realistic minimum is 1 byte length + at least 1 byte content). Bound
+     * N by remaining input so an oversized varint can't OOM the ecalloc. */
+    if (n > UINT32_MAX || n > d->len - d->pos) return -1;
     d->dict_len = (uint32_t)n;
     d->dict = ecalloc(d->dict_len + 1, sizeof(zend_string *));
     for (uint32_t i = 0; i < d->dict_len; i++) {
@@ -652,7 +669,10 @@ static int decode_value(decode_ctx *d, zval *out) {
         case TAG_PACKED_LONGS: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-            if (n > UINT32_MAX) return -1;
+            /* Bound N by remaining buffer — each element is at least 1 byte
+             * (the smallest varint). Without this a malformed payload could
+             * announce N=2^32 elements and OOM us before parsing fails. */
+            if (n > UINT32_MAX || n > d->len - d->pos) return -1;
             /* Pre-sized HT + direct arPacked writes. This is the hot path
              * we expect to beat igbinary on numeric arrays. */
             zend_array *arr = zend_new_array((uint32_t)n);
@@ -674,7 +694,8 @@ static int decode_value(decode_ctx *d, zval *out) {
         case TAG_PACKED_DOUBLES: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-            if (n > UINT32_MAX || d->pos + n * 8 > d->len) return -1;
+            /* PACKED_DOUBLES requires exactly 8*N bytes — check fits exactly. */
+            if (n > UINT32_MAX || n > (d->len - d->pos) / 8) return -1;
             zend_array *arr = zend_new_array((uint32_t)n);
             zend_hash_real_init_packed(arr);
             for (uint64_t i = 0; i < n; i++) {
@@ -692,7 +713,7 @@ static int decode_value(decode_ctx *d, zval *out) {
         case TAG_PACKED_STRINGS: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-            if (n > UINT32_MAX) return -1;
+            if (n > UINT32_MAX || n > d->len - d->pos) return -1;
             zend_array *arr = zend_new_array((uint32_t)n);
             zend_hash_real_init_packed(arr);
             for (uint64_t i = 0; i < n; i++) {
@@ -719,7 +740,7 @@ static int decode_value(decode_ctx *d, zval *out) {
         case TAG_PACKED_MIXED: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-            if (n > UINT32_MAX) return -1;
+            if (n > UINT32_MAX || n > d->len - d->pos) return -1;
             zend_array *arr = zend_new_array((uint32_t)n);
             zend_hash_real_init_packed(arr);
             for (uint64_t i = 0; i < n; i++) {
@@ -735,10 +756,26 @@ static int decode_value(decode_ctx *d, zval *out) {
             ZVAL_ARR(out, arr);
             return 0;
         }
+        case TAG_ENUM: {
+            uint64_t class_idx, case_idx;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &case_idx) < 0) return -1;
+            zend_string *cname = dec_get_zstr(d, (uint32_t)class_idx);
+            zend_string *casename = dec_get_zstr(d, (uint32_t)case_idx);
+            if (!cname || !casename) return -1;
+            zend_class_entry *ce = zend_lookup_class_ex(cname, NULL, 0);
+            if (!ce || !(ce->ce_flags & ZEND_ACC_ENUM)) return -1;
+            zend_object *obj = zend_enum_get_case(ce, casename);
+            if (!obj) return -1;
+            ZVAL_OBJ_COPY(out, obj);
+            return 0;
+        }
         case TAG_OBJECT: {
             uint64_t class_idx, nprops;
             if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
             if (varint_read_u64(d->buf, d->len, &d->pos, &nprops) < 0) return -1;
+            /* Each prop is at least 2 bytes (key idx varint + value tag). */
+            if (nprops > UINT32_MAX || nprops > (d->len - d->pos) / 2) return -1;
             zend_string *class_name = dec_get_zstr(d, (uint32_t)class_idx);
             if (!class_name) return -1;
 
@@ -748,14 +785,21 @@ static int decode_value(decode_ctx *d, zval *out) {
             zend_class_entry *ce = zend_lookup_class_ex(class_name, NULL, 0);
             if (!ce) ce = zend_standard_class_def;
 
-            /* Materialize the object. Trusted (mostly): we built this payload.
-             * Skipping ce->create_object hooks and __wakeup for V1 — those
-             * land with full Serializable / __unserialize support later. */
             if (object_init_ex(out, ce) != SUCCESS) {
                 ZVAL_NULL(out);
                 return -1;
             }
             zend_object *obj = Z_OBJ_P(out);
+
+            /* Mirror PHP's var_unserializer property installation. The
+             * standard library bypasses write_property (which rejects
+             * NUL-prefixed mangled names) and zend_get_property_info
+             * (which would enforce visibility scope on private props).
+             * Instead it looks up the mangled key directly in the object's
+             * properties HT — declared props show up as IS_INDIRECT entries
+             * pointing into properties_table, and we write straight into
+             * that slot. Dynamic props fall through to zend_hash_update. */
+            HashTable *obj_props = zend_std_get_properties(obj);
 
             for (uint64_t i = 0; i < nprops; i++) {
                 uint64_t key_idx;
@@ -764,23 +808,30 @@ static int decode_value(decode_ctx *d, zval *out) {
                 if (!key) goto obj_fail;
                 zval tmp;
                 if (decode_value(d, &tmp) < 0) goto obj_fail;
-                /* update_property handles typed-property coercion and the
-                 * declared-vs-dynamic property bag distinction. Slower than
-                 * direct HT write but correct across class shapes. */
-                obj->handlers->write_property(obj, key, &tmp, NULL);
-                zval_ptr_dtor(&tmp);
+
+                zval *existing = zend_hash_find(obj_props, key);
+                if (existing && Z_TYPE_P(existing) == IS_INDIRECT) {
+                    /* Declared prop — write into the slot. The indirect
+                     * value is the actual slot in properties_table. */
+                    zval *slot = Z_INDIRECT_P(existing);
+                    zval_ptr_dtor(slot);
+                    ZVAL_COPY_VALUE(slot, &tmp);
+                } else {
+                    /* Dynamic prop (or no matching slot). update_ind keeps
+                     * any existing IS_INDIRECT redirection intact. */
+                    zend_hash_update_ind(obj_props, key, &tmp);
+                }
                 continue;
             obj_fail:
-                zval_ptr_dtor(out);
-                ZVAL_NULL(out);
-                return -1;
+                zval_ptr_dtor(out); ZVAL_NULL(out); return -1;
             }
             return 0;
         }
         case TAG_ASSOC: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-            if (n > UINT32_MAX) return -1;
+            /* Each assoc entry is at least 2 bytes (key tag + value tag). */
+            if (n > UINT32_MAX || n > (d->len - d->pos) / 2) return -1;
             zend_array *arr = zend_new_array((uint32_t)n);
             for (uint64_t i = 0; i < n; i++) {
                 key_val k;
