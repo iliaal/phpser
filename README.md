@@ -14,21 +14,23 @@ failed to beat `pecl/igbinary` in opt-mode benchmarks — see
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → 5103 (**+12%**) | 8k ns → 12k ns (+47%) | 9k ns → 10k ns (+14%) |
-| rowset_1000 | 47K → 53K (**+11%**) | 141k → 132k ns (**-6%**) | 89k → 102k ns (+15%) |
-| packed_1k | 5495 → **1941** (**-65%**) | 3.7k → **1.2k** ns (**-66%**) | 6.4k → **1.7k** ns (**-73%**) |
-| packed_10k | 60K → **22K** (**-63%**) | 37k → **15k** ns (**-60%**) | 62k → **18k** ns (**-70%**) |
-| deep_50 | 419 → 420 (parity) | 1.2k → **0.8k** ns (**-37%**) | 1.6k → **1.2k** ns (**-22%**) |
+| rowset_100 | 4570 → 4876 (+7%) | 8k → 11k ns (+38%) | 9k → 9.5k ns (parity) |
+| rowset_1000 | 47K → 50K (+5%) | 138k → 120k ns (**-13%**) | 92k → 97k ns (parity, +5%) |
+| packed_1k | 5495 → **1941** (**-65%**) | 3.7k → **1.2k** ns (**-66%**) | 6.4k → **1.8k** ns (**-73%**) |
+| packed_10k | 60K → **22K** (**-63%**) | 37k → **15k** ns (**-59%**) | 62k → **19k** ns (**-70%**) |
+| deep_50 | 419 → 420 (parity) | 1.2k → **0.7k** ns (**-41%**) | 1.6k → **1.3k** ns (**-20%**) |
 
-Wins: packed numerics ~65% smaller + ~70% faster decode + ~62% faster
-encode. Deep-nested 22–37% faster on both sides at parity size.
-Rowset_1000 encode now beats igbinary by a few percent. Rowset decode
-within 10–20% of igbinary across all sizes.
+Wins: packed numerics ~65% smaller + ~70% faster decode + ~60% faster
+encode. Deep-nested ~20–40% faster on both sides at parity size.
+**Rowset_1000 encode now beats igbinary by 13%**, decode at parity (+5%).
 
-The persistent gap on rowsets is +11% size (we don't yet inline short
-strings or compactly encode tag+varint pairs the way igbinary does) and
-~15% decode (zend_hash_add_new + key materialization per bucket is real
-cost; closer parity needs bucket-direct writes via internal API).
+`rowset_100` encode (+38%) is the one durable gap — it's fixed-cost
+floor for unique-per-row strings (`row_0`..`row_99`) that get dict-
+interned individually. igbinary emits these inline with no per-string
+dict overhead. Closing further would require an inline-string tag or
+a two-pass encoder that knows which strings appear `>= 2` times. The
+absolute time is small enough (11 µs for the entire 100-row payload)
+that it hasn't been worth the complexity.
 
 ## What we kept from the experiment
 

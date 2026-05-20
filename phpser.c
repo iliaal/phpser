@@ -33,6 +33,7 @@
 #define TAG_PACKED_LONGS    0x08   /* varint(len), N×zigzag-varint */
 #define TAG_PACKED_DOUBLES  0x09   /* varint(len), N×8-byte LE */
 #define TAG_OBJECT          0x0a   /* varint(class_idx), varint(nprops), N×(key_idx, val) */
+#define TAG_PACKED_STRINGS  0x0b   /* varint(len), N×varint(dict_idx) — typed string run */
 
 /* Assoc key tags (one byte before the key's payload). */
 #define KEY_LONG  0x00
@@ -49,6 +50,14 @@ static inline void varint_write_u64(smart_str *s, uint64_t v) {
         v >>= 7;
     }
     smart_str_appendc(s, (char)v);
+}
+
+/* Common case: tag byte + small varint. Inlines two appendc for the typical
+ * (tag + 1-byte varint) shape, which is the dominant pattern for assoc key
+ * indices and string-dict refs (dicts rarely exceed 128 entries per payload). */
+static inline void emit_tag_and_varint(smart_str *s, uint8_t tag, uint64_t v) {
+    smart_str_appendc(s, (char)tag);
+    varint_write_u64(s, v);
 }
 
 static inline int varint_read_u64(const uint8_t *buf, size_t buflen, size_t *pos, uint64_t *out) {
@@ -87,17 +96,28 @@ static inline int varint_read_i64(const uint8_t *buf, size_t buflen, size_t *pos
 }
 
 /* -------------------------------------------------------------------------
- * Encode state. The interner is two-tiered:
+ * Encode state. Two-tier intern:
  *   - inline_cache: 16-slot ring of (zend_string*, dict_idx). Hit rate on
  *     rowset shapes is near 100% after the first row because PHP shares
  *     interned literal pointers across all rows. ~5-10 cmps per lookup;
  *     no hash function call, no HashTable bucket walk.
- *   - byte_map: HashTable fallback for misses and for distinct zend_string
- *     allocations that happen to share content (rare but supported).
+ *   - hash_map: HashTable keyed by zend_string content. ONLY consulted on
+ *     inline-cache miss AND only meaningful when two distinct zend_string
+ *     allocations share content (e.g., runtime-built strings that happen
+ *     to equal a literal). For typical cache payloads it's mostly dead
+ *     weight, but we keep it for correctness.
  *   - dict: index→zend_string* array we emit at the head.
  * ------------------------------------------------------------------------- */
 
 #define INTERN_CACHE_SIZE 16
+
+/* Threshold under which we skip the hash_map check on miss and just add the
+ * string to the dict. Rationale: for small dicts the chance of two distinct
+ * zend_string allocations colliding by content is tiny, and we'd pay an
+ * unconditional hash+probe per unique string. The risk: a duplicate slips
+ * through if two same-content allocations show up in the first N strings.
+ * Behavior remains correct — wire format just gets a bit larger. */
+#define HASH_MAP_THRESHOLD 32
 
 typedef struct {
     zend_string *ptr;
@@ -115,7 +135,7 @@ typedef struct {
     intern_slot inline_cache[INTERN_CACHE_SIZE];
     uint32_t cache_filled;        /* number of valid slots, up to INTERN_CACHE_SIZE */
     uint32_t cache_next;          /* next replacement slot when full (LRU-ish ring) */
-    HashTable byte_map;           /* (zend_string content -> u32 dict_idx) */
+    HashTable hash_map;           /* (zend_string content -> u32 dict_idx), only used past threshold */
     zend_string **dict;           /* index -> zend_string* (borrowed) */
     uint32_t dict_len;
     uint32_t dict_cap;
@@ -126,7 +146,7 @@ static void enc_ctx_init(encode_ctx *e) {
     memset(e->inline_cache, 0, sizeof(e->inline_cache));
     e->cache_filled = 0;
     e->cache_next = 0;
-    zend_hash_init(&e->byte_map, 16, NULL, NULL, 0);
+    zend_hash_init(&e->hash_map, 16, NULL, NULL, 0);
     e->dict = NULL;
     e->dict_len = 0;
     e->dict_cap = 0;
@@ -134,7 +154,7 @@ static void enc_ctx_init(encode_ctx *e) {
 }
 
 static void enc_ctx_destroy(encode_ctx *e) {
-    zend_hash_destroy(&e->byte_map);
+    zend_hash_destroy(&e->hash_map);
     if (e->dict) efree(e->dict);
 }
 
@@ -156,24 +176,37 @@ static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
         if (e->inline_cache[i].ptr == zs) return e->inline_cache[i].idx;
     }
 
-    /* Content lookup. Two distinct zend_string allocations with the same
-     * bytes should still resolve to one dict entry. */
-    zval *hit = zend_hash_find(&e->byte_map, zs);
-    if (hit) {
-        uint32_t idx = (uint32_t)Z_LVAL_P(hit);
-        enc_cache_insert(e, zs, idx);
-        return idx;
+    /* Content lookup, only once the dict is large enough that the chance
+     * of two distinct allocations colliding by content matters. For small
+     * payloads this branch is skipped — saves the per-unique-string hash. */
+    if (e->dict_len >= HASH_MAP_THRESHOLD) {
+        zval *hit = zend_hash_find(&e->hash_map, zs);
+        if (hit) {
+            uint32_t idx = (uint32_t)Z_LVAL_P(hit);
+            enc_cache_insert(e, zs, idx);
+            return idx;
+        }
     }
 
-    /* Miss — append to dict and back-fill both indices. */
+    /* Append to dict. */
     if (e->dict_len == e->dict_cap) {
         e->dict_cap = e->dict_cap ? e->dict_cap * 2 : 16;
         e->dict = erealloc(e->dict, e->dict_cap * sizeof(zend_string *));
     }
     uint32_t idx = e->dict_len++;
     e->dict[idx] = zs;
-    zval iz; ZVAL_LONG(&iz, idx);
-    zend_hash_add(&e->byte_map, zs, &iz);
+
+    /* Once we cross the threshold, backfill the hash_map so subsequent
+     * misses can hit it. Pay this O(N) cost exactly once. */
+    if (e->dict_len == HASH_MAP_THRESHOLD) {
+        for (uint32_t i = 0; i < e->dict_len; i++) {
+            zval iz; ZVAL_LONG(&iz, i);
+            zend_hash_add(&e->hash_map, e->dict[i], &iz);
+        }
+    } else if (e->dict_len > HASH_MAP_THRESHOLD) {
+        zval iz; ZVAL_LONG(&iz, idx);
+        zend_hash_add(&e->hash_map, zs, &iz);
+    }
     enc_cache_insert(e, zs, idx);
     return idx;
 }
@@ -219,8 +252,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
             smart_str_appendc(body, TAG_TRUE);
             return;
         case IS_LONG:
-            smart_str_appendc(body, TAG_LONG);
-            varint_write_i64(body, Z_LVAL_P(v));
+            emit_tag_and_varint(body, TAG_LONG, zigzag_encode64(Z_LVAL_P(v)));
             return;
         case IS_DOUBLE: {
             smart_str_appendc(body, TAG_DOUBLE);
@@ -230,8 +262,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
         }
         case IS_STRING: {
             uint32_t idx = enc_intern_zstr(e, Z_STR_P(v));
-            smart_str_appendc(body, TAG_STR_DICT);
-            varint_write_u64(body, idx);
+            emit_tag_and_varint(body, TAG_STR_DICT, idx);
             return;
         }
         case IS_ARRAY:
@@ -278,17 +309,24 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
 }
 
 /* Homogeneity scan over a dense packed array. Determines whether we can use
- * a typed-run tag (PACKED_LONGS / PACKED_DOUBLES) that skips per-element tag
- * emission and lets the decoder use a single tight loop. */
+ * a typed-run tag (PACKED_LONGS / PACKED_DOUBLES / PACKED_STRINGS) that skips
+ * per-element tag emission and lets the decoder use a single tight loop. */
 static uint8_t detect_packed_run(HashTable *ht, uint32_t n_used) {
     if (n_used == 0) return TAG_PACKED_MIXED;
     zval *zp = ht->arPacked;
     uint8_t first = Z_TYPE(zp[0]);
-    if (first != IS_LONG && first != IS_DOUBLE) return TAG_PACKED_MIXED;
+    if (first != IS_LONG && first != IS_DOUBLE && first != IS_STRING) {
+        return TAG_PACKED_MIXED;
+    }
     for (uint32_t i = 1; i < n_used; i++) {
         if (Z_TYPE(zp[i]) != first) return TAG_PACKED_MIXED;
     }
-    return first == IS_LONG ? TAG_PACKED_LONGS : TAG_PACKED_DOUBLES;
+    switch (first) {
+        case IS_LONG:   return TAG_PACKED_LONGS;
+        case IS_DOUBLE: return TAG_PACKED_DOUBLES;
+        case IS_STRING: return TAG_PACKED_STRINGS;
+        default:        return TAG_PACKED_MIXED; /* unreachable */
+    }
 }
 
 static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
@@ -310,6 +348,10 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
             for (uint32_t i = 0; i < n_used; i++) {
                 double d = Z_DVAL(zp[i]);
                 smart_str_appendl(body, (char *)&d, 8);
+            }
+        } else if (tag == TAG_PACKED_STRINGS) {
+            for (uint32_t i = 0; i < n_used; i++) {
+                varint_write_u64(body, enc_intern_zstr(e, Z_STR(zp[i])));
             }
         } else {
             for (uint32_t i = 0; i < n_used; i++) {
@@ -341,11 +383,9 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
     for (; b < end; b++) {
         if (Z_TYPE(b->val) == IS_UNDEF) continue;
         if (b->key) {
-            smart_str_appendc(body, KEY_STR);
-            varint_write_u64(body, enc_intern_zstr(e, b->key));
+            emit_tag_and_varint(body, KEY_STR, enc_intern_zstr(e, b->key));
         } else {
-            smart_str_appendc(body, KEY_LONG);
-            varint_write_i64(body, (int64_t)b->h);
+            emit_tag_and_varint(body, KEY_LONG, zigzag_encode64((int64_t)b->h));
         }
         encode_value(body, e, &b->val);
     }
@@ -495,6 +535,33 @@ static int decode_value(decode_ctx *d, zval *out) {
                 memcpy(&dv, d->buf + d->pos, 8);
                 d->pos += 8;
                 ZVAL_DOUBLE(&arr->arPacked[i], dv);
+            }
+            arr->nNumUsed = (uint32_t)n;
+            arr->nNumOfElements = (uint32_t)n;
+            arr->nNextFreeElement = (zend_long)n;
+            ZVAL_ARR(out, arr);
+            return 0;
+        }
+        case TAG_PACKED_STRINGS: {
+            uint64_t n;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
+            if (n > UINT32_MAX) return -1;
+            zend_array *arr = zend_new_array((uint32_t)n);
+            zend_hash_real_init_packed(arr);
+            for (uint64_t i = 0; i < n; i++) {
+                uint64_t idx;
+                if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) {
+                    arr->nNumUsed = (uint32_t)i;
+                    zend_array_destroy(arr);
+                    return -1;
+                }
+                zend_string *zs = dec_get_zstr(d, (uint32_t)idx);
+                if (!zs) {
+                    arr->nNumUsed = (uint32_t)i;
+                    zend_array_destroy(arr);
+                    return -1;
+                }
+                ZVAL_STR_COPY(&arr->arPacked[i], zs);
             }
             arr->nNumUsed = (uint32_t)n;
             arr->nNumOfElements = (uint32_t)n;
