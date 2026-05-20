@@ -29,7 +29,7 @@ echo ($rt instanceof Vanishing && $rt->a === 7 && $rt->s === "hi") ? "vanishing_
 // SplObjectStorage round-trip — the class always exists, so this is
 // just a sanity check that the no-fallback case works. ---
 $sos = new SplObjectStorage();
-$sos->attach(new stdClass(), "x");
+$sos[new stdClass()] = "x";
 $rt = phpser_unserialize(phpser_serialize($sos));
 echo ($rt instanceof SplObjectStorage && $rt->count() === 1) ? "legacy_known OK\n" : "legacy_known FAIL\n";
 
@@ -52,7 +52,7 @@ echo ($rt instanceof WithNul) ? "mangled_known OK\n" : "mangled_known FAIL\n";
 // obj->ce->name for the class ref, and the subclass exists at decode. ---
 class MySos extends SplObjectStorage {}
 $sub = new MySos();
-$sub->attach(new stdClass(), "data");
+$sub[new stdClass()] = "data";
 $rt = phpser_unserialize(phpser_serialize($sub));
 echo ($rt instanceof MySos && $rt->count() === 1) ? "internal_sub OK\n" : "internal_sub FAIL\n";
 

@@ -8,6 +8,7 @@ modules/
 autom4te.cache/
 build/
 configure
+configure.ac
 configure~
 config.h
 config.h.in

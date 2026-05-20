@@ -36,8 +36,8 @@ class Key { public int $id; public function __construct(int $i) { $this->id = $i
 $sos = new SplObjectStorage();
 $k1 = new Key(1);
 $k2 = new Key(2);
-$sos->attach($k1, "value-1");
-$sos->attach($k2, "value-2");
+$sos[$k1] = "value-1";
+$sos[$k2] = "value-2";
 $rt = phpser_unserialize(phpser_serialize($sos));
 echo ($rt instanceof SplObjectStorage && $rt->count() === 2) ? "spl_obj_storage OK\n" : "spl_obj_storage FAIL\n";
 

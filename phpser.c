@@ -1240,7 +1240,7 @@ static void decode_destroy(decode_ctx *d) {
             if (s->kind == ID_OBJ) {
                 OBJ_RELEASE(s->u.obj);
             } else if (s->kind == ID_REF) {
-                GC_DTOR_NO_REF(s->u.ref);
+                GC_DTOR(s->u.ref);
             }
         }
         efree(d->id_table);
@@ -1367,7 +1367,30 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             ZVAL_UNDEF(&ref->val);
             ZVAL_REF(out, ref);
             dec_register(d, out);
-            return decode_value(d, &ref->val);
+            if (decode_value(d, &ref->val) < 0) return -1;
+            /* Reject IS_REFERENCE wrapping IS_REFERENCE: phpser's encoder
+             * can't produce this (PHP's own ref machinery flattens on bind),
+             * but adversarial wire (TAG_NEW_REF directly inside TAG_NEW_REF,
+             * or TAG_NEW_REF + TAG_REF to itself) can. Either shape forces
+             * PHP's teardown to recurse through ref->val->ref->val...,
+             * blowing the C stack on a payload as small as 256 bytes. The
+             * legitimate cycle pattern (`$a = []; $a[] = &$a;`) routes
+             * through a container so ref->val ends up IS_ARRAY/IS_OBJECT,
+             * which terminates cleanly via the gc cycle collector.
+             *
+             * Clear ref->val before returning so the refcount cycle breaks:
+             * the self-ref case (TAG_NEW_REF + TAG_REF to itself) has
+             * ref->val holding a refcount back on ref itself, and the
+             * id_table teardown can't drive refcount to zero unless that
+             * self-edge is cut here. The chained case (nested TAG_NEW_REF)
+             * also drops one cycle edge so id_table teardown can free
+             * downstream entries cleanly via the standard refcount chain. */
+            if (Z_TYPE(ref->val) == IS_REFERENCE) {
+                zval_ptr_dtor(&ref->val);
+                ZVAL_UNDEF(&ref->val);
+                return -1;
+            }
+            return 0;
         }
         case TAG_NULL:  ZVAL_NULL(out); return 0;
         case TAG_FALSE: ZVAL_FALSE(out); return 0;
@@ -1929,11 +1952,24 @@ static int phpser_decode_buf_opts(
     }
 done:
     decode_destroy(&d);
+    /* Adversarial wire can hand back a top-level IS_REFERENCE (TAG_NEW_REF
+     * as the root value). PHP's calling convention rejects that for
+     * functions not declared by-ref: ZEND_DO_ICALL asserts IS_REFERENCE
+     * iff the function returns by-ref. phpser_unserialize is plain-return,
+     * so unwrap before handing back. Matches PHP native unserialize, which
+     * collapses a top-level `R:n;` to the underlying value. */
+    if (Z_TYPE_P(out) == IS_REFERENCE) {
+        zend_reference *ref = Z_REF_P(out);
+        zval inner;
+        ZVAL_COPY(&inner, &ref->val);
+        zval_ptr_dtor(out);
+        ZVAL_COPY_VALUE(out, &inner);
+    }
     /* If a deferred __unserialize or __wakeup threw, signal failure to C
      * callers. PHP-level callers are unwound by Zend's exception handling
      * at the function boundary regardless, but the session handler
      * (PS_SERIALIZER_DECODE_FUNC) reads our return value to decide whether
-     * to persist `$_SESSION` — a swallowed exception would let it commit
+     * to persist `$_SESSION`. A swallowed exception would let it commit
      * a partially-stitched graph. */
     return UNEXPECTED(EG(exception)) ? -1 : 0;
 }
