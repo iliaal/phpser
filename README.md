@@ -17,22 +17,24 @@ failed to beat `pecl/igbinary` in opt-mode benchmarks — see
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → 5095 (+12%) | 10k → 13k ns (+30%) | 11k → 13k ns (+15%) |
-| rowset_1000 | 47K → 49K (**+3%**) | 163k → 125k ns (**-22%**) | 106k → 117k ns (+10%) |
-| packed_1k | 5495 → **1941** (**-65%**) | 4.5k → **1.5k** ns (**-67%**) | 7.7k → **1.8k** ns (**-76%**) |
-| packed_10k | 60K → **22K** (**-63%**) | 44k → **19k** ns (**-57%**) | 75k → **19k** ns (**-74%**) |
-| deep_50 | 419 → 424 (parity) | 1.4k → **0.7k** ns (**-51%**) | 1.8k → **1.7k** ns (**-11%**) |
+| rowset_100 | 4570 → **4819** (**+5.4%**) | 9k → 12k ns (+27%) | 10k → 10k ns (+6%) |
+| rowset_1000 | 47K → 48K (**+2.1%**) | 150k → 120k ns (**-19%**) | 99k → 108k ns (+10%) |
+| packed_1k | 5495 → **1941** (**-65%**) | 4.2k → **1.4k** ns (**-67%**) | 7.0k → **1.8k** ns (**-76%**) |
+| packed_10k | 60K → **22K** (**-63%**) | 40k → **16k** ns (**-60%**) | 68k → **18k** ns (**-74%**) |
+| deep_50 | 419 → 424 (parity) | 1.3k → **0.6k** ns (**-54%**) | 1.6k → **1.5k** ns (**-11%**) |
 
-Wins: packed numerics ~65% smaller + ~74% faster decode + ~57% faster
-encode. Deep-nested ~50% faster encode at parity size. **Rowset_1000
-encode beats igbinary by ~22%**, size within 3%; decode pays a ~10%
+Wins: packed numerics ~65% smaller + ~74% faster decode + ~60% faster
+encode. Deep-nested ~54% faster encode at parity size. **Rowset_1000
+encode beats igbinary by ~19%**, size within 2%; decode pays a ~10%
 tax for the front-loaded dict header walk + refcount-reuse machinery.
 
-`rowset_100` encode (+30%) is the one durable gap — fixed-cost floor
+`rowset_100` encode (+27%) is the one durable gap — fixed-cost floor
 for the dict header emission and first-row inline emissions, amortized
-over too few rows to recover. The absolute time is small (13 µs for
-the entire 100-row payload). Small-rowset decode (+15%) is the same
-shape: header + dict-warmup costs dominate when the body is short.
+over too few rows to recover. The absolute time is small (12 µs for
+the entire 100-row payload). The previously-large size gap (+12%) and
+decode gap (+15%) collapsed to +5% and +6% after the cache-miss
+hash_map fallback was wired up — see the encode-state comment about
+`HASH_MAP_THRESHOLD` for the mechanism.
 
 ## What we kept from the experiment
 
