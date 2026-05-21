@@ -31,11 +31,17 @@ few build tools installed first:
 
 ```bash
 # Debian/Ubuntu
-sudo apt install -y git bison libtool-bin
+sudo apt install -y git bison libtool-bin unzip
 
 # macOS
 brew install bison libtool
 ```
+
+`unzip` is load-bearing on Debian: composer shells out to `/usr/bin/unzip`
+when extracting PIE's prebuilt-binary zip. If `unzip` is missing, composer
+silently falls back to PHP's ZipArchive which lays the `.so` out at a
+path PIE doesn't check, and install fails with `ExtensionBinaryNotFound`
+even though the zip downloaded fine.
 
 ### From source
 
