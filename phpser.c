@@ -293,6 +293,12 @@ typedef struct {
     uint32_t dict_len;
     uint32_t dict_cap;
     uint32_t depth;
+    /* Set when encode_value hits MAX_DEPTH and substitutes TAG_NULL. The
+     * substitution keeps the in-progress buffer well-formed, but the result
+     * would silently lose data (and decode rejects it at the same cap), so
+     * phpser_encode_zval checks this after the walk and fails loudly rather
+     * than handing back a lossy payload. */
+    uint8_t depth_exceeded;
 } encode_ctx;
 
 static void enc_ctx_init(encode_ctx *e) {
@@ -308,6 +314,7 @@ static void enc_ctx_init(encode_ctx *e) {
     e->dict_len = 0;
     e->dict_cap = 0;
     e->depth = 0;
+    e->depth_exceeded = 0;
 }
 
 static void enc_ctx_destroy(encode_ctx *e) {
@@ -489,29 +496,36 @@ static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
     return idx;
 }
 
-/* Emit a string value, choosing between TAG_STR_INLINE (first encounter)
- * and TAG_STR_DICT (second+ encounter via upgrade). Single-pass: we don't
- * know if a string will repeat until we see it again. Subtle properties:
+/* Emit a string, choosing between an inline tag (first encounter) and a
+ * dict-ref tag (second+ encounter via upgrade). Single-pass: we don't know
+ * if a string will repeat until we see it again. Subtle properties:
  *
- *   - First-time strings emit TAG_STR_INLINE — no dict insert cost.
+ *   - First-time strings emit `inline_tag` — no dict insert cost.
  *   - On the SECOND encounter we promote to the dict; the previous inline
  *     emission stays as-is in the buffer (it's still a valid value), and
- *     all subsequent occurrences emit TAG_STR_DICT with the assigned idx.
+ *     all subsequent occurrences emit `dict_tag` with the assigned idx.
  *   - For pure-singleton strings (e.g. row_X values in a rowset), we never
  *     hit the upgrade branch — no dict header overhead either.
  *   - Eviction from the 16-slot ring is benign: a later re-encounter of
  *     an evicted INLINE_EMITTED string will inline-emit it a second time.
- *     Decode is still correct; the wire just has the same bytes twice. */
-static void enc_emit_str_value(smart_str *body, encode_ctx *e, zend_string *zs) {
+ *     Decode is still correct; the wire just has the same bytes twice.
+ *
+ * Values pass (TAG_STR_DICT, TAG_STR_INLINE); assoc keys pass
+ * (KEY_STR, KEY_STR_INLINE). The logic is identical; only the tag bytes
+ * differ, so both entry points are thin wrappers around this. */
+static zend_always_inline void enc_emit_str_tagged(
+    smart_str *body, encode_ctx *e, zend_string *zs,
+    uint8_t dict_tag, uint8_t inline_tag)
+{
     intern_slot *s = enc_cache_find(e, zs);
     if (s) {
         if (SLOT_IS_DICT(*s)) {
-            emit_tag_and_varint(body, TAG_STR_DICT, SLOT_DICT_IDX(*s));
+            emit_tag_and_varint(body, dict_tag, SLOT_DICT_IDX(*s));
             return;
         }
         /* INLINE_EMITTED — upgrade in place. */
         s->idx = enc_dict_append(e, zs);  /* writes into low 31 bits; high bit cleared */
-        emit_tag_and_varint(body, TAG_STR_DICT, s->idx);
+        emit_tag_and_varint(body, dict_tag, s->idx);
         return;
     }
     /* Cache miss above HASH_MAP_THRESHOLD: content dedup might still hit. */
@@ -520,44 +534,24 @@ static void enc_emit_str_value(smart_str *body, encode_ctx *e, zend_string *zs) 
         if (hit) {
             uint32_t idx = (uint32_t)Z_LVAL_P(hit);
             enc_cache_alloc_slot(e, zs)->idx = idx;
-            emit_tag_and_varint(body, TAG_STR_DICT, idx);
+            emit_tag_and_varint(body, dict_tag, idx);
             return;
         }
     }
     /* First encounter: emit inline, mark in cache as INLINE_EMITTED so the
      * next occurrence triggers the upgrade above. */
-    smart_str_appendc(body, TAG_STR_INLINE);
+    smart_str_appendc(body, inline_tag);
     varint_write_u64(body, ZSTR_LEN(zs));
     smart_str_appendl(body, ZSTR_VAL(zs), ZSTR_LEN(zs));
     enc_cache_alloc_slot(e, zs)->idx = SLOT_INLINE_MARK;
 }
 
-/* Same idea for assoc string keys: KEY_STR_INLINE on first occurrence,
- * KEY_STR on subsequent. */
+static void enc_emit_str_value(smart_str *body, encode_ctx *e, zend_string *zs) {
+    enc_emit_str_tagged(body, e, zs, TAG_STR_DICT, TAG_STR_INLINE);
+}
+
 static void enc_emit_str_key(smart_str *body, encode_ctx *e, zend_string *zs) {
-    intern_slot *s = enc_cache_find(e, zs);
-    if (s) {
-        if (SLOT_IS_DICT(*s)) {
-            emit_tag_and_varint(body, KEY_STR, SLOT_DICT_IDX(*s));
-            return;
-        }
-        s->idx = enc_dict_append(e, zs);
-        emit_tag_and_varint(body, KEY_STR, s->idx);
-        return;
-    }
-    if (e->dict_len >= HASH_MAP_THRESHOLD) {
-        zval *hit = zend_hash_find(&e->hash_map, zs);
-        if (hit) {
-            uint32_t idx = (uint32_t)Z_LVAL_P(hit);
-            enc_cache_alloc_slot(e, zs)->idx = idx;
-            emit_tag_and_varint(body, KEY_STR, idx);
-            return;
-        }
-    }
-    smart_str_appendc(body, KEY_STR_INLINE);
-    varint_write_u64(body, ZSTR_LEN(zs));
-    smart_str_appendl(body, ZSTR_VAL(zs), ZSTR_LEN(zs));
-    enc_cache_alloc_slot(e, zs)->idx = SLOT_INLINE_MARK;
+    enc_emit_str_tagged(body, e, zs, KEY_STR, KEY_STR_INLINE);
 }
 
 /* -------------------------------------------------------------------------
@@ -578,8 +572,12 @@ static void encode_value(smart_str *body, encode_ctx *e, zval *v) {
     }
     /* Cycle guard. References that point back into an ancestor would
      * recurse forever without this — we flatten Z_REFVAL_P, and a self-ref
-     * chases the same zval indefinitely. */
+     * chases the same zval indefinitely. Substitute TAG_NULL to keep the
+     * buffer well-formed for the remainder of the walk, but flag the
+     * truncation so the caller can reject the whole payload instead of
+     * silently shipping lossy bytes (which decode rejects anyway). */
     if (UNEXPECTED(e->depth >= MAX_DEPTH)) {
+        e->depth_exceeded = 1;
         smart_str_appendc(body, TAG_NULL);
         return;
     }
@@ -1844,9 +1842,15 @@ static int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n
  * ------------------------------------------------------------------------- */
 
 /* Reusable encode: produce a framed payload zend_string from a zval.
- * Caller owns the returned zend_string. Never returns NULL — worst case
- * is an empty TAG_NULL body. */
-static zend_string *phpser_encode_zval(zval *value) {
+ * Caller owns the returned zend_string. Returns NULL only when the input
+ * nests deeper than MAX_DEPTH — a lossy, undecodable payload would
+ * otherwise result. When throw_on_overflow is set, that case also throws
+ * an Exception so the userland entry points fail loud; the session handler
+ * passes false and degrades to a warning, because a thrown exception during
+ * request shutdown (the session auto-save path runs with no execution
+ * frame) surfaces as an uncaught fatal that the hook cannot intercept.
+ * Every other input yields a payload (worst case an empty TAG_NULL body). */
+static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
     encode_ctx ctx;
     enc_ctx_init(&ctx);
 
@@ -1867,6 +1871,20 @@ static zend_string *phpser_encode_zval(zval *value) {
     }
     smart_str_alloc(&body, body_estimate, 0);
     encode_value(&body, &ctx, value);
+
+    /* Reject over-deep input rather than ship a truncated payload. The
+     * decoder caps at the same MAX_DEPTH, so a payload that hit the encode
+     * cap would decode to NULL in full — silent total data loss. Fail
+     * loud here instead. */
+    if (UNEXPECTED(ctx.depth_exceeded)) {
+        smart_str_free(&body);
+        enc_ctx_destroy(&ctx);
+        if (throw_on_overflow) {
+            zend_throw_exception_ex(zend_ce_exception, 0,
+                "phpser: maximum nesting depth (%d) exceeded", MAX_DEPTH);
+        }
+        return NULL;
+    }
     size_t body_len = body.s ? ZSTR_LEN(body.s) : 0;
 
     /* Frame: [version][varint ndict][per-entry varint(len)+bytes][body].
@@ -1994,7 +2012,11 @@ PHP_FUNCTION(phpser_serialize) {
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_ZVAL(value)
     ZEND_PARSE_PARAMETERS_END();
-    RETVAL_STR(phpser_encode_zval(value));
+    zend_string *out = phpser_encode_zval(value, /* throw_on_overflow */ true);
+    if (UNEXPECTED(!out)) {
+        RETURN_THROWS();  /* depth-cap exception already pending */
+    }
+    RETVAL_STR(out);
 }
 
 /* -------------------------------------------------------------------------
@@ -2011,18 +2033,38 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
     if (Z_TYPE_P(session_vars) == IS_REFERENCE) {
         session_vars = Z_REFVAL_P(session_vars);
     }
-    return phpser_encode_zval(session_vars);
+    /* throw_on_overflow=false: the session auto-save runs at request
+     * shutdown with no execution frame, where a thrown exception surfaces as
+     * an uncaught fatal the hook can't intercept. So encode returns NULL
+     * without throwing on over-depth; we degrade to the E_WARNING that
+     * session.c itself uses for write failures. php_session_save_current_state
+     * writes ZSTR_EMPTY_ALLOC() on a NULL result (the empty write is
+     * unavoidable through the serializer-hook contract, and a >MAX_DEPTH
+     * $_SESSION can't round-trip regardless). */
+    zend_string *out = phpser_encode_zval(session_vars, /* throw_on_overflow */ false);
+    if (UNEXPECTED(!out)) {
+        php_error_docref(NULL, E_WARNING,
+            "phpser: $_SESSION not serialized — nesting depth exceeds %d", MAX_DEPTH);
+        return NULL;
+    }
+    return out;
 }
 
 PS_SERIALIZER_DECODE_FUNC(phpser) {
     zval decoded;
-    if (phpser_decode_buf(val, vallen, &decoded) < 0) {
+    if (vallen == 0) {
+        /* A brand-new session reads back as an empty string from storage.
+         * PHP's native serializers treat that as an empty session; feeding
+         * it to the decoder fails the version-byte check (FAILURE), which
+         * makes the engine emit "Failed to decode session object" and
+         * destroy the session on every first request. Start empty instead. */
+        array_init(&decoded);
+    } else if (phpser_decode_buf(val, vallen, &decoded) < 0) {
         return FAILURE;
-    }
-    /* Sessions expect an array on the way back; if the payload decoded to
-     * something else, swap in an empty array so PS(http_session_vars) stays
-     * sane for $_SESSION. */
-    if (Z_TYPE(decoded) != IS_ARRAY) {
+    } else if (Z_TYPE(decoded) != IS_ARRAY) {
+        /* Sessions expect an array on the way back; if the payload decoded
+         * to something else, swap in an empty array so PS(http_session_vars)
+         * stays sane for $_SESSION. */
         zval_ptr_dtor(&decoded);
         array_init(&decoded);
     }
@@ -2047,9 +2089,10 @@ PS_SERIALIZER_DECODE_FUNC(phpser) {
 /* Parse a phpser_unserialize options array. On success, *out_set may be
  * non-NULL and the caller must free it. Returns -1 on type error (an
  * exception is already thrown). param_idx is the arg position for the
- * error message (2 for unserialize, 3 for unserialize_signed). */
+ * error message (2 for unserialize, 3 for unserialize_signed); fname is
+ * the calling function's name for the TypeError text. */
 static int parse_unserialize_options(
-    HashTable *options_ht, int param_idx,
+    HashTable *options_ht, int param_idx, const char *fname,
     int *out_mode, HashTable **out_set)
 {
     *out_mode = ALLOWED_ALL;
@@ -2079,9 +2122,9 @@ static int parse_unserialize_options(
                 efree(*out_set);
                 *out_set = NULL;
                 zend_type_error(
-                    "phpser_unserialize(): allowed_classes option must "
+                    "%s(): allowed_classes option must "
                     "be an array of class names, %s given",
-                    zend_zval_value_name(cn));
+                    fname, zend_zval_value_name(cn));
                 return -1;
             }
             zend_string *lc = zend_string_tolower(Z_STR_P(cn));
@@ -2108,7 +2151,8 @@ PHP_FUNCTION(phpser_unserialize) {
 
     int allowed_mode;
     HashTable *allowed_set;
-    if (parse_unserialize_options(options_ht, 2, &allowed_mode, &allowed_set) < 0) {
+    if (parse_unserialize_options(options_ht, 2, "phpser_unserialize",
+                                  &allowed_mode, &allowed_set) < 0) {
         RETURN_THROWS();
     }
 
@@ -2129,7 +2173,10 @@ PHP_FUNCTION(phpser_serialize_signed) {
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    zend_string *frame = phpser_encode_zval(value);
+    zend_string *frame = phpser_encode_zval(value, /* throw_on_overflow */ true);
+    if (UNEXPECTED(!frame)) {
+        RETURN_THROWS();  /* depth-cap exception already pending */
+    }
     /* Reallocate to add tag space. zend_string_extend grows the underlying
      * allocation and bumps ZSTR_LEN. The 32 trailing bytes become the HMAC. */
     size_t frame_len = ZSTR_LEN(frame);
@@ -2188,7 +2235,8 @@ PHP_FUNCTION(phpser_unserialize_signed) {
 
     int allowed_mode;
     HashTable *allowed_set;
-    if (parse_unserialize_options(options_ht, 3, &allowed_mode, &allowed_set) < 0) {
+    if (parse_unserialize_options(options_ht, 3, "phpser_unserialize_signed",
+                                  &allowed_mode, &allowed_set) < 0) {
         RETURN_THROWS();
     }
 

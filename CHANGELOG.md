@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `phpser_serialize()` and `phpser_serialize_signed()` now throw an
+  exception when the value nests deeper than the recursion cap (512)
+  instead of silently emitting a truncated payload that
+  `phpser_unserialize()` could not decode (it returned `null`, losing all
+  data). The session serialize handler degrades to an `E_WARNING` and skips
+  the write rather than throwing during request shutdown.
+
+### Fixed
+
+- Session serialize handler: a brand-new (empty) session is no longer
+  rejected. The engine reads back an empty string for a fresh session and
+  phpser's decoder treated it as malformed, so every first request emitted
+  "Failed to decode session object" and destroyed the session. Empty input
+  now decodes as an empty session, matching PHP's native serializers.
+- The `allowed_classes` `TypeError` raised by
+  `phpser_unserialize_signed()` now names that function rather than
+  `phpser_unserialize()`.
+
 ## [0.1.0] - 2026-05-20
 
 ### Added

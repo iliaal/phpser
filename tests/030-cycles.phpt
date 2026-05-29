@@ -21,7 +21,7 @@ echo "self_obj survived: ", strlen($bytes) > 0 ? "yes" : "no", "\n";
 $rt = phpser_unserialize($bytes);
 echo "decoded type: ", gettype($rt), "\n";
 
-// Deep but non-cyclic — well under MAX_DEPTH=4096
+// Deep but non-cyclic — well under MAX_DEPTH=512
 $cur = ["leaf" => 42];
 for ($i = 0; $i < 100; $i++) {
     $cur = ["next" => $cur];

@@ -37,9 +37,11 @@ echo $ok ? "gh12265_wrapped OK\n" : "gh12265_wrapped FAIL\n";
 
 // --- gh15169: stack overflow on serializing a deep linked list.
 // PHP cap is zend.max_allowed_stack_size; our encoder has its own
-// MAX_DEPTH=4096. Build a chain longer than that and verify the encoder
-// terminates without crash (the output will be truncated at the depth
-// cap — we don't error, we just stop recursing). ---
+// MAX_DEPTH=512. Build a chain longer than that and verify the encoder
+// rejects it loudly (throws) rather than emitting a truncated payload.
+// The encode and decode caps are equal, so a truncated payload would be
+// undecodable (decode returns NULL in full) — silent total data loss.
+// Fail loud at encode instead. ---
 class Node { public ?Node $next = null; }
 $first = new Node();
 $node = $first;
@@ -47,8 +49,13 @@ for ($i = 0; $i < 5000; $i++) {  // exceeds MAX_DEPTH
     $node->next = new Node();
     $node = $node->next;
 }
-$ser = phpser_serialize($first);  // must not crash
-echo ($ser !== null && strlen($ser) > 0) ? "gh15169_no_crash OK\n" : "gh15169_no_crash FAIL\n";
+try {
+    phpser_serialize($first);  // must throw — not crash, not truncate
+    echo "gh15169_no_crash FAIL (no throw)\n";
+} catch (\Exception $e) {
+    echo str_contains($e->getMessage(), "maximum nesting depth")
+        ? "gh15169_no_crash OK\n" : "gh15169_no_crash FAIL: {$e->getMessage()}\n";
+}
 
 // And a chain just under the cap round-trips cleanly:
 $first = new Node();

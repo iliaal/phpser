@@ -89,9 +89,9 @@ for ($i = 0; $i < 100; $i++) {
 }
 echo "random_fuzz OK\n";
 
-// --- Deeply nested arrays — verify our MAX_DEPTH cap. The encoder caps
-// at depth 4096; decoder doesn't have an explicit cap but bombs on
-// invalid input naturally. Build a 200-deep array, round-trip OK. ---
+// --- Deeply nested arrays — verify our MAX_DEPTH cap. Both encoder and
+// decoder cap at depth 512 (encoder throws past it, decoder rejects to
+// NULL). Build a 200-deep array, well under the cap, round-trip OK. ---
 $deep = "x";
 for ($i = 0; $i < 200; $i++) $deep = [$deep];
 $rt = phpser_unserialize(phpser_serialize($deep));

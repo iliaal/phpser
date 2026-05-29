@@ -109,7 +109,7 @@ model.
 ## ✨ Features
 
 - **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder.
-- **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode, and assoc decode uses `zend_hash_update` so duplicate-key payloads collapse to last-write-wins rather than phantom buckets.
+- **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode (encode throws, decode returns `null`), and assoc decode uses `zend_hash_update` so duplicate-key payloads collapse to last-write-wins rather than phantom buckets.
 - **PHP 8.3+ (8.4, 8.5, master).** BSD 3-Clause.
 
 ## Bench (opt PHP 8.4.22-dev NTS release, 1000 iters, median of 9 runs)
@@ -243,9 +243,11 @@ as a `session.serialize_handler` when available.
 
 ## Limitations / known gaps
 
-- **Recursion depth is capped at 512** on both encode and decode. Anything
-  deeper than 512 nested containers / refs is rejected to bound stack
-  consumption against adversarial wire payloads. Object cycles are
+- **Recursion depth is capped at 512** on both encode and decode. On decode,
+  anything deeper than 512 nested containers / refs is rejected (returns
+  `null`) to bound stack consumption against adversarial wire payloads. On
+  encode, input deeper than 512 throws an `Exception` rather than silently
+  shipping a truncated payload. Object cycles are
   preserved correctly via the id-table machinery and don't count against
   this cap for shared-graph cases; the cap only fires on genuinely deep
   trees. Cache workloads typically nest 5-10 deep, so the cap is many
