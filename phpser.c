@@ -562,6 +562,21 @@ static void encode_value(smart_str *body, encode_ctx *e, zval *v);
 static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v);
 static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht);
 
+/* Live-property predicate shared by the plain-object count and emit passes.
+ * get_properties surfaces declared props as IS_INDIRECT (deref to the real
+ * slot) and leaves uninitialized typed props / tombstones as IS_UNDEF; both
+ * keyless and IS_UNDEF buckets are skipped. Returns the zval to encode, or
+ * NULL to skip this bucket. Keeping the skip rules in one place means the
+ * count pass and the emit pass can never drift out of agreement on nprops —
+ * which would corrupt the wire format. */
+static zend_always_inline zval *enc_obj_prop_val(Bucket *b) {
+    if (!b->key) return NULL;
+    zval *v = &b->val;
+    if (Z_TYPE_P(v) == IS_INDIRECT) v = Z_INDIRECT_P(v);
+    if (Z_TYPE_P(v) == IS_UNDEF) return NULL;
+    return v;
+}
+
 static void encode_value(smart_str *body, encode_ctx *e, zval *v) {
     /* Declared properties surface as IS_INDIRECT in get_properties() HTs —
      * the bucket holds a pointer to the real slot in properties_table[].
@@ -798,23 +813,17 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 return;
             }
             HashTable *props = obj->handlers->get_properties(obj);
-            /* Count live entries — get_properties can include $this-style
-             * entries we want to skip and tombstones (IS_UNDEF). Declared
-             * props surface as IS_INDIRECT; we must deref to detect the
-             * uninitialized-typed-property case (slot is IS_UNDEF but the
-             * bucket val is IS_INDIRECT, not IS_UNDEF directly). Without
-             * the deref, encoder emits TAG_NULL and the decoder's typed-
-             * prop check rejects it as "cannot assign null to int". */
+            /* Two passes: count live entries for nprops, then emit. The
+             * wire format needs an accurate count before the bucket values,
+             * and enc_obj_prop_val keeps the skip rules identical across
+             * both passes (see its comment for the IS_INDIRECT / IS_UNDEF
+             * handling). */
             uint32_t nprops = 0;
             if (props) {
                 Bucket *b = props->arData;
                 Bucket *end = b + props->nNumUsed;
                 for (; b < end; b++) {
-                    if (!b->key) continue;
-                    zval *v = &b->val;
-                    if (Z_TYPE_P(v) == IS_INDIRECT) v = Z_INDIRECT_P(v);
-                    if (Z_TYPE_P(v) == IS_UNDEF) continue;
-                    nprops++;
+                    if (enc_obj_prop_val(b)) nprops++;
                 }
             }
             smart_str_appendc(body, TAG_OBJECT);
@@ -824,10 +833,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 Bucket *b = props->arData;
                 Bucket *end = b + props->nNumUsed;
                 for (; b < end; b++) {
-                    if (!b->key) continue;
-                    zval *v = &b->val;
-                    if (Z_TYPE_P(v) == IS_INDIRECT) v = Z_INDIRECT_P(v);
-                    if (Z_TYPE_P(v) == IS_UNDEF) continue;
+                    zval *v = enc_obj_prop_val(b);
+                    if (!v) continue;
                     varint_write_u64(body, enc_intern_zstr(e, b->key));
                     encode_value(body, e, v);
                 }
