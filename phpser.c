@@ -1099,11 +1099,18 @@ static int dec_defer_wakeup(decode_ctx *d, zend_object *obj) {
 /* Resolve a class entry from a dict-indexed class name with memoization
  * keyed by class_idx. Sentinel (zend_class_entry *)-1 marks "tried,
  * not found" so we don't re-call zend_lookup_class_ex for missing
- * classes either. Caller still gets NULL for unknown classes. */
+ * classes either. Caller still gets NULL for unknown classes.
+ *
+ * class_idx < d->dict_len is a precondition: the ce_cache is sized to
+ * dict_len, so an out-of-range index would be an OOB read/write here.
+ * Every caller resolves the class name via dec_get_zstr (which bounds the
+ * index) before calling in, so this holds; the assert catches any future
+ * caller that forgets. */
 #define DEC_CE_MISSING ((zend_class_entry *)(uintptr_t)-1)
 static inline zend_class_entry *dec_class_resolve(
     decode_ctx *d, uint64_t class_idx, zend_string *class_name)
 {
+    ZEND_ASSERT(class_idx < d->dict_len);
     if (UNEXPECTED(!d->ce_cache)) {
         d->ce_cache = ecalloc(d->dict_len, sizeof(zend_class_entry *));
     }
