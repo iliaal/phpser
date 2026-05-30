@@ -2344,4 +2344,11 @@ zend_module_entry phpser_module_entry = {
  * On NTS builds both macros expand to nothing. */
 ZEND_TSRMLS_CACHE_DEFINE()
 
+/* get_module() is the dynamic-loader entry point; emit it only for a shared
+ * build. A hypothetical static link into the PHP binary would otherwise get
+ * a duplicate/clashing symbol. The OR mirrors the MINIT TSRMLS guard so the
+ * hand-rolled dev Makefile (which defines ZEND_COMPILE_DL_EXT rather than
+ * COMPILE_DL_PHPSER) still produces a loadable .so for `make test`. */
+#if defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)
 ZEND_GET_MODULE(phpser)
+#endif
