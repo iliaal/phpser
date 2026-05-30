@@ -60,7 +60,7 @@ In scope:
   without the correct key.
 - `allowed_classes` bypass: a class outside the allowlist being
   instantiated as itself rather than `__PHP_Incomplete_Class`.
-- Recursion-depth or quadratic-blowup attacks that bypass the 4096
+- Recursion-depth or quadratic-blowup attacks that bypass the 512
   nesting cap or otherwise cause unbounded CPU/memory use from a
   bounded-size input.
 - Reference / cycle handling that produces dangling pointers or wrong
