@@ -1023,6 +1023,13 @@ typedef struct {
      * 1000 times. Sentinel (zend_class_entry *)-1 marks "looked up but
      * not found" so we don't repeatedly retry missing classes. */
     zend_class_entry **ce_cache;
+    /* Allow-decision cache for ALLOWED_SET mode: (class_idx → 0 unknown /
+     * 1 allowed / 2 denied). Sized to dict_len, lazy-allocated on first
+     * filtered object decode. dec_class_allowed otherwise re-lowercases the
+     * class name and hits allowed_set once per object — on a same-class DTO
+     * batch that is one tolower allocation per element for a single repeated
+     * name. Unused in ALLOWED_ALL / ALLOWED_NONE, which short-circuit. */
+    uint8_t *allow_cache;
     /* C-stack recursion guard: TAG_NEW_REF / TAG_PACKED_MIXED / TAG_ASSOC /
      * TAG_OBJECT / TAG_OBJECT_MAGIC all recurse through decode_value.
      * Without a cap, attacker-controlled wire format can blow the pthread
@@ -1123,17 +1130,27 @@ static inline zend_class_entry *dec_class_resolve(
     return ce;
 }
 
-/* Returns 1 if `class_name` is allowed by the current decode_ctx filter.
- * The set is pre-lowercased on caller side. */
-static inline int dec_class_allowed(decode_ctx *d, zend_string *class_name) {
+/* Returns 1 if `class_name` (dict slot class_idx) is allowed by the current
+ * decode_ctx filter. The set is pre-lowercased on caller side; the decision
+ * is memoized per class_idx so a repeated class name in a DTO batch pays the
+ * tolower + lookup once. class_idx < dict_len is a precondition (every caller
+ * resolves class_name via dec_get_zstr first). */
+static inline int dec_class_allowed(decode_ctx *d, uint64_t class_idx,
+                                    zend_string *class_name) {
     if (EXPECTED(d->allowed_mode == ALLOWED_ALL)) return 1;
     if (d->allowed_mode == ALLOWED_NONE) return 0;
     /* ALLOWED_SET: case-insensitive lookup. PHP class names are stored
      * lowercased in the engine class table, and user-supplied names in
      * allowed_classes get pre-lowercased into d->allowed_set. */
+    if (UNEXPECTED(!d->allow_cache)) {
+        d->allow_cache = ecalloc(d->dict_len, sizeof(uint8_t));
+    }
+    uint8_t cached = d->allow_cache[class_idx];
+    if (EXPECTED(cached != 0)) return cached == 1;
     zend_string *lc = zend_string_tolower(class_name);
     int ok = zend_hash_exists(d->allowed_set, lc);
     zend_string_release(lc);
+    d->allow_cache[class_idx] = ok ? 1 : 2;
     return ok;
 }
 
@@ -1285,6 +1302,7 @@ static void decode_destroy(decode_ctx *d) {
         efree(d->wakeup);
     }
     if (d->ce_cache) efree(d->ce_cache);
+    if (d->allow_cache) efree(d->allow_cache);
 }
 
 /* Read an Assoc/Object key (one byte tag + payload). Stores result in out_key,
@@ -1554,7 +1572,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * incomplete-class instance and skip the legacy serializer
              * payload. ce->unserialize would otherwise instantiate the real
              * class, which the option exists to prevent. */
-            if (!dec_class_allowed(d, class_name)) {
+            if (!dec_class_allowed(d, class_idx, class_name)) {
                 d->pos += blen;
                 if (dec_make_incomplete(out, class_name) < 0) return -1;
                 dec_register(d, out);
@@ -1595,7 +1613,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * matches PHP's behavior of preserving serialized state on
              * __PHP_Incomplete_Class). We must consume the data tree
              * from the stream either way to keep id counts aligned. */
-            int allowed = dec_class_allowed(d, class_name);
+            int allowed = dec_class_allowed(d, class_idx, class_name);
             zend_class_entry *ce = allowed
                 ? dec_class_resolve(d, class_idx, class_name) : NULL;
             if (!ce) ce = allowed ? zend_standard_class_def : PHP_IC_ENTRY;
@@ -1648,7 +1666,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             if (!cname || !casename) return -1;
             /* allowed_classes also gates enum cases. PHP's serialize emits
              * enums as "E:..." and the filter applies the same as for O:. */
-            if (!dec_class_allowed(d, cname)) {
+            if (!dec_class_allowed(d, class_idx, cname)) {
                 if (dec_make_incomplete(out, cname) < 0) return -1;
                 dec_register(d, out);
                 return 0;
@@ -1674,7 +1692,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * __PHP_Incomplete_Class with the original name attached as
              * the magic property. Properties below still land via the
              * normal IS_INDIRECT / dynamic-prop write path. */
-            int allowed = dec_class_allowed(d, class_name);
+            int allowed = dec_class_allowed(d, class_idx, class_name);
             zend_class_entry *ce = allowed
                 ? dec_class_resolve(d, class_idx, class_name) : PHP_IC_ENTRY;
             /* Resolve the class. If autoloading fails or the class doesn't
