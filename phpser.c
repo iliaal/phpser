@@ -853,24 +853,30 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
 static uint8_t detect_packed_run(encode_ctx *e, HashTable *ht, uint32_t n_used) {
     if (n_used == 0) return TAG_PACKED_MIXED;
     zval *zp = ht->arPacked;
-    uint8_t first = Z_TYPE(zp[0]);
-    if (first != IS_LONG && first != IS_DOUBLE && first != IS_STRING) {
-        return TAG_PACKED_MIXED;
-    }
-    for (uint32_t i = 1; i < n_used; i++) {
-        if (Z_TYPE(zp[i]) != first) return TAG_PACKED_MIXED;
-    }
-    switch (first) {
-        case IS_LONG:   return TAG_PACKED_LONGS;
-        case IS_DOUBLE: return TAG_PACKED_DOUBLES;
-        case IS_STRING: {
+    /* One pass per candidate type. The string case folds the homogeneity
+     * check and the dict-membership check into a single walk — previously a
+     * type-homogeneity pass followed by a separate dict pass — so a
+     * PACKED_STRINGS-eligible array is scanned once here instead of twice. */
+    switch (Z_TYPE(zp[0])) {
+        case IS_LONG:
+            for (uint32_t i = 1; i < n_used; i++) {
+                if (Z_TYPE(zp[i]) != IS_LONG) return TAG_PACKED_MIXED;
+            }
+            return TAG_PACKED_LONGS;
+        case IS_DOUBLE:
+            for (uint32_t i = 1; i < n_used; i++) {
+                if (Z_TYPE(zp[i]) != IS_DOUBLE) return TAG_PACKED_MIXED;
+            }
+            return TAG_PACKED_DOUBLES;
+        case IS_STRING:
             for (uint32_t i = 0; i < n_used; i++) {
+                if (Z_TYPE(zp[i]) != IS_STRING) return TAG_PACKED_MIXED;
                 intern_slot *s = enc_cache_find(e, Z_STR(zp[i]));
                 if (!s || !SLOT_IS_DICT(*s)) return TAG_PACKED_MIXED;
             }
             return TAG_PACKED_STRINGS;
-        }
-        default:        return TAG_PACKED_MIXED; /* unreachable */
+        default:
+            return TAG_PACKED_MIXED;
     }
 }
 
