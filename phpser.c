@@ -1777,7 +1777,6 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
 /* Cached at MINIT. ext/hash is mandatory since PHP 7.4 and lookup never
  * fails for a builtin algo; we still null-check defensively. */
 static const php_hash_ops *phpser_sha256_ops = NULL;
-static zend_string *phpser_sha256_name = NULL;
 
 /* HMAC-SHA256 of `data` under `key`. Writes a 32-byte tag to `out`.
  * Returns 0 on success, -1 if SHA256 ops aren't available. */
@@ -2277,18 +2276,16 @@ static PHP_MINIT_FUNCTION(phpser) {
 #endif
     /* Cache SHA256 ops for HMAC signing. ext/hash is mandatory since PHP
      * 7.4 so this never fails in normal builds; we still null-check at
-     * call time. The algo-name zend_string is interned/persistent for the
-     * module lifetime — `1` = persistent flag. */
-    phpser_sha256_name = zend_string_init("sha256", sizeof("sha256") - 1, 1);
-    phpser_sha256_ops = php_hash_fetch_ops(phpser_sha256_name);
+     * call time. php_hash_fetch_ops only reads the algo name for the table
+     * lookup — it doesn't retain the pointer — so the lookup zend_string is
+     * a transient stack-local released immediately, not a module global. */
+    zend_string *algo = zend_string_init("sha256", sizeof("sha256") - 1, 0);
+    phpser_sha256_ops = php_hash_fetch_ops(algo);
+    zend_string_release(algo);
     return SUCCESS;
 }
 
 static PHP_MSHUTDOWN_FUNCTION(phpser) {
-    if (phpser_sha256_name) {
-        zend_string_release(phpser_sha256_name);
-        phpser_sha256_name = NULL;
-    }
     phpser_sha256_ops = NULL;
     return SUCCESS;
 }
