@@ -69,8 +69,38 @@ foreach ($valid_payloads as $bytes) {
     }
 }
 echo "fuzz OK\n";
+
+// 4. Crafted object/enum tags that name an *allowed* but uninstantiable or
+//    not-serializable class, or an invalid enum case. Each must decode to
+//    NULL without crashing and without leaking a pending exception.
+//    - TAG_ENUM (0x0d): class_idx, case_idx (dict indices).
+//    - TAG_OBJECT (0x0a): class_idx, nprops=0.
+enum Suit: string { case Hearts = "H"; const FOO = 1; }
+abstract class AbstractFoo {}
+interface IFoo {}
+
+$crafted = [
+    // enum tag whose case-name slot is not a case at all
+    "enum_missing_case"    => "\x01\x02\x04Suit\x08NotACase\x0d\x00\x01",
+    // enum tag whose case-name slot is a real class constant but not a case
+    "enum_noncase_const"   => "\x01\x02\x04Suit\x03FOO\x0d\x00\x01",
+    // object tag naming a NOT_SERIALIZABLE class (corrupt-instance crash)
+    "object_closure"       => "\x01\x01\x07Closure\x0a\x00\x00",
+    // object tag naming an abstract class (object_init_ex would throw)
+    "object_abstract"      => "\x01\x01\x0bAbstractFoo\x0a\x00\x00",
+    // object tag naming an interface
+    "object_interface"     => "\x01\x01\x04IFoo\x0a\x00\x00",
+];
+foreach ($crafted as $name => $bytes) {
+    $rt = phpser_unserialize($bytes);
+    if ($rt !== null) echo "$name expected NULL, got " . gettype($rt) . "\n";
+    // Touch the result to surface a corrupt object that crashes on access.
+    if (is_object($rt)) { try { var_export($rt); } catch (\Throwable $e) {} }
+}
+echo "crafted OK\n";
 ?>
 --EXPECT--
 static OK
 truncate OK
 fuzz OK
+crafted OK

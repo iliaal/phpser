@@ -44,6 +44,15 @@
 #include <stdint.h>
 #include <string.h>
 
+/* ZEND_ACC_UNINSTANTIABLE is the named alias (PHP 8.4+) for the set of class
+ * flags object_init_ex refuses to instantiate. On 8.3 the alias is absent;
+ * spell out the same composite so the instantiation guards below compile. */
+#ifndef ZEND_ACC_UNINSTANTIABLE
+# define ZEND_ACC_UNINSTANTIABLE \
+    (ZEND_ACC_INTERFACE | ZEND_ACC_TRAIT | ZEND_ACC_IMPLICIT_ABSTRACT_CLASS | \
+     ZEND_ACC_EXPLICIT_ABSTRACT_CLASS | ZEND_ACC_ENUM)
+#endif
+
 /* Wire format version. Bump on any incompatible change. */
 #define PHPSER_VERSION 0x01
 
@@ -1618,6 +1627,12 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 ? dec_class_resolve(d, class_idx, class_name) : NULL;
             if (!ce) ce = allowed ? zend_standard_class_def : PHP_IC_ENTRY;
 
+            /* See TAG_OBJECT: reject NOT_SERIALIZABLE / UNINSTANTIABLE before
+             * object_init_ex to avoid corrupt instances and leaked exceptions. */
+            if (ce->ce_flags & (ZEND_ACC_NOT_SERIALIZABLE | ZEND_ACC_UNINSTANTIABLE)) {
+                return -1;
+            }
+
             if (object_init_ex(out, ce) != SUCCESS) {
                 ZVAL_NULL(out);
                 return -1;
@@ -1654,6 +1669,15 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                  * dropped. */
                 dec_apply_data_as_props(Z_OBJ_P(out), Z_ARRVAL(data));
                 zval_ptr_dtor(&data);
+                /* Native then calls __wakeup() if the (instantiable, allowed)
+                 * class defines it: a __serialize()+__wakeup() class without
+                 * __unserialize() falls through the no-__unserialize branch
+                 * above and must still fire __wakeup(). Gated on `allowed` so
+                 * incomplete classes (PHP_IC_ENTRY) never run a hook. */
+                if (allowed && zend_hash_find_known_hash(&ce->function_table,
+                        ZSTR_KNOWN(ZEND_STR_WAKEUP)) != NULL) {
+                    dec_defer_wakeup(d, Z_OBJ_P(out));
+                }
             }
             return 0;
         }
@@ -1673,6 +1697,14 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             }
             zend_class_entry *ce = dec_class_resolve(d, class_idx, cname);
             if (!ce || !(ce->ce_flags & ZEND_ACC_ENUM)) return -1;
+            /* zend_enum_get_case() ZEND_ASSERTs the name is a valid case and
+             * then dereferences the constant unconditionally — in an NDEBUG
+             * build a crafted case name that is missing (NULL) or a non-case
+             * class constant NULL-derefs or type-confuses. Validate against
+             * the constants table first; the (!obj) guard below is otherwise
+             * dead because the function never returns NULL. */
+            zend_class_constant *cc = zend_hash_find_ptr(CE_CONSTANTS_TABLE(ce), casename);
+            if (!cc || !(ZEND_CLASS_CONST_FLAGS(cc) & ZEND_CLASS_CONST_IS_CASE)) return -1;
             zend_object *obj = zend_enum_get_case(ce, casename);
             if (!obj) return -1;
             ZVAL_OBJ_COPY(out, obj);
@@ -1700,6 +1732,18 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * of payloads written before a class was registered. */
             if (!ce) ce = zend_standard_class_def;
 
+            /* Reject classes object_init_ex can't safely instantiate before
+             * calling it. NOT_SERIALIZABLE (Closure/Generator/Fiber) has a
+             * create_object handler so object_init_ex succeeds but hands back
+             * a corrupt instance that crashes on first access; native
+             * unserialize blocks it outright. UNINSTANTIABLE (interface/trait/
+             * enum/abstract) makes object_init_ex *throw*, which would leak a
+             * pending exception past the decoder's return-NULL contract and
+             * has no catch frame on the session-decode path. */
+            if (ce->ce_flags & (ZEND_ACC_NOT_SERIALIZABLE | ZEND_ACC_UNINSTANTIABLE)) {
+                return -1;
+            }
+
             if (object_init_ex(out, ce) != SUCCESS) {
                 ZVAL_NULL(out);
                 return -1;
@@ -1710,6 +1754,39 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * property value (cycles, shared subobjects) can resolve to this
              * in-progress object. */
             dec_register(d, out);
+
+            /* __unserialize() precedence. Native unserialize() decides the
+             * rebuild path from the *current* class definition, not the wire
+             * form: if the class defines __unserialize(), the decoded
+             * key/value pairs are handed to it as an array and __wakeup() is
+             * never called. A class with __unserialize() but no __serialize()
+             * (and no __sleep) is encoded here as a plain property object, so
+             * without this branch its invariants would be rebuilt by raw
+             * property writes instead of the magic method — a compliance gap
+             * and an allowlisted-payload risk (crafted property objects could
+             * skip invariant rebuilding). Mirror native: build the array,
+             * defer __unserialize, and do not queue __wakeup. */
+            if (allowed && ce->__unserialize != NULL) {
+                zval data;
+                array_init_size(&data, (uint32_t)nprops);
+                zend_hash_real_init_mixed(Z_ARRVAL(data));
+                for (uint64_t i = 0; i < nprops; i++) {
+                    uint64_t key_idx;
+                    if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx) < 0) goto unser_fail;
+                    zend_string *key = dec_get_zstr(d, key_idx);
+                    if (!key) goto unser_fail;
+                    zval tmp;
+                    if (decode_value(d, &tmp) < 0) goto unser_fail;
+                    zend_hash_update(Z_ARRVAL(data), key, &tmp);
+                    continue;
+                unser_fail:
+                    zval_ptr_dtor(&data);
+                    zval_ptr_dtor(out); ZVAL_NULL(out);
+                    return -1;
+                }
+                dec_defer_unserialize(d, obj, &data);
+                return 0;
+            }
 
             /* Mirror PHP's var_unserializer property installation. The
              * standard library bypasses write_property (which rejects
