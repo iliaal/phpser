@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-06-01
+
 ### Changed
 
 - `phpser_serialize()` and `phpser_serialize_signed()` now throw an
@@ -26,6 +28,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `allowed_classes` `TypeError` raised by
   `phpser_unserialize_signed()` now names that function rather than
   `phpser_unserialize()`.
+- `__unserialize()` and `__wakeup()` are now selected from the class
+  definition rather than the on-wire object form, matching native
+  `unserialize()`. A class that defines `__unserialize()` but not
+  `__serialize()` is now rebuilt through `__unserialize()` instead of by
+  raw property writes, and a class with `__serialize()` plus `__wakeup()`
+  but no `__unserialize()` now has `__wakeup()` called.
+
+### Security
+
+- Decoding a crafted payload that named a missing enum case, or a class
+  constant that is not a case, no longer crashes. The case was validated
+  through `zend_enum_get_case()`, whose internal assertion compiles out in
+  release builds, so a missing case dereferenced a null pointer and a
+  non-case constant was misread as an object pointer. Both are now
+  rejected to `null` before any object is built.
+- Decoding a crafted object payload that names a non-serializable class
+  (`Closure`, `Generator`, `Fiber`) no longer yields a corrupt instance
+  that crashes on first access, and naming an interface, trait, or
+  abstract class no longer leaves a thrown exception pending past the
+  decoder's null-return contract. Both are rejected to `null`, matching
+  the classes PHP's native `unserialize()` refuses. Selecting the rebuild
+  path from the class (above) also stops a crafted plain-object tag from
+  skipping a class's `__unserialize()`/`__wakeup()` invariant rebuild.
 
 ## [0.1.0] - 2026-05-20
 
@@ -48,5 +73,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.1.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.1.1...HEAD
+[0.1.1]: https://github.com/iliaal/phpser/releases/tag/0.1.1
 [0.1.0]: https://github.com/iliaal/phpser/releases/tag/0.1.0
