@@ -206,7 +206,7 @@ static inline double le64_read(const uint8_t *src) {
 
 /* -------------------------------------------------------------------------
  * Encode state. Two-tier intern:
- *   - inline_cache: 16-slot ring of (zend_string*, dict_idx). Linear-scan
+ *   - inline_cache: ring of (zend_string*, dict_idx). Linear-scan
  *     pointer-equality probe; near-zero cost on hits when PHP literals
  *     share interned zend_string allocations across rows.
  *   - hash_map: HashTable keyed by zend_string content. Consulted on
@@ -214,18 +214,33 @@ static inline double le64_read(const uint8_t *src) {
  *     both "same content, different allocation" (runtime-built strings
  *     equaling a literal) AND "cache slot evicted, dict entry still
  *     present" — the dominant case on rowset workloads, where row_X
- *     allocations push prop-key slots out of the 16-slot cache after
- *     ~16 rows.
+ *     allocations push prop-key slots out of the cache.
  *   - dict: index→zend_string* array we emit at the head.
  * ------------------------------------------------------------------------- */
 
-#define INTERN_CACHE_SIZE 16
+/* Ring size. A repeated string VALUE only graduates to a dict ref if its
+ * first two encounters straddle fewer than this many distinct strings — the
+ * graduation signal lives in the (FIFO-evicted) ring, and the content hash_map
+ * only carries strings already in the dict. The persistent prop-name +
+ * class-name slots for a payload's object shapes stay resident (eviction skips
+ * DICT slots), so the cap must clear (distinct names/keys in a locality window)
+ * + (value-graduation distance). 16 was too tight for mixed/nested object
+ * payloads: dto_mixed interleaves two classes whose 15 prop names + 2 class
+ * names + 2 array keys = 19 always-dict strings alone saturate a 16-slot ring,
+ * so repeated values (timestamps, currency, status enums) never graduated and
+ * re-emitted inline on every row — +33% size, +25% encode vs igbinary. 32
+ * clears that working set with headroom; the wider linear scan costs nothing
+ * measurable (512 B, ~8 cache lines, pointer compares) and rowset/dto encode
+ * held or improved. Workloads with >32 distinct interned strings between two
+ * occurrences re-hit the inline-duplication path — revisit the cap if a real
+ * shape needs it. */
+#define INTERN_CACHE_SIZE 32
 
 /* Threshold under which we skip the hash_map check on miss and just emit
  * the string inline (potentially duplicating bytes for a key already in
- * the dict). The 16-slot intern cache is FIFO-evicted, so on rowset-shape
+ * the dict). The intern cache is FIFO-evicted, so on rowset-shape
  * payloads with many unique string values (e.g. 1000 row_X) the prop-key
- * cache slots get evicted after ~16 inserts. Without hash_map fallback,
+ * cache slots get evicted once unique values overflow the ring. Without hash_map fallback,
  * the next encounter of the prop key would re-emit it inline, bloating
  * the wire format.
  *
