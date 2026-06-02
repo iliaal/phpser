@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-06-02
+
 ### Security
 
 - `phpser_serialize_signed()` and `phpser_unserialize_signed()` now reject an
@@ -108,6 +110,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.1.1...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.1.2...HEAD
+[0.1.2]: https://github.com/iliaal/phpser/releases/tag/0.1.2
 [0.1.1]: https://github.com/iliaal/phpser/releases/tag/0.1.1
 [0.1.0]: https://github.com/iliaal/phpser/releases/tag/0.1.0

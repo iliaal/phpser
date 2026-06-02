@@ -79,12 +79,12 @@ HMAC-SHA256 frame; tampered or foreign-keyed input is rejected before
 any decoding work runs:
 
 ```php
-$key = random_bytes(32);  // store this key in your app config
+$key = random_bytes(32);  // store this key in your app config; an empty key is rejected
 
 $payload = phpser_serialize_signed($cacheValue, $key);
 // ... later, possibly across a process boundary ...
 $value = phpser_unserialize_signed($payload, $key);
-// returns NULL if the payload was tampered or signed with a different key
+// throws an Exception if the payload was tampered or signed with a different key
 ```
 
 `allowed_classes` option on both unserialize entry points. Same shape as
@@ -108,7 +108,7 @@ model.
 
 ## ✨ Features
 
-- **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder.
+- **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder. An empty key is rejected on both sides — a keyless HMAC is forgeable, so callers must supply real key material.
 - **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode (encode throws, decode returns `null`), and assoc decode uses `zend_hash_update` so duplicate-key payloads collapse to last-write-wins rather than phantom buckets.
 - **PHP 8.3+ (8.4, 8.5, master).** BSD 3-Clause.
 
