@@ -880,7 +880,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
              * lazy-object check is essential — a lazy ghost/proxy has
              * uninitialized slots until get_properties() triggers its
              * initializer, so reading OBJ_PROP directly would serialize
-             * uninitialized values (see tests/069-lazy-objects.phpt). */
+             * uninitialized values (see tests/082-lazy-objects.phpt). */
             zend_class_entry *ce = obj->ce;
             if (obj->properties == NULL
                 && obj->handlers->get_properties == zend_std_get_properties
