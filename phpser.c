@@ -1111,6 +1111,14 @@ typedef struct {
      * stack at ~100K nested frames. Bracket decode_value with ++/-- and
      * reject when >= MAX_DEPTH. */
     uint32_t depth;
+    /* Set only for HMAC-authenticated payloads (phpser_unserialize_signed):
+     * the bytes provably came from our own encoder, which walks PHP
+     * HashTables and so never emits a duplicate assoc key. That lets the
+     * assoc decode loop use zend_hash_*_add_new (skips the per-key dup-find)
+     * instead of _update. The unsigned path leaves this 0 and keeps _update,
+     * which collapses crafted duplicate keys to last-write-wins and preserves
+     * the CR-001 back-ref safety (see tests/077). */
+    uint8_t trusted;
 } decode_ctx;
 
 enum { ALLOWED_ALL = 0, ALLOWED_NONE, ALLOWED_SET };
@@ -1908,27 +1916,50 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                     if (k.kind == KV_OWNED_STR) zend_string_release(k.owned_str);
                     goto assoc_fail;
                 }
-                /* Use update semantics so a crafted payload with duplicate
-                 * keys collapses to the last value (matches PHP's native
-                 * unserialize behavior) rather than producing a corrupt
-                 * HT where count() and $arr[key] disagree. The encoder
-                 * doesn't emit duplicates from trusted sources — but the
-                 * decoder is the security boundary. */
-                switch (k.kind) {
-                    case KV_LONG:
-                        zend_hash_index_update(arr, (zend_ulong)k.lval, &tmp);
-                        break;
-                    case KV_DICT_STR: {
-                        zend_string *zs = dec_get_zstr(d, k.dict_idx);
-                        if (!zs) { zval_ptr_dtor(&tmp); goto assoc_fail; }
-                        zend_hash_update(arr, zs, &tmp);
-                        break;
+                /* Untrusted (default): update semantics so a crafted payload
+                 * with duplicate keys collapses to the last value (matches
+                 * native unserialize) rather than a corrupt HT where count()
+                 * and $arr[key] disagree — and so a dup that overwrites an
+                 * id-table-registered object frees it safely (see CR-001 /
+                 * tests/077). The decoder is the security boundary.
+                 *
+                 * Trusted (HMAC-authenticated, d->trusted): the bytes came
+                 * from our encoder, which walks unique-keyed HashTables, so
+                 * no duplicate keys exist. add_new skips the per-key dup-find
+                 * — the assoc-decode win — and cannot hit the dup path. */
+                if (d->trusted) {
+                    switch (k.kind) {
+                        case KV_LONG:
+                            zend_hash_index_add_new(arr, (zend_ulong)k.lval, &tmp);
+                            break;
+                        case KV_DICT_STR: {
+                            zend_string *zs = dec_get_zstr(d, k.dict_idx);
+                            if (!zs) { zval_ptr_dtor(&tmp); goto assoc_fail; }
+                            zend_hash_add_new(arr, zs, &tmp);
+                            break;
+                        }
+                        case KV_OWNED_STR:
+                            zend_hash_add_new(arr, k.owned_str, &tmp);
+                            zend_string_release(k.owned_str);
+                            break;
                     }
-                    case KV_OWNED_STR:
-                        zend_hash_update(arr, k.owned_str, &tmp);
-                        /* hash addref'd it for the bucket; drop our ref. */
-                        zend_string_release(k.owned_str);
-                        break;
+                } else {
+                    switch (k.kind) {
+                        case KV_LONG:
+                            zend_hash_index_update(arr, (zend_ulong)k.lval, &tmp);
+                            break;
+                        case KV_DICT_STR: {
+                            zend_string *zs = dec_get_zstr(d, k.dict_idx);
+                            if (!zs) { zval_ptr_dtor(&tmp); goto assoc_fail; }
+                            zend_hash_update(arr, zs, &tmp);
+                            break;
+                        }
+                        case KV_OWNED_STR:
+                            zend_hash_update(arr, k.owned_str, &tmp);
+                            /* hash addref'd it for the bucket; drop our ref. */
+                            zend_string_release(k.owned_str);
+                            break;
+                    }
                 }
                 continue;
             assoc_fail:
@@ -2106,13 +2137,14 @@ static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
  * rest land in __PHP_Incomplete_Class. NULL/ALLOWED_ALL means no filter. */
 static int phpser_decode_buf_opts(
     const char *str, size_t str_len, zval *out,
-    int allowed_mode, HashTable *allowed_set)
+    int allowed_mode, HashTable *allowed_set, uint8_t trusted)
 {
     decode_ctx d = {0};
     d.buf = (const uint8_t *)str;
     d.len = str_len;
     d.allowed_mode = allowed_mode;
     d.allowed_set = allowed_set;
+    d.trusted = trusted;
 
     if (decode_header(&d) < 0) {
         decode_destroy(&d);
@@ -2183,7 +2215,7 @@ done:
 #ifdef HAVE_PHP_SESSION
 /* Back-compat wrapper for the session handler, which doesn't take options. */
 static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
-    return phpser_decode_buf_opts(str, str_len, out, ALLOWED_ALL, NULL);
+    return phpser_decode_buf_opts(str, str_len, out, ALLOWED_ALL, NULL, /* trusted */ 0);
 }
 #endif
 
@@ -2336,7 +2368,7 @@ PHP_FUNCTION(phpser_unserialize) {
         RETURN_THROWS();
     }
 
-    phpser_decode_buf_opts(str, str_len, return_value, allowed_mode, allowed_set);
+    phpser_decode_buf_opts(str, str_len, return_value, allowed_mode, allowed_set, /* trusted */ 0);
 
     if (allowed_set) {
         zend_hash_destroy(allowed_set);
@@ -2420,7 +2452,11 @@ PHP_FUNCTION(phpser_unserialize_signed) {
         RETURN_THROWS();
     }
 
-    phpser_decode_buf_opts(payload, frame_len, return_value, allowed_mode, allowed_set);
+    /* trusted=1: the HMAC verified above proves these bytes were produced by
+     * our encoder, which serializes unique-keyed PHP HashTables — no duplicate
+     * assoc keys — so the assoc decode loop can use add_new and skip the
+     * per-key dup-find. */
+    phpser_decode_buf_opts(payload, frame_len, return_value, allowed_mode, allowed_set, /* trusted */ 1);
 
     if (allowed_set) {
         zend_hash_destroy(allowed_set);
