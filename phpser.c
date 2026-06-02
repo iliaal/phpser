@@ -99,20 +99,38 @@
  * signed longs. Reader returns 0 on success, -1 on truncation.
  * ------------------------------------------------------------------------- */
 
+/* A u64 varint is at most 10 bytes (ceil(64/7)); a tag + varint at most 11. */
+#define VARINT_MAX_BYTES 10
+
+/* Reserve the worst-case byte count once, then write raw. smart_str_appendc
+ * runs smart_str_alloc (a capacity check) per byte, so the byte-at-a-time
+ * loop paid one check per varint byte; reserving collapses that to a single
+ * check per varint. Output bytes are identical. */
 static inline void varint_write_u64(smart_str *s, uint64_t v) {
+    smart_str_alloc(s, VARINT_MAX_BYTES, 0);
+    char *base = ZSTR_VAL(s->s);
+    size_t pos = ZSTR_LEN(s->s);
     while (v >= 0x80) {
-        smart_str_appendc(s, (char)((v & 0x7f) | 0x80));
+        base[pos++] = (char)((v & 0x7f) | 0x80);
         v >>= 7;
     }
-    smart_str_appendc(s, (char)v);
+    base[pos++] = (char)v;
+    ZSTR_LEN(s->s) = pos;
 }
 
-/* Common case: tag byte + small varint. Inlines two appendc for the typical
- * (tag + 1-byte varint) shape, which is the dominant pattern for assoc key
- * indices and string-dict refs (dicts rarely exceed 128 entries per payload). */
+/* Common case: tag byte + varint — the dominant pattern for assoc key indices
+ * and string-dict refs. One reserve covers tag + worst-case varint. */
 static inline void emit_tag_and_varint(smart_str *s, uint8_t tag, uint64_t v) {
-    smart_str_appendc(s, (char)tag);
-    varint_write_u64(s, v);
+    smart_str_alloc(s, 1 + VARINT_MAX_BYTES, 0);
+    char *base = ZSTR_VAL(s->s);
+    size_t pos = ZSTR_LEN(s->s);
+    base[pos++] = (char)tag;
+    while (v >= 0x80) {
+        base[pos++] = (char)((v & 0x7f) | 0x80);
+        v >>= 7;
+    }
+    base[pos++] = (char)v;
+    ZSTR_LEN(s->s) = pos;
 }
 
 static inline int varint_read_u64(const uint8_t *buf, size_t buflen, size_t *pos, uint64_t *out) {
