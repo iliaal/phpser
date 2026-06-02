@@ -19,7 +19,10 @@ to letting the attacker run those magic methods.
   payload; rejects tampered or foreign-keyed input before any decoding
   starts. Use for cache/session/cookie storage where the payload
   round-trips through a system you don't fully control (memcached,
-  redis, signed cookies, etc.).
+  redis, signed cookies, etc.). An empty `$hmac_key` is rejected with an
+  exception on both the signing and verifying side — a keyless HMAC is
+  forgeable, so callers must supply real key material (use a
+  high-entropy secret, e.g. 32 random bytes).
 
 ## Supported versions
 

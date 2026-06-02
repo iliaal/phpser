@@ -25,11 +25,22 @@ try {
 }
 echo $caught ? "wrong_key OK\n" : "wrong_key FAIL\n";
 
-// --- Empty key (legal but weak — accepted to match HMAC RFC; not our policy
-// to enforce minimum key length). ---
-$sig0 = phpser_serialize_signed($value, '');
-$rt0 = phpser_unserialize_signed($sig0, '');
-echo ($rt0 === $value) ? "empty_key OK\n" : "empty_key FAIL\n";
+// --- Empty key: an empty key makes HMAC keyless and forgeable, so both
+// entry points reject it before doing any work. ---
+$enc_threw = false;
+try {
+    phpser_serialize_signed($value, '');
+} catch (Exception $e) {
+    $enc_threw = str_contains($e->getMessage(), 'key must not be empty');
+}
+$sig_real = phpser_serialize_signed($value, $key);
+$dec_threw = false;
+try {
+    phpser_unserialize_signed($sig_real, '');
+} catch (Exception $e) {
+    $dec_threw = str_contains($e->getMessage(), 'key must not be empty');
+}
+echo ($enc_threw && $dec_threw) ? "empty_key OK\n" : "empty_key FAIL\n";
 
 // --- Long key (> 64 bytes block size): RFC says hash it first. We do. ---
 $long = str_repeat('a', 200);

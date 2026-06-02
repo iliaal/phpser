@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- `phpser_serialize_signed()` and `phpser_unserialize_signed()` now reject an
+  empty signing key instead of accepting it. An empty key reduces HMAC-SHA256
+  to a fixed, keyless tag that anyone can recompute, so a misconfigured caller
+  (e.g. `getenv('SECRET') ?: ''` with the variable unset) would silently emit
+  and accept forgeable payloads — defeating the signed path's only purpose.
+  Both entry points now throw before any HMAC work.
+
 ### Changed
 
 - Encode is now faster than igbinary across the whole benchmark suite

@@ -2407,6 +2407,15 @@ PHP_FUNCTION(phpser_serialize_signed) {
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
+    /* An empty key reduces HMAC to a fixed, keyless tag anyone can compute,
+     * silently downgrading the signed path to forgeable. Reject loudly rather
+     * than emit an unprotected payload. */
+    if (key_len == 0) {
+        zend_throw_exception(zend_ce_exception,
+            "phpser: signing key must not be empty", 0);
+        RETURN_THROWS();
+    }
+
     zend_string *frame = phpser_encode_zval(value, /* throw_on_overflow */ true);
     if (UNEXPECTED(!frame)) {
         RETURN_THROWS();  /* depth-cap exception already pending */
@@ -2441,6 +2450,15 @@ PHP_FUNCTION(phpser_unserialize_signed) {
         Z_PARAM_OPTIONAL
         Z_PARAM_ARRAY_HT(options_ht)
     ZEND_PARSE_PARAMETERS_END();
+
+    /* An empty key makes the HMAC keyless and forgeable; reject before any
+     * verify work so a misconfigured caller fails loud instead of accepting
+     * attacker-signed bytes. Matches the serialize_signed guard. */
+    if (key_len == 0) {
+        zend_throw_exception(zend_ce_exception,
+            "phpser: signing key must not be empty", 0);
+        RETURN_THROWS();
+    }
 
     /* Payload must include at least the 32-byte tag. Anything shorter is
      * either truncated or never signed — reject without leaking which. */
