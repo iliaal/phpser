@@ -14,9 +14,9 @@ where decode time matters more than encode time or payload size.
 
 PHP cache workloads pay decode cost on every read. Encode happens once per write. The default `igbinary` was the right answer for over a decade, but lags on three shapes that show up everywhere: packed numeric arrays, deep-nested structures, and same-class DTO batches (Laravel queue payloads, cached models).
 
-phpser is decoder-optimized. Pointer-equality dict intern, refcount-reuse of zend_strings, pre-sized hash tables with direct `arPacked` writes, tagged scalar runs. On the shapes above, it cuts size by 60-65% and decode time by 70-77% vs igbinary. On general-purpose rowsets it sits within 1% of igbinary's size with 25% faster encode and ~5% slower decode.
+phpser is decoder-optimized. Pointer-equality dict intern, refcount-reuse of zend_strings, pre-sized hash tables with direct `arPacked` writes, tagged scalar runs, an O(1) pointer-hash intern cache. On the shapes above, it cuts size by 60-65% and decode time by 70-77% vs igbinary. On general-purpose rowsets it sits within 1% of igbinary's size and encodes 18-53% faster.
 
-Not a universal win. Encode on small rowsets (100 rows) costs +30% over igbinary, and object-heavy mixed shapes pay +42% on encode because `obj->handlers->get_properties` is per-object. The bench table below has the full shape-by-shape breakdown.
+phpser is now also faster to **encode** than igbinary on every shape in the suite (−14% to −70%), so it's no longer just a read-path win. The remaining non-wins are small and on the de-prioritized axes: rowset size runs ~1-4% over igbinary, and `rowset_1000` decode ~4% slower (the front-loaded dictionary trades streamability for decode speed everywhere else). The bench table below has the full shape-by-shape breakdown.
 
 ## Install
 
@@ -116,37 +116,38 @@ model.
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → **4771** (**+4.4%**) | 9k → 11k ns (+30%) | 9k → 10k ns (~parity) |
-| rowset_1000 | 47K → 48K (**+1.1%**) | 143k → 113k ns (**-25%**) | 93k → 98k ns (+5%) |
-| packed_1k | 5495 → **1941** (**-65%**) | 4.2k → **1.4k** ns (**-67%**) | 7.0k → **1.7k** ns (**-77%**) |
-| packed_10k | 60K → **22K** (**-63%**) | 41k → **16k** ns (**-61%**) | 67k → **17k** ns (**-73%**) |
-| deep_50 | 419 → 424 (parity) | 1.3k → **0.65k** ns (**-49%**) | 1.7k → **1.5k** ns (**-9%**) |
-| dto_100 | 7083 → **6362** (**-10%**) | 14k → 18k ns (+22%) | 25k → **22k** ns (**-11%**) |
-| dto_1000 | 73K → **65K** (**-12%**) | 175k → 173k ns (parity) | 250k → **214k** ns (**-14%**) |
-| dto_mixed | 22K → 29K (+33%) | 54k → 76k ns (+42%) | 103k → **88k** ns (**-14%**) |
+| rowset_100 | 4570 → **4771** (**+4.4%**) | 9.6k → **7.9k** ns (**-18%**) | 11k → 11k ns (~parity) |
+| rowset_1000 | 47K → 48K (**+1.1%**) | 153k → **72k** ns (**-53%**) | 104k → 108k ns (+4%) |
+| packed_1k | 5495 → **1941** (**-65%**) | 4.4k → **1.5k** ns (**-67%**) | 7.0k → **1.8k** ns (**-75%**) |
+| packed_10k | 60K → **22K** (**-63%**) | 44k → **13k** ns (**-70%**) | 73k → **19k** ns (**-74%**) |
+| deep_50 | 419 → 424 (parity) | 1.3k → **0.63k** ns (**-52%**) | 1.8k → **1.6k** ns (**-11%**) |
+| dto_100 | 7083 → **6362** (**-10%**) | 16k → **13k** ns (**-14%**) | 27k → **23k** ns (**-15%**) |
+| dto_1000 | 73K → **65K** (**-12%**) | 186k → **160k** ns (**-14%**) | 272k → **227k** ns (**-16%**) |
+| dto_mixed | 22K → **18K** (**-17%**) | 59k → **40k** ns (**-32%**) | 111k → **79k** ns (**-29%**) |
 
-Wins: packed numerics ~65% smaller + ~75% faster decode + ~61% faster
-encode. Deep-nested ~49% faster encode at parity size. **Rowset_1000
-encode beats igbinary by ~25%**, size within 1.1%; decode pays a ~5%
-tax for the front-loaded dict header walk + refcount-reuse machinery.
-DTO workloads (Laravel-queue-style payloads, single-class arrays):
-**10-12% smaller, 11-14% faster decode** vs igbinary thanks to dict
-dedup on prop names + the class-entry lookup cache that amortizes
-`zend_lookup_class_ex` across same-typed batches.
+phpser is faster to encode than igbinary on **every** shape in the
+suite (−14% to −70%) while staying decoder-first. Packed numerics:
+~65% smaller, ~70% faster encode, ~75% faster decode. Deep-nested:
+~52% faster encode at parity size. **Rowsets encode 18-53% faster**,
+size within ~1%; rowset decode pays a small (~4%) tax for the
+front-loaded dict-header walk. DTO workloads (Laravel-queue-style
+payloads, single-class arrays): **10-17% smaller, 15-29% faster
+decode, 14-32% faster encode** vs igbinary — dict dedup on prop
+names, the class-entry lookup cache that amortizes
+`zend_lookup_class_ex` across same-typed batches, and an O(1)
+pointer-hash intern cache that keeps the per-value dedup lookup off
+the critical path.
 
-`rowset_100` encode (+30%) is the durable gap: a fixed-cost floor for
-the dict header emission and first-row inline emissions, amortized
-over too few rows to recover. The absolute time is small (11 µs for
-the entire 100-row payload). Decode is essentially at parity (per-run
-delta median +0.4%, absolute ratio +6%): the skip-DICT cache-eviction
-policy keeps `['a','b','c']`-style repeated values in DICT slots so
-`detect_packed_run` picks the `TAG_PACKED_STRINGS` typed-run path
-instead of falling back to `PACKED_MIXED` mid-rowset.
+The remaining non-wins are small and on the de-prioritized axes:
+rowset size is ~1-4% over igbinary, and `rowset_1000` decode runs ~4%
+slower — the front-loaded dictionary is read once at the head and
+referenced by index, which is exactly what makes the other decodes
+fast (not streamable; you can't have both).
 
-`dto_mixed` encode (+42%) is the durable encode gap on object-heavy
-shapes: `obj->handlers->get_properties` is called per object and
-isn't trivially avoidable without a custom fast path for default
-property layouts.
+Cross-validated on arm64 (aarch64, PHP 8.4.21 NTS, idle, median of 9):
+same direction on every shape — encode −4% to −66%, decode wins on all
+but `rowset_1000` (+4%). The encode margins on object shapes are
+narrower than x86 (dto_100 −4%, dto_mixed −24%) but still ahead.
 
 ## Design highlights
 
@@ -182,20 +183,24 @@ measurable perf to take, and that this project targets, are:
    single `PACKED_LONGS` header + N zigzag varints, not 1000 `(tag,
    varint)` pairs. Decode is one tight loop with no per-element tag
    dispatch. **Shipped.**
-3. **Inline-cache pointer intern.** 16-slot ring of recently-seen
-   `zend_string*`. Hit rate near 100% on rowset shapes (PHP interns
-   literals; the same `"id"` zend_string pointer flows through every
-   row). Skips the byte-hash entirely on cache hits. **Shipped.**
+3. **O(1) pointer-hash intern.** Open-addressed `zend_string* → slot`
+   hash, grown without eviction. Hit rate near 100% on rowset shapes (PHP
+   interns literals; the same `"id"` zend_string pointer flows through
+   every row), and unique value strings (names, emails) hit a single-probe
+   miss instead of a linear scan — the change that put encode ahead of
+   igbinary on every shape. Skips the byte-hash entirely on hits.
+   **Shipped.**
 4. **Eager dict materialization with warm hashes.** All dict zend_strings
    allocated up front during header parse and their hashes pre-computed.
    `zend_hash_add_new` reuses the cached hash. **Shipped.**
-5. **`update` insert on assoc decode.** Originally `add_new` to skip the
-   existence-check, but adversarial wire payloads with duplicate keys
-   would produce phantom buckets that violate PHP's last-write-wins
-   semantic (`count($arr) != count(array_unique(array_keys($arr)))`).
-   Reverted to `zend_hash_update` for security-boundary correctness;
-   `add_new` is a real but small perf win the cost of breaking adversarial
-   payloads cleanly. **Shipped.**
+5. **Provenance-gated `add_new` on assoc decode.** The default
+   (unsigned) path uses `zend_hash_update`: it's the security boundary, and
+   adversarial payloads with duplicate keys must collapse to last-write-wins
+   rather than produce phantom buckets (`count($arr) !=
+   count(array_unique(array_keys($arr)))`). The HMAC-authenticated
+   `phpser_unserialize_signed` path provably came from our own encoder
+   (unique-keyed HashTables, no duplicates), so it uses `zend_hash_*_add_new`
+   and skips the per-key existence check. **Shipped.**
 6. **Inline-short-string tag with upgrade-on-second-encounter.**
    `TAG_STR_INLINE` (0x0c) and `KEY_STR_INLINE` (0x02) are emitted on a
    string's first occurrence; the next occurrence triggers an in-place
