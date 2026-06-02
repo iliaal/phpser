@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Encode is now faster than igbinary across the whole benchmark suite
+  (−14% to −70% depending on shape), where it previously lagged on small
+  rowsets (+30%) and object-heavy payloads (+42%). The encoder's intern
+  fast path is now an O(1) open-addressed pointer hash instead of a fixed
+  linear ring, so unique value strings (names, emails, SKUs) no longer pay
+  a linear-scan miss on every occurrence; varint emission reserves its
+  worst-case byte count once rather than a capacity check per byte. The
+  wire format and decode output are unchanged.
+- `dto_mixed`-style payloads (objects interleaved with arrays) are now
+  ~17% smaller than igbinary, where they were ~33% larger. The encode
+  intern window was widened so repeated value strings (timestamps, status
+  enums, currency codes) graduate into the front-loaded dictionary instead
+  of re-emitting inline on every row.
+- Plain objects with no dynamic-property table now serialize directly from
+  their declared property slots instead of materializing a properties
+  HashTable, the way native `serialize()` does — faster one-shot (fresh
+  object) encode. PHP 8.4 lazy objects fall back to `get_properties()` so
+  their initializer runs before serialization.
+- `phpser_unserialize_signed()` decodes associative arrays with `add_new`
+  instead of `update`: the HMAC proves the payload came from this
+  extension's encoder (unique keys), so the per-key duplicate check is
+  skipped. The unsigned path keeps last-write-wins collapse for untrusted
+  input.
+
 ## [0.1.1] - 2026-06-01
 
 ### Changed
