@@ -227,35 +227,18 @@ static inline double le64_read(const uint8_t *src) {
 
 /* -------------------------------------------------------------------------
  * Encode state. Two-tier intern:
- *   - inline_cache: ring of (zend_string*, dict_idx). Linear-scan
- *     pointer-equality probe; near-zero cost on hits when PHP literals
- *     share interned zend_string allocations across rows.
+ *   - icache: open-addressed pointer→slot hash. O(1) pointer-equality probe;
+ *     near-zero cost on hits when PHP literals share interned zend_string
+ *     allocations across rows. Grows with the payload's distinct-string count
+ *     and never evicts, so every pointer-shared repeat stays cached (a former
+ *     fixed ring evicted hot repeats and made unique-string misses an O(N)
+ *     linear scan — ~30% of object encode).
  *   - hash_map: HashTable keyed by zend_string content. Consulted on
- *     inline-cache miss once dict_len crosses HASH_MAP_THRESHOLD. Catches
- *     both "same content, different allocation" (runtime-built strings
- *     equaling a literal) AND "cache slot evicted, dict entry still
- *     present" — the dominant case on rowset workloads, where row_X
- *     allocations push prop-key slots out of the cache.
+ *     icache miss once dict_len crosses HASH_MAP_THRESHOLD. Catches
+ *     "same content, different allocation" (runtime-built strings equaling a
+ *     literal) that pointer-equality alone misses.
  *   - dict: index→zend_string* array we emit at the head.
  * ------------------------------------------------------------------------- */
-
-/* Ring size. A repeated string VALUE only graduates to a dict ref if its
- * first two encounters straddle fewer than this many distinct strings — the
- * graduation signal lives in the (FIFO-evicted) ring, and the content hash_map
- * only carries strings already in the dict. The persistent prop-name +
- * class-name slots for a payload's object shapes stay resident (eviction skips
- * DICT slots), so the cap must clear (distinct names/keys in a locality window)
- * + (value-graduation distance). 16 was too tight for mixed/nested object
- * payloads: dto_mixed interleaves two classes whose 15 prop names + 2 class
- * names + 2 array keys = 19 always-dict strings alone saturate a 16-slot ring,
- * so repeated values (timestamps, currency, status enums) never graduated and
- * re-emitted inline on every row — +33% size, +25% encode vs igbinary. 32
- * clears that working set with headroom; the wider linear scan costs nothing
- * measurable (512 B, ~8 cache lines, pointer compares) and rowset/dto encode
- * held or improved. Workloads with >32 distinct interned strings between two
- * occurrences re-hit the inline-duplication path — revisit the cap if a real
- * shape needs it. */
-#define INTERN_CACHE_SIZE 32
 
 /* Threshold under which we skip the hash_map check on miss and just emit
  * the string inline (potentially duplicating bytes for a key already in
@@ -319,9 +302,16 @@ typedef struct {
 } id_entry;
 
 typedef struct {
-    intern_slot inline_cache[INTERN_CACHE_SIZE];
-    uint32_t cache_filled;
-    uint32_t cache_next;
+    /* Open-addressed pointer→slot hash (ptr==NULL empty). Replaces the former
+     * fixed linear ring: unique value strings used to pay a full INTERN_CACHE_SIZE
+     * linear-scan miss on every occurrence (~30% of object encode), and the
+     * ring's eviction dropped hot repeats into the slower content hash_map. An
+     * O(1) probe makes the unique-miss cheap, and growing without eviction keeps
+     * every pointer-shared repeat cached, cutting content-hash fallbacks too.
+     * No wire-format change: it only speeds the encoder's dedup lookup. */
+    intern_slot *icache;
+    uint32_t icache_mask;    /* capacity-1 (power of 2); 0 = unallocated */
+    uint32_t icache_count;
     HashTable hash_map;
     uint8_t   hash_map_inited;   /* lazy init: skipped for small payloads */
     /* Per-payload id table for (zend_object*|zend_reference*) → uint32 id
@@ -347,9 +337,9 @@ typedef struct {
 } encode_ctx;
 
 static void enc_ctx_init(encode_ctx *e) {
-    memset(e->inline_cache, 0, sizeof(e->inline_cache));
-    e->cache_filled = 0;
-    e->cache_next = 0;
+    e->icache = NULL;
+    e->icache_mask = 0;
+    e->icache_count = 0;
     e->hash_map_inited = 0;     /* zend_hash_init deferred until dict crosses HASH_MAP_THRESHOLD */
     e->id_buckets = NULL;
     e->id_mask = 0;
@@ -363,6 +353,7 @@ static void enc_ctx_init(encode_ctx *e) {
 }
 
 static void enc_ctx_destroy(encode_ctx *e) {
+    if (e->icache) efree(e->icache);
     if (e->hash_map_inited) zend_hash_destroy(&e->hash_map);
     if (e->id_buckets) efree(e->id_buckets);
     if (e->dict) {
@@ -452,36 +443,49 @@ static inline void enc_unvisit_last(encode_ctx *e, void *ptr) {
 }
 
 static inline intern_slot *enc_cache_find(encode_ctx *e, zend_string *zs) {
-    for (uint32_t i = 0; i < e->cache_filled; i++) {
-        if (e->inline_cache[i].ptr == zs) return &e->inline_cache[i];
+    if (!e->icache) return NULL;
+    uint32_t h = id_hash((uintptr_t)zs) & e->icache_mask;
+    intern_slot *c = e->icache;
+    while (c[h].ptr) {
+        if (c[h].ptr == zs) return &c[h];
+        h = (h + 1) & e->icache_mask;
     }
     return NULL;
 }
 
-static inline intern_slot *enc_cache_alloc_slot(encode_ctx *e, zend_string *zs) {
-    uint32_t slot;
-    if (e->cache_filled < INTERN_CACHE_SIZE) {
-        slot = e->cache_filled++;
-    } else {
-        /* FIFO ring eviction, but skip past slots that hold a "graduated"
-         * DICT_IDX entry. On rowset workloads the prop-key slots
-         * (graduated to DICT after row 2) would otherwise get evicted
-         * by row_X unique-string allocations; that triggers cache misses
-         * + hash_map fallback for every subsequent prop access. By
-         * preferring to evict INLINE_EMITTED (singleton) slots, we keep
-         * the hot DICT slots warm. Worst-case probe is INTERN_CACHE_SIZE
-         * (all slots are DICT — then we evict the first one and accept
-         * the cost), but typical case finds a non-DICT slot in 1-2
-         * probes. */
-        slot = e->cache_next;
-        for (uint32_t i = 0; i < INTERN_CACHE_SIZE; i++) {
-            if (!SLOT_IS_DICT(e->inline_cache[slot])) break;
-            slot = (slot + 1) % INTERN_CACHE_SIZE;
+static void enc_icache_grow(encode_ctx *e) {
+    uint32_t new_cap = e->icache_mask ? (e->icache_mask + 1) * 2 : 32;
+    intern_slot *nb = ecalloc(new_cap, sizeof(intern_slot));  /* ptr==NULL = empty */
+    uint32_t nm = new_cap - 1;
+    if (e->icache) {
+        for (uint32_t i = 0; i <= e->icache_mask; i++) {
+            zend_string *p = e->icache[i].ptr;
+            if (!p) continue;
+            uint32_t h = id_hash((uintptr_t)p) & nm;
+            while (nb[h].ptr) h = (h + 1) & nm;
+            nb[h] = e->icache[i];
         }
-        e->cache_next = (slot + 1) % INTERN_CACHE_SIZE;
+        efree(e->icache);
     }
-    e->inline_cache[slot].ptr = zs;
-    return &e->inline_cache[slot];
+    e->icache = nb;
+    e->icache_mask = nm;
+}
+
+/* Insert `zs` (which the caller has confirmed absent via enc_cache_find) and
+ * return its slot. No eviction — the cache grows with the payload's distinct
+ * string count, so every pointer-shared repeat stays cached. The caller writes
+ * .idx immediately; no enc_cache_alloc_slot call may intervene before that
+ * write, so the returned pointer can't be invalidated by a rehash. */
+static inline intern_slot *enc_cache_alloc_slot(encode_ctx *e, zend_string *zs) {
+    if (UNEXPECTED((e->icache_count + 1) * 2 > e->icache_mask + 1)) {
+        enc_icache_grow(e);
+    }
+    uint32_t h = id_hash((uintptr_t)zs) & e->icache_mask;
+    intern_slot *c = e->icache;
+    while (c[h].ptr) h = (h + 1) & e->icache_mask;
+    c[h].ptr = zs;
+    e->icache_count++;
+    return &c[h];
 }
 
 /* Allocate a dict slot for `zs` and return its index. Also maintains the
