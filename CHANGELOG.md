@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Packed-array encode (numeric, double, and typed-string runs) now reserves
+  the whole run's worst-case output capacity once, then writes elements raw,
+  instead of running a `smart_str` capacity check per element. On small
+  numeric arrays — where that per-element check was a large fraction of the
+  total work — this cuts encode time ~26% (`packed_1k`); rowsets, whose
+  tag-arrays travel the typed-string run, encode ~2% faster. The mixed-run
+  path is unchanged (its recursion can reallocate the buffer mid-loop). Wire
+  format and decode output are identical.
+
 ## [0.1.2] - 2026-06-02
 
 ### Security

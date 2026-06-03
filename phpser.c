@@ -996,17 +996,45 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
         varint_write_u64(body, n_elems);
         zval *zp = ht->arPacked;
         if (tag == TAG_PACKED_LONGS) {
+            /* Reserve the whole run's worst case once, then write raw —
+             * collapses n_used per-element capacity checks to one. Nothing
+             * else appends to body inside the loop, so the cached base stays
+             * valid. */
+            smart_str_alloc(body, (size_t)n_used * VARINT_MAX_BYTES, 0);
+            char *base = ZSTR_VAL(body->s);
+            size_t pos = ZSTR_LEN(body->s);
             for (uint32_t i = 0; i < n_used; i++) {
-                varint_write_i64(body, Z_LVAL(zp[i]));
+                uint64_t v = zigzag_encode64(Z_LVAL(zp[i]));
+                while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
+                base[pos++] = (char)v;
             }
+            ZSTR_LEN(body->s) = pos;
         } else if (tag == TAG_PACKED_DOUBLES) {
+            smart_str_alloc(body, (size_t)n_used * 8, 0);
+            char *base = ZSTR_VAL(body->s);
+            size_t pos = ZSTR_LEN(body->s);
             for (uint32_t i = 0; i < n_used; i++) {
-                smart_str_append_le64(body, Z_DVAL(zp[i]));
+                double dv = Z_DVAL(zp[i]);
+#ifdef WORDS_BIGENDIAN
+                uint64_t bits; memcpy(&bits, &dv, 8);
+                for (int k = 0; k < 8; k++) base[pos++] = (char)((bits >> (k * 8)) & 0xff);
+#else
+                memcpy(base + pos, &dv, 8); pos += 8;
+#endif
             }
+            ZSTR_LEN(body->s) = pos;
         } else if (tag == TAG_PACKED_STRINGS) {
+            /* enc_intern_zstr touches dict/cache, never body — base stays put
+             * across the intern calls, so the same reserve-once trick holds. */
+            smart_str_alloc(body, (size_t)n_used * VARINT_MAX_BYTES, 0);
+            char *base = ZSTR_VAL(body->s);
+            size_t pos = ZSTR_LEN(body->s);
             for (uint32_t i = 0; i < n_used; i++) {
-                varint_write_u64(body, enc_intern_zstr(e, Z_STR(zp[i])));
+                uint64_t v = enc_intern_zstr(e, Z_STR(zp[i]));
+                while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
+                base[pos++] = (char)v;
             }
+            ZSTR_LEN(body->s) = pos;
         } else {
             for (uint32_t i = 0; i < n_used; i++) {
                 encode_value(body, e, &zp[i]);
