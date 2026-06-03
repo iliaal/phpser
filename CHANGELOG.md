@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tag-arrays travel the typed-string run, encode ~2% faster. The mixed-run
   path is unchanged (its recursion can reallocate the buffer mid-loop). Wire
   format and decode output are identical.
+- The typed-string packed run now reads each element's dictionary index
+  straight from the intern-cache slot rather than re-walking the intern
+  path, which `detect_packed_run` has already shown is unnecessary (every
+  element is proven dict-bound before the run is chosen). Rowset encode is
+  a further ~5-6% faster on top of the reserve-once change. Decode and wire
+  bytes unchanged.
 
 ## [0.1.2] - 2026-06-02
 

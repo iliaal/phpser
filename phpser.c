@@ -1024,13 +1024,18 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
             }
             ZSTR_LEN(body->s) = pos;
         } else if (tag == TAG_PACKED_STRINGS) {
-            /* enc_intern_zstr touches dict/cache, never body — base stays put
-             * across the intern calls, so the same reserve-once trick holds. */
+            /* detect_packed_run already proved every element is ring-resident
+             * and dict-bound, so read the dict idx straight from the cache
+             * slot instead of re-walking enc_intern_zstr. enc_cache_find is a
+             * lookup (no ring mutation), so the slots stay valid across the
+             * loop; nothing appends to body either, so base stays put. */
             smart_str_alloc(body, (size_t)n_used * VARINT_MAX_BYTES, 0);
             char *base = ZSTR_VAL(body->s);
             size_t pos = ZSTR_LEN(body->s);
             for (uint32_t i = 0; i < n_used; i++) {
-                uint64_t v = enc_intern_zstr(e, Z_STR(zp[i]));
+                intern_slot *s = enc_cache_find(e, Z_STR(zp[i]));
+                ZEND_ASSERT(s && SLOT_IS_DICT(*s));  /* detect_packed_run's contract */
+                uint64_t v = SLOT_DICT_IDX(*s);
                 while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
                 base[pos++] = (char)v;
             }
