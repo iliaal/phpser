@@ -18,6 +18,8 @@ phpser is decoder-optimized. Pointer-equality dict intern, refcount-reuse of zen
 
 phpser is now also faster to **encode** than igbinary on every shape in the suite (−14% to −70%), so it's no longer just a read-path win. The remaining non-wins are small and on the de-prioritized axes: rowset size runs ~1-4% over igbinary, and `rowset_1000` decode ~4% slower (the front-loaded dictionary trades streamability for decode speed everywhere else). The bench table below has the full shape-by-shape breakdown.
 
+📖 **The design writeup:** [phpser: a fast, secure binary serializer for PHP cache workloads](https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads) — what the decoder does differently and why decode time is the metric to optimize. The [interactive benchmark page](https://iliaal.github.io/phpser/) compares phpser against igbinary, native `serialize()`, and msgpack across every cache shape.
+
 ## Install
 
 ```bash
@@ -148,6 +150,14 @@ Cross-validated on arm64 (aarch64, PHP 8.4.21 NTS, idle, median of 9):
 same direction on every shape — encode −4% to −66%, decode wins on all
 but `rowset_1000` (+4%). The encode margins on object shapes are
 narrower than x86 (dto_100 −4%, dto_mixed −24%) but still ahead.
+
+For the full four-way picture — phpser vs igbinary vs native `serialize()`
+vs msgpack, with size/encode/decode side by side on every shape — see the
+**[interactive benchmark page](https://iliaal.github.io/phpser/)** (arm64,
+median of 9). Regenerate it with `php ... bench.php --html > docs/index.html`.
+The short version: phpser decodes faster than all three on every shape but
+the rowsets, and the object (`dto_*`) decode that msgpack is slowest at is
+exactly the Laravel-queue workload phpser targets.
 
 ## Design highlights
 
@@ -323,4 +333,4 @@ Companion native PHP extensions:
 
 ---
 
-[Follow on X](https://x.com/iliaa) • [Blog](https://ilia.ws) • If this cut your cache decode CPU, ⭐ star it!
+[Follow on X](https://x.com/iliaa) • [Read the writeup](https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads) • If this cut your cache decode CPU, ⭐ star it!

@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>phpser benchmarks</title>
+<style>
+  :root {
+    --bg:#0d1117; --panel:#161b22; --line:#30363d; --txt:#e6edf3;
+    --dim:#8b949e; --accent:#3fb950; --accent2:#58a6ff; --bar:#21262d;
+    --win:#3fb950; --loss:#f85149; --phpser:#a371f7;
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+    font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif; }
+  .wrap { max-width:1040px; margin:0 auto; padding:40px 24px 80px; }
+  h1 { font-size:30px; margin:0 0 6px; letter-spacing:-.5px; }
+  h1 .ps { color:var(--phpser); }
+  .lede { color:var(--dim); margin:0 0 24px; max-width:70ch; }
+  .env { display:flex; flex-wrap:wrap; gap:8px; margin:0 0 28px; }
+  .env span { background:var(--panel); border:1px solid var(--line);
+    border-radius:6px; padding:4px 10px; font-size:12.5px; color:var(--dim); }
+  .env span b { color:var(--txt); font-weight:600; }
+  .legend { color:var(--dim); font-size:13px; margin:0 0 28px; }
+  .legend .chip { display:inline-block; width:11px; height:11px; border-radius:3px;
+    vertical-align:-1px; margin:0 4px 0 14px; }
+  section { margin:0 0 40px; }
+  h2 { font-size:13px; letter-spacing:1.5px; text-transform:uppercase;
+    color:var(--accent2); border-bottom:1px solid var(--line);
+    padding-bottom:8px; margin:0 0 4px; }
+  h2 small { color:var(--dim); letter-spacing:0; text-transform:none;
+    font-size:12px; margin-left:8px; }
+  table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+  th, td { text-align:right; padding:9px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:600; font-size:12px; }
+  th:first-child, td:first-child { text-align:left; }
+  td.shape { color:var(--txt); font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:13px; }
+  .cell { display:flex; flex-direction:column; align-items:flex-end; gap:3px; }
+  .val { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:13px; }
+  .bar { width:100%; max-width:120px; height:5px; background:var(--bar);
+    border-radius:3px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--accent2); border-radius:3px; }
+  td.best .val { color:var(--win); font-weight:700; }
+  td.best .bar i { background:var(--win); }
+  .ser-phpser { color:var(--phpser) !important; }
+  .delta { font-size:11px; color:var(--dim); }
+  .delta.win { color:var(--win); }
+  .delta.loss { color:var(--loss); }
+  .na { color:var(--dim); }
+  th.phpser, td.phpser-col { background:rgba(163,113,247,.06); }
+  footer { color:var(--dim); font-size:13px; border-top:1px solid var(--line);
+    padding-top:20px; margin-top:48px; }
+  footer a { color:var(--accent2); text-decoration:none; }
+  footer a:hover { text-decoration:underline; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1><span class="ps">phpser</span> benchmarks</h1>
+  <p class="lede">A decoder-optimized binary serializer for read-heavy PHP cache
+    workloads, measured against <b>igbinary</b> (the reference), PHP's native
+    <b>serialize()</b>, and <b>msgpack</b> across cache-shaped payloads. Lower is
+    better on every metric. igbinary is the baseline; each percentage is that
+    column's delta vs. igbinary — green beats igbinary, red loses to it.</p>
+
+  <div class="env">
+    <span><b>PHP</b> 8.4.21</span>
+    <span><b>arch</b> aarch64</span>
+    <span><b>os</b> Linux 6.17.0-1010-oracle</span>
+    <span><b>iters</b> 1000</span>
+    <span><b>median of</b> 9</span>
+    <span><b>phpser</b> 0.1.2</span>
+    <span><b>igbinary</b> 3.2.16</span>    <span><b>msgpack</b> 3.0.1</span>    <span><b>date</b> 2026-06-03</span>
+  </div>
+
+  <p class="legend">Bars are normalized per row to the largest value (longer =
+    slower / bigger).<span class="chip" style="background:var(--win)"></span>best
+    in row<span class="chip" style="background:var(--phpser)"></span>phpser column</p>
+
+  <section>
+    <h2>SIZE<small>bytes — lower is better</small></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>shape</th>
+                      <th class="phpser">phpser</th>
+                      <th class="">igbinary *</th>
+                      <th class="">serialize</th>
+                      <th class="">msgpack</th>
+                  </tr>
+      </thead>
+      <tbody>
+              <tr>
+          <td class="shape">rowset_100</td>
+                      <td class="phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">4,771</span>
+                <div class="bar"><i style="width:23%"></i></div>
+                <span class='delta loss'>+4%</span>              </div>
+            </td>
+                      <td class="best ">
+              <div class="cell">
+                <span class="val ">4,570</span>
+                <div class="bar"><i style="width:22%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">21,046</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+361%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">9,593</span>
+                <div class="bar"><i style="width:46%"></i></div>
+                <span class='delta loss'>+110%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">rowset_1000</td>
+                      <td class="phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">47,972</span>
+                <div class="bar"><i style="width:22%"></i></div>
+                <span class='delta loss'>+1%</span>              </div>
+            </td>
+                      <td class="best ">
+              <div class="cell">
+                <span class="val ">47,459</span>
+                <div class="bar"><i style="width:22%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">214,949</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+353%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">98,509</span>
+                <div class="bar"><i style="width:46%"></i></div>
+                <span class='delta loss'>+108%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">packed_1k</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">1,941</span>
+                <div class="bar"><i style="width:16%"></i></div>
+                <span class='delta win'>-65%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">5,495</span>
+                <div class="bar"><i style="width:47%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">11,789</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+115%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">2,619</span>
+                <div class="bar"><i style="width:22%"></i></div>
+                <span class='delta win'>-52%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">packed_10k</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">21,749</span>
+                <div class="bar"><i style="width:16%"></i></div>
+                <span class='delta win'>-63%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">59,495</span>
+                <div class="bar"><i style="width:43%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">137,790</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+132%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">29,619</span>
+                <div class="bar"><i style="width:21%"></i></div>
+                <span class='delta win'>-50%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">deep_50</td>
+                      <td class="phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">424</span>
+                <div class="bar"><i style="width:28%"></i></div>
+                <span class='delta loss'>+1%</span>              </div>
+            </td>
+                      <td class="best ">
+              <div class="cell">
+                <span class="val ">419</span>
+                <div class="bar"><i style="width:28%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">1,512</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+261%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">457</span>
+                <div class="bar"><i style="width:30%"></i></div>
+                <span class='delta loss'>+9%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">dto_100</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">6,362</span>
+                <div class="bar"><i style="width:23%"></i></div>
+                <span class='delta win'>-10%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">7,083</span>
+                <div class="bar"><i style="width:25%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">28,190</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+298%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">14,909</span>
+                <div class="bar"><i style="width:53%"></i></div>
+                <span class='delta loss'>+110%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">dto_1000</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">64,863</span>
+                <div class="bar"><i style="width:23%"></i></div>
+                <span class='delta win'>-12%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">73,372</span>
+                <div class="bar"><i style="width:26%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">285,891</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+290%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">152,725</span>
+                <div class="bar"><i style="width:53%"></i></div>
+                <span class='delta loss'>+108%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">dto_mixed</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">17,927</span>
+                <div class="bar"><i style="width:21%"></i></div>
+                <span class='delta win'>-17%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">21,644</span>
+                <div class="bar"><i style="width:25%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">85,395</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+295%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">46,433</span>
+                <div class="bar"><i style="width:54%"></i></div>
+                <span class='delta loss'>+115%</span>              </div>
+            </td>
+                  </tr>
+            </tbody>
+    </table>
+  </section>
+  <section>
+    <h2>ENCODE<small>ns / op — lower is better</small></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>shape</th>
+                      <th class="phpser">phpser</th>
+                      <th class="">igbinary *</th>
+                      <th class="">serialize</th>
+                      <th class="">msgpack</th>
+                  </tr>
+      </thead>
+      <tbody>
+              <tr>
+          <td class="shape">rowset_100</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">14.4k</span>
+                <div class="bar"><i style="width:22%"></i></div>
+                <span class='delta win'>-19%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">17.7k</span>
+                <div class="bar"><i style="width:27%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">65.1k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+268%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">39.7k</span>
+                <div class="bar"><i style="width:61%"></i></div>
+                <span class='delta loss'>+125%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">rowset_1000</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">139.4k</span>
+                <div class="bar"><i style="width:20%"></i></div>
+                <span class='delta win'>-46%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">258.6k</span>
+                <div class="bar"><i style="width:36%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">711.9k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+175%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">407.8k</span>
+                <div class="bar"><i style="width:57%"></i></div>
+                <span class='delta loss'>+58%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">packed_1k</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">2.4k</span>
+                <div class="bar"><i style="width:10%"></i></div>
+                <span class='delta win'>-75%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">9.7k</span>
+                <div class="bar"><i style="width:41%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">23.5k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+141%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">12.7k</span>
+                <div class="bar"><i style="width:54%"></i></div>
+                <span class='delta loss'>+30%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">packed_10k</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">35.1k</span>
+                <div class="bar"><i style="width:14%"></i></div>
+                <span class='delta win'>-63%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">94.4k</span>
+                <div class="bar"><i style="width:38%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">246.2k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+161%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">128.8k</span>
+                <div class="bar"><i style="width:52%"></i></div>
+                <span class='delta loss'>+36%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">deep_50</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">1.4k</span>
+                <div class="bar"><i style="width:20%"></i></div>
+                <span class='delta win'>-51%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">2.8k</span>
+                <div class="bar"><i style="width:40%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">3.2k</span>
+                <div class="bar"><i style="width:47%"></i></div>
+                <span class='delta loss'>+16%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">6.8k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+147%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">dto_100</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">27.9k</span>
+                <div class="bar"><i style="width:59%"></i></div>
+                <span class='delta '>-0%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">28.0k</span>
+                <div class="bar"><i style="width:59%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">37.5k</span>
+                <div class="bar"><i style="width:79%"></i></div>
+                <span class='delta loss'>+34%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">47.3k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+69%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">dto_1000</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">285.2k</span>
+                <div class="bar"><i style="width:57%"></i></div>
+                <span class='delta win'>-8%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">310.2k</span>
+                <div class="bar"><i style="width:62%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">376.9k</span>
+                <div class="bar"><i style="width:75%"></i></div>
+                <span class='delta loss'>+21%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">503.9k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+62%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">dto_mixed</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">85.7k</span>
+                <div class="bar"><i style="width:40%"></i></div>
+                <span class='delta win'>-20%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">107.8k</span>
+                <div class="bar"><i style="width:51%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">212.3k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+97%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">163.8k</span>
+                <div class="bar"><i style="width:77%"></i></div>
+                <span class='delta loss'>+52%</span>              </div>
+            </td>
+                  </tr>
+            </tbody>
+    </table>
+  </section>
+  <section>
+    <h2>DECODE<small>ns / op — lower is better</small></h2>
+    <table>
+      <thead>
+        <tr>
+          <th>shape</th>
+                      <th class="phpser">phpser</th>
+                      <th class="">igbinary *</th>
+                      <th class="">serialize</th>
+                      <th class="">msgpack</th>
+                  </tr>
+      </thead>
+      <tbody>
+              <tr>
+          <td class="shape">rowset_100</td>
+                      <td class="phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">21.3k</span>
+                <div class="bar"><i style="width:31%"></i></div>
+                <span class='delta loss'>+1%</span>              </div>
+            </td>
+                      <td class="best ">
+              <div class="cell">
+                <span class="val ">21.1k</span>
+                <div class="bar"><i style="width:31%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">68.4k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+225%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">68.0k</span>
+                <div class="bar"><i style="width:99%"></i></div>
+                <span class='delta loss'>+223%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">rowset_1000</td>
+                      <td class="phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">219.5k</span>
+                <div class="bar"><i style="width:30%"></i></div>
+                <span class='delta loss'>+4%</span>              </div>
+            </td>
+                      <td class="best ">
+              <div class="cell">
+                <span class="val ">210.2k</span>
+                <div class="bar"><i style="width:29%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">730.7k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+248%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">699.0k</span>
+                <div class="bar"><i style="width:96%"></i></div>
+                <span class='delta loss'>+233%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">packed_1k</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">3.3k</span>
+                <div class="bar"><i style="width:9%"></i></div>
+                <span class='delta win'>-79%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">15.8k</span>
+                <div class="bar"><i style="width:42%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">37.2k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+136%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">17.7k</span>
+                <div class="bar"><i style="width:48%"></i></div>
+                <span class='delta loss'>+12%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">packed_10k</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">36.7k</span>
+                <div class="bar"><i style="width:9%"></i></div>
+                <span class='delta win'>-76%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">154.0k</span>
+                <div class="bar"><i style="width:39%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">399.9k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+160%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">177.5k</span>
+                <div class="bar"><i style="width:44%"></i></div>
+                <span class='delta loss'>+15%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">deep_50</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">3.1k</span>
+                <div class="bar"><i style="width:43%"></i></div>
+                <span class='delta win'>-10%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">3.4k</span>
+                <div class="bar"><i style="width:47%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">6.0k</span>
+                <div class="bar"><i style="width:83%"></i></div>
+                <span class='delta loss'>+75%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">7.3k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+112%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">dto_100</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">48.5k</span>
+                <div class="bar"><i style="width:31%"></i></div>
+                <span class='delta win'>-11%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">54.7k</span>
+                <div class="bar"><i style="width:35%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">125.9k</span>
+                <div class="bar"><i style="width:81%"></i></div>
+                <span class='delta loss'>+130%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">156.2k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+185%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">dto_1000</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">508.6k</span>
+                <div class="bar"><i style="width:31%"></i></div>
+                <span class='delta win'>-14%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">588.6k</span>
+                <div class="bar"><i style="width:36%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">1601.1k</span>
+                <div class="bar"><i style="width:99%"></i></div>
+                <span class='delta loss'>+172%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">1621.8k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+176%</span>              </div>
+            </td>
+                  </tr>
+              <tr>
+          <td class="shape">dto_mixed</td>
+                      <td class="best phpser-col">
+              <div class="cell">
+                <span class="val ser-phpser">179.7k</span>
+                <div class="bar"><i style="width:32%"></i></div>
+                <span class='delta win'>-20%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">223.6k</span>
+                <div class="bar"><i style="width:40%"></i></div>
+                              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">515.4k</span>
+                <div class="bar"><i style="width:91%"></i></div>
+                <span class='delta loss'>+130%</span>              </div>
+            </td>
+                      <td class="">
+              <div class="cell">
+                <span class="val ">564.9k</span>
+                <div class="bar"><i style="width:100%"></i></div>
+                <span class='delta loss'>+153%</span>              </div>
+            </td>
+                  </tr>
+            </tbody>
+    </table>
+  </section>
+
+  <footer>
+    <p>Reproduce: <code>php -d extension=phpser.so -d extension=igbinary.so -d extension=msgpack.so bench.php --html &gt; docs/index.html</code>.
+       igbinary marked <code>*</code> is the reference column.
+       Shapes: <code>rowset_*</code> mixed assoc rows, <code>packed_*</code> numeric
+       arrays, <code>deep_50</code> nested containers, <code>dto_*</code>
+       single-class typed-object batches (Laravel-queue-style).</p>
+    <p><a href="https://github.com/iliaal/phpser">github.com/iliaal/phpser</a> ·
+       <a href="https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads">the writeup</a></p>
+  </footer>
+</div>
+</body>
+</html>
