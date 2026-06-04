@@ -327,7 +327,7 @@ Companion native PHP extensions:
 - [php_excel](https://github.com/iliaal/php_excel): native XLS/XLSX read/write via LibXL
 - [mdparser](https://github.com/iliaal/mdparser): native CommonMark + GitHub Flavored Markdown parser
 - [php_clickhouse](https://github.com/iliaal/php_clickhouse): native ClickHouse client over the binary protocol
-- [fastchart](https://github.com/iliaal/fastchart): 19 chart types in one PHP extension
+- [fastchart](https://github.com/iliaal/fastchart): 26 chart types in one PHP extension
 - [fastjson](https://github.com/iliaal/fastjson): drop-in faster `ext/json`, backed by yyjson
 - [statgrab](https://github.com/iliaal/statgrab): system statistics wrapper around libstatgrab
 
