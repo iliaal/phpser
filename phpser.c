@@ -56,6 +56,22 @@
      ZEND_ACC_EXPLICIT_ABSTRACT_CLASS | ZEND_ACC_ENUM)
 #endif
 
+/* GC_DTOR drops a refcount and runs the destructor / GC-root check on a
+ * refcounted value. It first appeared in PHP 8.3; on 8.2 spell out the same
+ * expansion (zend_gc_delref / rc_dtor_func / gc_check_possible_root all exist
+ * unchanged on 8.2) so the reference-teardown call site stays version-agnostic. */
+#if PHP_VERSION_ID < 80300
+# define GC_DTOR(p) \
+	do { \
+		zend_refcounted_h *_p = &(p)->gc; \
+		if (zend_gc_delref(_p) == 0) { \
+			rc_dtor_func((zend_refcounted *)_p); \
+		} else { \
+			gc_check_possible_root((zend_refcounted *)_p); \
+		} \
+	} while (0)
+#endif
+
 /* Wire format version. Bump on any incompatible change. */
 #define PHPSER_VERSION 0x01
 
@@ -2391,7 +2407,12 @@ static int parse_unserialize_options(
                 zend_type_error(
                     "%s(): allowed_classes option must "
                     "be an array of class names, %s given",
-                    fname, zend_zval_value_name(cn));
+                    fname,
+#if PHP_VERSION_ID >= 80300
+                    zend_zval_value_name(cn));
+#else
+                    zend_zval_type_name(cn));
+#endif
                 return -1;
             }
             zend_string *lc = zend_string_tolower(Z_STR_P(cn));
