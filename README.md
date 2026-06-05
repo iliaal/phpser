@@ -58,7 +58,7 @@ echo 'extension=phpser.so' | sudo tee /etc/php/conf.d/phpser.ini
 
 ### Pre-built binaries
 
-Pre-built `.dll`s for Windows (PHP 8.3-8.5, TS/NTS, x64) and `.so`s for
+Pre-built `.dll`s for Windows (PHP 8.2-8.5, TS/NTS, x64) and `.so`s for
 Linux glibc (x86_64, arm64) and macOS arm64 (PHP 8.4-8.5) are attached
 to each [GitHub release](https://github.com/iliaal/phpser/releases). PIE
 fetches the matching binary automatically; falls back to source-build
@@ -112,7 +112,7 @@ model.
 
 - **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder. An empty key is rejected on both sides — a keyless HMAC is forgeable, so callers must supply real key material.
 - **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode (encode throws, decode returns `null`), and assoc decode uses `zend_hash_update` so duplicate-key payloads collapse to last-write-wins rather than phantom buckets.
-- **PHP 8.3+ (8.4, 8.5, master).** BSD 3-Clause.
+- **PHP 8.2+ (8.3, 8.4, 8.5, master).** BSD 3-Clause.
 
 ## Bench (opt PHP 8.4.22-dev NTS release, 1000 iters, median of 9 runs)
 
