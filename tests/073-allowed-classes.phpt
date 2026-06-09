@@ -101,6 +101,38 @@ echo $threw ? "invalid_option OK\n" : "invalid_option FAIL\n";
 $rt = phpser_unserialize(phpser_serialize($a), ['allowed_classes' => []]);
 echo ($rt instanceof __PHP_Incomplete_Class) ? "empty_array OK\n" : "empty_array FAIL\n";
 
+// --- Reference-wrapped allowlist entry (foreach-by-ref residue) derefs
+// like native unserialize(). ---
+$allow = ['Approved'];
+foreach ($allow as &$cname) { $cname = trim($cname); }
+try {
+    $rt = phpser_unserialize(phpser_serialize($a), ['allowed_classes' => $allow]);
+    echo ($rt instanceof Approved) ? "ref_entry OK\n" : "ref_entry FAIL\n";
+} catch (Throwable $e) {
+    echo "ref_entry FAIL ", get_class($e), ": ", $e->getMessage(), "\n";
+}
+unset($cname);
+
+// --- Reference-wrapped option value: false by reference disables all
+// classes, same as plain false. ---
+$flag = false;
+try {
+    $rt = phpser_unserialize(phpser_serialize($a), ['allowed_classes' => &$flag]);
+    echo ($rt instanceof __PHP_Incomplete_Class) ? "ref_false OK\n" : "ref_false FAIL\n";
+} catch (Throwable $e) {
+    echo "ref_false FAIL ", get_class($e), ": ", $e->getMessage(), "\n";
+}
+
+// --- Reference-wrapped option value: array by reference applies the
+// allowlist, same as a plain array. ---
+$list = ['Approved'];
+try {
+    $rt = phpser_unserialize(phpser_serialize($a), ['allowed_classes' => &$list]);
+    echo ($rt instanceof Approved) ? "ref_array OK\n" : "ref_array FAIL\n";
+} catch (Throwable $e) {
+    echo "ref_array FAIL ", get_class($e), ": ", $e->getMessage(), "\n";
+}
+
 ?>
 --EXPECT--
 default_all OK
@@ -117,3 +149,6 @@ enum_filtered OK
 nested_filter OK
 invalid_option OK
 empty_array OK
+ref_entry OK
+ref_false OK
+ref_array OK

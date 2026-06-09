@@ -2381,8 +2381,8 @@ static int parse_unserialize_options(
     *out_mode = ALLOWED_ALL;
     *out_set = NULL;
     if (!options_ht) return 0;
-    zval *ac = zend_hash_str_find(options_ht, "allowed_classes",
-                                   sizeof("allowed_classes") - 1);
+    zval *ac = zend_hash_str_find_deref(options_ht, "allowed_classes",
+                                         sizeof("allowed_classes") - 1);
     if (!ac) return 0;
     if (Z_TYPE_P(ac) == IS_FALSE) { *out_mode = ALLOWED_NONE; return 0; }
     if (Z_TYPE_P(ac) == IS_TRUE)  { *out_mode = ALLOWED_ALL;  return 0; }
@@ -2396,6 +2396,7 @@ static int parse_unserialize_options(
                        NULL, NULL, 0);
         zval *cn;
         ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ac), cn) {
+            ZVAL_DEREF(cn);
             if (Z_TYPE_P(cn) != IS_STRING) {
                 /* Match PHP's native unserialize: non-string entry in
                  * the allowed_classes array is a TypeError. Silently

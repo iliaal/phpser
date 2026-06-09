@@ -11,6 +11,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - PHP 8.2 support (lowered the minimum from 8.3).
 
+### Fixed
+
+- `allowed_classes` options carrying PHP references now behave like native
+  `unserialize()`. Previously a reference-wrapped option value
+  (`['allowed_classes' => &$flag]`) or an allowlist entry left referenced by
+  a `foreach (... as &$c)` loop threw a spurious ValueError/TypeError instead
+  of applying the filter. Both cases failed closed (the decode never ran), so
+  this is a compatibility fix, not a security one.
+
 ### Changed
 
 - Packed-array encode (numeric, double, and typed-string runs) now reserves
