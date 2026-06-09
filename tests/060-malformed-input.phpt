@@ -98,9 +98,41 @@ foreach ($crafted as $name => $bytes) {
     if (is_object($rt)) { try { var_export($rt); } catch (\Throwable $e) {} }
 }
 echo "crafted OK\n";
+
+// 5. Numeric-string assoc keys must coerce to int exactly as native
+//    unserialize. PHP arrays collapse a canonical numeric string key ("5")
+//    to integer 5, so this state is unreachable from PHP code — only a
+//    crafted payload can carry KEY_STR_INLINE "5". A raw zend_hash_update on
+//    the untrusted path would preserve it as a string key, letting an
+//    attacker smuggle a value past isset()/array_key_exists checks that
+//    assume coercion already happened. Build the payloads by encoding a
+//    1-char key we CAN construct, then byte-swapping it to the digit.
+$one = phpser_serialize(["Z" => 42]);
+$one[strpos($one, "Z")] = "5";
+$r = phpser_unserialize($one);
+$k = array_key_first($r);
+echo (is_int($k) && $k === 5 && $r[5] === 42) ? "numkey_coerced OK\n" : "numkey_coerced FAIL\n";
+
+// Dual int-5 and string-"5" in one payload must collapse to a single int
+// key (last-write-wins), never a 2-element array holding both.
+$dual = phpser_serialize([5 => 1, "Z" => 2]);
+$dual[strpos($dual, "Z")] = "5";
+$rd = phpser_unserialize($dual);
+echo (count($rd) === 1 && $rd[5] === 2) ? "numkey_dual_collapse OK\n" : "numkey_dual_collapse FAIL\n";
+
+// Non-canonical numeric strings ("05", leading zero) stay string keys, as
+// native unserialize keeps them — confirms real coercion, not naive atoi.
+$lead = phpser_serialize(["ZZ" => 9]);
+$lead = str_replace("ZZ", "05", $lead);
+$rl = phpser_unserialize($lead);
+echo is_string(array_key_first($rl)) ? "numkey_leadzero_string OK\n" : "numkey_leadzero_string FAIL\n";
+
 ?>
 --EXPECT--
 static OK
 truncate OK
 fuzz OK
 crafted OK
+numkey_coerced OK
+numkey_dual_collapse OK
+numkey_leadzero_string OK

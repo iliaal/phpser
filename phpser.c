@@ -772,11 +772,20 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 zend_call_known_instance_method_with_0_params(
                     obj->ce->__serialize, obj, &retval);
                 if (UNEXPECTED(EG(exception)) || Z_TYPE(retval) != IS_ARRAY) {
-                    /* Match PHP's behavior: type error / exception during
-                     * __serialize → emit NULL and bail. Don't swallow the
-                     * exception silently — PHP propagates it. Roll back
-                     * the speculative id-claim so back-refs to this
-                     * object later in the payload don't misalign. */
+                    /* Match PHP's behavior: a non-array return raises a
+                     * TypeError (native: "X::__serialize() must return an
+                     * array"). Without this the object ships as a silent
+                     * TAG_NULL that decodes to null in its place — the same
+                     * undecodable-data-loss failure the depth cap rejects.
+                     * If __serialize already threw, propagate that untouched.
+                     * Roll back the speculative id-claim either way so
+                     * back-refs to this object later in the payload don't
+                     * misalign. */
+                    if (!EG(exception) && Z_TYPE(retval) != IS_ARRAY) {
+                        zend_type_error(
+                            "%s::__serialize() must return an array",
+                            ZSTR_VAL(obj->ce->name));
+                    }
                     zval_ptr_dtor(&retval);
                     enc_unvisit_last(e, obj);
                     smart_str_appendc(body, TAG_NULL);
@@ -2019,14 +2028,22 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                         case KV_LONG:
                             zend_hash_index_update(arr, (zend_ulong)k.lval, &tmp);
                             break;
+                        /* symtable_update (not hash_update) so a crafted
+                         * canonical-numeric string key like "5" coerces to
+                         * integer 5, exactly as native unserialize and every
+                         * PHP array write do. hash_update would let an attacker
+                         * smuggle a value under string "5" that survives next
+                         * to (or instead of) int 5 — a HashTable state no PHP
+                         * code can produce, breaking isset()/array_key_exists
+                         * dedup assumptions downstream. */
                         case KV_DICT_STR: {
                             zend_string *zs = dec_get_zstr(d, k.dict_idx);
                             if (!zs) { zval_ptr_dtor(&tmp); goto assoc_fail; }
-                            zend_hash_update(arr, zs, &tmp);
+                            zend_symtable_update(arr, zs, &tmp);
                             break;
                         }
                         case KV_OWNED_STR:
-                            zend_hash_update(arr, k.owned_str, &tmp);
+                            zend_symtable_update(arr, k.owned_str, &tmp);
                             /* hash addref'd it for the bucket; drop our ref. */
                             zend_string_release(k.owned_str);
                             break;
@@ -2279,8 +2296,20 @@ done:
      * at the function boundary regardless, but the session handler
      * (PS_SERIALIZER_DECODE_FUNC) reads our return value to decide whether
      * to persist `$_SESSION`. A swallowed exception would let it commit
-     * a partially-stitched graph. */
-    return UNEXPECTED(EG(exception)) ? -1 : 0;
+     * a partially-stitched graph.
+     *
+     * Honor the documented "out is NULL on error" contract on this path too:
+     * dtor the fully-decoded graph and null out. decode_destroy already
+     * released the id_table's extra refs, so out owns the sole remaining
+     * reference — this frees the graph cleanly and exactly once. Without it
+     * the session decode hook, which returns FAILURE without dtoring its
+     * zval, leaks the entire decoded graph (and skips its destructors). */
+    if (UNEXPECTED(EG(exception))) {
+        zval_ptr_dtor(out);
+        ZVAL_NULL(out);
+        return -1;
+    }
+    return 0;
 }
 
 #ifdef HAVE_PHP_SESSION

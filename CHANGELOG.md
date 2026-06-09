@@ -19,6 +19,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a `foreach (... as &$c)` loop threw a spurious ValueError/TypeError instead
   of applying the filter. Both cases failed closed (the decode never ran), so
   this is a compatibility fix, not a security one.
+- A crafted payload with a canonical numeric string array key (`"5"`) now
+  decodes to the integer key `5`, matching native `unserialize()` and every
+  PHP array write. The untrusted decode path previously preserved it as a
+  string key, a HashTable state no PHP code can produce — letting an attacker
+  smuggle a value past `isset()` / `array_key_exists()` checks that assume
+  the key was already coerced. The HMAC-signed path was never affected (the
+  encoder only ever emits integer keys for numeric strings).
+- A `__serialize()` that returns a non-array without throwing now raises a
+  `TypeError`, matching native PHP, instead of silently encoding the object
+  as `null`. The previous behavior shipped a valid payload that decoded to
+  `null` in the object's place with no error at write time.
+- Decoding a payload whose deferred `__wakeup()` / `__unserialize()` throws
+  no longer leaks the decoded object graph. The session decode handler now
+  receives a cleared result on this error path, restoring the decoder's
+  documented "result is null on failure" contract.
 
 ### Changed
 

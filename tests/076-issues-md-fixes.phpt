@@ -187,22 +187,47 @@ echo ($rt->a === 1 && $rt->b === "x" && $rt->c === null)
 // id_table slot — typically out-of-bounds, decoder rejected the WHOLE
 // payload as malformed. Fix: roll back the speculative enc_visit before
 // emitting TAG_NULL.
+//
+// Uses __sleep (not __serialize) for the NULL-producing path: native PHP
+// degrades a non-array __sleep to a warning + NULL, so phpser emits TAG_NULL
+// and the rollback is exercised. A non-array __serialize now throws (see the
+// magic_serialize_nonarray_throws case below), so it can't reach TAG_NULL.
 // =====================================================================
-class BadMagic {
-    public function __serialize() { return 42; }     // non-array, no throw
-    public function __unserialize(array $d): void {}
+class BadSleep {
+    public $x = 1;
+    #[\ReturnTypeWillChange]
+    public function __sleep() { return 42; }     // non-array, no throw
 }
 class Wrap_ {
     public $a; public $b; public $c;
 }
-$bad = new BadMagic();
+$bad = new BadSleep();
 $w = new Wrap_();
 $w->a = $bad;
 $w->b = $bad;   // back-ref to $bad if encoder claimed an id
 $w->c = "tail"; // sentinel to verify decode reached the end
-$rt = phpser_unserialize(phpser_serialize($w));
+$rt = phpser_unserialize(@phpser_serialize($w));
 echo ($rt instanceof Wrap_ && $rt->a === null && $rt->b === null && $rt->c === "tail")
     ? "magic_fail_no_desync OK\n" : "magic_fail_no_desync FAIL\n";
+
+// REGRESSION: a __serialize() that returns a non-array without throwing used
+// to be silently encoded as TAG_NULL — the object vanished from the payload
+// with no error at write time. Native PHP raises a TypeError for this; phpser
+// now matches, failing loud instead of shipping undecodable data loss.
+class BadSerialize {
+    public $x = 1;
+    #[\ReturnTypeWillChange]
+    public function __serialize() { return 42; }     // non-array, no throw
+}
+$threw = false; $msg = '';
+try {
+    phpser_serialize(new BadSerialize());
+} catch (TypeError $e) {
+    $threw = true; $msg = $e->getMessage();
+}
+echo ($threw && $msg === 'BadSerialize::__serialize() must return an array')
+    ? "magic_serialize_nonarray_throws OK\n"
+    : "magic_serialize_nonarray_throws FAIL ($msg)\n";
 
 ?>
 --EXPECT--
@@ -224,3 +249,4 @@ cr009_doubles_roundtrip OK
 uninit_typed_skip OK
 untyped_preserve OK
 magic_fail_no_desync OK
+magic_serialize_nonarray_throws OK
