@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Typed-string run encode fuses the eligibility scan with emission (one
   intern-cache probe per element instead of two); rowset encode ~6% faster,
   wire bytes unchanged.
+- Object encode emits properties in a single pass with a back-patched
+  count instead of a count walk plus an emit walk; DTO encode ~4% faster,
+  wire bytes unchanged.
 
 ### Fixed
 

@@ -615,6 +615,31 @@ static void enc_emit_str_value(smart_str *body, encode_ctx *e, zend_string *zs) 
     enc_emit_str_tagged(body, e, zs, TAG_STR_DICT, TAG_STR_INLINE);
 }
 
+/* Patch a one-byte nprops placeholder at `off` with the final count, written
+ * after the property emission loop so the objects' buckets are walked once
+ * instead of count-pass + emit-pass. The placeholder assumed the common
+ * <128 case (one varint byte); larger counts insert the extra varint bytes
+ * with a tail memmove — objects with 128+ live properties are rare enough
+ * that the move is effectively never taken. */
+static void enc_patch_nprops(smart_str *body, size_t off, uint32_t nprops) {
+    if (EXPECTED(nprops < 0x80)) {
+        ZSTR_VAL(body->s)[off] = (char)nprops;
+        return;
+    }
+    uint8_t var[VARINT_MAX_BYTES];
+    int len = 0;
+    uint64_t v = nprops;
+    while (v >= 0x80) { var[len++] = (uint8_t)((v & 0x7f) | 0x80); v >>= 7; }
+    var[len++] = (uint8_t)v;
+    size_t extra = (size_t)len - 1;
+    smart_str_alloc(body, extra, 0);
+    char *base = ZSTR_VAL(body->s);
+    size_t end = ZSTR_LEN(body->s);
+    memmove(base + off + len, base + off + 1, end - (off + 1));
+    memcpy(base + off, var, (size_t)len);
+    ZSTR_LEN(body->s) = end + extra;
+}
+
 static void enc_emit_str_key(smart_str *body, encode_ctx *e, zend_string *zs) {
     enc_emit_str_tagged(body, e, zs, KEY_STR, KEY_STR_INLINE);
 }
@@ -835,31 +860,16 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     return;
                 }
                 HashTable *names_ht = Z_ARRVAL(names_zv);
-                /* Two passes: count, then emit. Hash lookups are O(1) so
-                 * the extra walk is cheap; we need an accurate nprops for
-                 * the wire format ahead of the bucket emission. */
-                uint32_t nprops = 0;
-                zval *zv_name;
-                ZEND_HASH_FOREACH_VAL(names_ht, zv_name) {
-                    if (Z_TYPE_P(zv_name) != IS_STRING) continue;
-                    zend_string *nm = Z_STR_P(zv_name);
-                    zend_property_info *info = zend_hash_find_ptr(&obj->ce->properties_info, nm);
-                    if (info != NULL) {
-                        if (info->flags & ZEND_ACC_STATIC) continue;
-#if PHP_VERSION_ID >= 80400
-                        if (info->offset == (uint32_t)ZEND_VIRTUAL_PROPERTY_OFFSET) continue;
-#endif
-                        zval *p = OBJ_PROP(obj, info->offset);
-                        if (Z_TYPE_P(p) == IS_UNDEF) continue;
-                        nprops++;
-                    } else if (obj->properties) {
-                        zval *p = zend_hash_find(obj->properties, nm);
-                        if (p && Z_TYPE_P(p) != IS_UNDEF) nprops++;
-                    }
-                } ZEND_HASH_FOREACH_END();
+                /* Single pass: each __sleep name costs one properties_info
+                 * lookup (not two), and the skip rules live in exactly one
+                 * place so a count/emit drift is impossible by construction.
+                 * nprops is back-patched once the loop knows the live count. */
                 smart_str_appendc(body, TAG_OBJECT);
                 varint_write_u64(body, class_idx);
-                varint_write_u64(body, nprops);
+                size_t nprops_off = ZSTR_LEN(body->s);
+                smart_str_appendc(body, 0);  /* placeholder, patched below */
+                uint32_t nprops = 0;
+                zval *zv_name;
                 ZEND_HASH_FOREACH_VAL(names_ht, zv_name) {
                     if (Z_TYPE_P(zv_name) != IS_STRING) continue;
                     zend_string *nm = Z_STR_P(zv_name);
@@ -882,7 +892,9 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     }
                     varint_write_u64(body, enc_intern_zstr(e, key));
                     encode_value(body, e, p);
+                    nprops++;
                 } ZEND_HASH_FOREACH_END();
+                enc_patch_nprops(body, nprops_off, nprops);
                 zval_ptr_dtor(&names_zv);
                 return;
             }
@@ -914,16 +926,11 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
 #endif
                 ) {
                 int pc = ce->default_properties_count;
-                uint32_t fp_nprops = 0;
-                for (int pi = 0; pi < pc; pi++) {
-                    zend_property_info *info = ce->properties_info_table[pi];
-                    if (info == NULL) continue;
-                    if (Z_TYPE_P(OBJ_PROP(obj, info->offset)) == IS_UNDEF) continue;
-                    fp_nprops++;
-                }
                 smart_str_appendc(body, TAG_OBJECT);
                 varint_write_u64(body, class_idx);
-                varint_write_u64(body, fp_nprops);
+                size_t nprops_off = ZSTR_LEN(body->s);
+                smart_str_appendc(body, 0);  /* placeholder, patched below */
+                uint32_t fp_nprops = 0;
                 for (int pi = 0; pi < pc; pi++) {
                     zend_property_info *info = ce->properties_info_table[pi];
                     if (info == NULL) continue;
@@ -931,26 +938,19 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     if (Z_TYPE_P(p) == IS_UNDEF) continue;
                     varint_write_u64(body, enc_intern_zstr(e, info->name));
                     encode_value(body, e, p);
+                    fp_nprops++;
                 }
+                enc_patch_nprops(body, nprops_off, fp_nprops);
                 return;
             }
             HashTable *props = obj->handlers->get_properties(obj);
-            /* Two passes: count live entries for nprops, then emit. The
-             * wire format needs an accurate count before the bucket values,
-             * and enc_obj_prop_val keeps the skip rules identical across
-             * both passes (see its comment for the IS_INDIRECT / IS_UNDEF
-             * handling). */
-            uint32_t nprops = 0;
-            if (props) {
-                Bucket *b = props->arData;
-                Bucket *end = b + props->nNumUsed;
-                for (; b < end; b++) {
-                    if (enc_obj_prop_val(b)) nprops++;
-                }
-            }
+            /* Single bucket walk; nprops back-patched after the loop. See
+             * enc_obj_prop_val for the IS_INDIRECT / IS_UNDEF skip rules. */
             smart_str_appendc(body, TAG_OBJECT);
             varint_write_u64(body, class_idx);
-            varint_write_u64(body, nprops);
+            size_t nprops_off = ZSTR_LEN(body->s);
+            smart_str_appendc(body, 0);  /* placeholder, patched below */
+            uint32_t nprops = 0;
             if (props) {
                 Bucket *b = props->arData;
                 Bucket *end = b + props->nNumUsed;
@@ -959,8 +959,10 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     if (!v) continue;
                     varint_write_u64(body, enc_intern_zstr(e, b->key));
                     encode_value(body, e, v);
+                    nprops++;
                 }
             }
+            enc_patch_nprops(body, nprops_off, nprops);
             return;
         }
         default:
