@@ -1423,8 +1423,17 @@ static int decode_header(decode_ctx *d) {
         uint64_t slen;
         if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
         if (slen > UINT32_MAX || d->pos + slen > d->len) return -1;
-        d->dict[i] = zend_string_init((const char *)(d->buf + d->pos), (size_t)slen, 0);
-        zend_string_hash_val(d->dict[i]);  /* warms the cached hash on the zend_string */
+        /* Resolve against the engine's interned-string tables first. Dict
+         * entries are dominated by property names, class names, and hot
+         * literals — all interned in any compiled-code process. A hit means:
+         * no allocation, no refcount traffic on any later ZVAL_STR_COPY of
+         * this slot (interned strings skip addref/release), and
+         * pointer-equality fast paths inside every hash lookup that uses it
+         * (class table, properties_info, assoc inserts). A miss falls back
+         * to a regular refcounted string. Both paths return with ZSTR_H
+         * already set, so no separate hash warm is needed. */
+        d->dict[i] = zend_string_init_existing_interned(
+            (const char *)(d->buf + d->pos), (size_t)slen, 0);
         d->pos += slen;
     }
     return 0;

@@ -11,6 +11,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - PHP 8.2 support (lowered the minimum from 8.3).
 
+### Changed
+
+- Decode resolves dictionary strings against the engine's interned-string
+  table; interned hits skip the per-slot allocation and all refcount traffic.
+  Rowset decode ~9%, DTO decode ~11-14% faster (arm64, median of 12).
+
 ### Fixed
 
 - `allowed_classes` options carrying PHP references now behave like native
