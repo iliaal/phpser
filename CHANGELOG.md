@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   via `ce->properties_info` instead of materializing each object's
   properties HashTable; DTO decode a further ~22-25% faster, and decoded
   objects no longer carry the materialized table.
+- Typed-string run encode fuses the eligibility scan with emission (one
+  intern-cache probe per element instead of two); rowset encode ~6% faster,
+  wire bytes unchanged.
 
 ### Fixed
 

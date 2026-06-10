@@ -970,22 +970,14 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
     }
 }
 
-/* Homogeneity scan over a dense packed array. Determines whether we can use
- * a typed-run tag (PACKED_LONGS / PACKED_DOUBLES / PACKED_STRINGS) that skips
- * per-element tag emission and lets the decoder use a single tight loop.
- *
- * For PACKED_STRINGS we additionally require every element to already be
- * dict-bound — otherwise we'd lose the inline-singleton optimization. The
- * common rowset case where the same `['a','b','c']` tags array appears in
- * every row hits this fast path from row 2 onward (after the upgrade
- * during row 1's PACKED_MIXED traversal). */
-static uint8_t detect_packed_run(encode_ctx *e, HashTable *ht, uint32_t n_used) {
-    if (n_used == 0) return TAG_PACKED_MIXED;
+/* Homogeneity scan for the numeric typed-run tags (PACKED_LONGS /
+ * PACKED_DOUBLES). Strings don't go through here — the PACKED_STRINGS
+ * decision needs a per-element intern-cache probe anyway, so its scan is
+ * fused with the emission loop in encode_hashtable (probe once, emit
+ * optimistically, roll back the partial run on the first non-conforming
+ * element). */
+static uint8_t detect_packed_run(HashTable *ht, uint32_t n_used) {
     zval *zp = ht->arPacked;
-    /* One pass per candidate type. The string case folds the homogeneity
-     * check and the dict-membership check into a single walk — previously a
-     * type-homogeneity pass followed by a separate dict pass — so a
-     * PACKED_STRINGS-eligible array is scanned once here instead of twice. */
     switch (Z_TYPE(zp[0])) {
         case IS_LONG:
             for (uint32_t i = 1; i < n_used; i++) {
@@ -997,13 +989,6 @@ static uint8_t detect_packed_run(encode_ctx *e, HashTable *ht, uint32_t n_used) 
                 if (Z_TYPE(zp[i]) != IS_DOUBLE) return TAG_PACKED_MIXED;
             }
             return TAG_PACKED_DOUBLES;
-        case IS_STRING:
-            for (uint32_t i = 0; i < n_used; i++) {
-                if (Z_TYPE(zp[i]) != IS_STRING) return TAG_PACKED_MIXED;
-                intern_slot *s = enc_cache_find(e, Z_STR(zp[i]));
-                if (!s || !SLOT_IS_DICT(*s)) return TAG_PACKED_MIXED;
-            }
-            return TAG_PACKED_STRINGS;
         default:
             return TAG_PACKED_MIXED;
     }
@@ -1015,11 +1000,52 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
     int is_packed = HT_IS_PACKED(ht);
 
     if (is_packed && n_used == n_elems && n_used > 0) {
-        /* Dense packed — try to use a typed-run tag. */
-        uint8_t tag = detect_packed_run(e, ht, n_used);
+        zval *zp = ht->arPacked;
+        if (Z_TYPE(zp[0]) == IS_STRING) {
+            /* Optimistic single-pass PACKED_STRINGS. Every element must be a
+             * string that is already dict-bound (first-encounter strings stay
+             * inline-eligible, so a run of singletons falls through to
+             * PACKED_MIXED — same rule the old two-pass scan enforced). The
+             * scan IS the emission: probe the intern cache once per element
+             * and write the dict index straight out. On the first element
+             * that disqualifies the run, rewrite the tag byte in place and
+             * truncate the partial index run — the element count is the same
+             * for both tags, so only the tag byte and the run bytes differ.
+             * Nothing else appends to body inside the loop, so the cached
+             * base pointer stays valid and the rollback offsets are exact.
+             * The common rowset case where the same ['a','b','c'] tags array
+             * repeats per row qualifies from row 2 onward (after row 1's
+             * PACKED_MIXED traversal upgrades the strings into the dict). */
+            size_t tag_off = body->s ? ZSTR_LEN(body->s) : 0;
+            smart_str_appendc(body, TAG_PACKED_STRINGS);
+            varint_write_u64(body, n_elems);
+            smart_str_alloc(body, (size_t)n_used * VARINT_MAX_BYTES, 0);
+            char *base = ZSTR_VAL(body->s);
+            size_t pos = ZSTR_LEN(body->s);
+            const size_t run_start = pos;
+            for (uint32_t i = 0; i < n_used; i++) {
+                intern_slot *s;
+                if (Z_TYPE(zp[i]) != IS_STRING
+                    || (s = enc_cache_find(e, Z_STR(zp[i]))) == NULL
+                    || !SLOT_IS_DICT(*s)) {
+                    ZSTR_VAL(body->s)[tag_off] = (char)TAG_PACKED_MIXED;
+                    ZSTR_LEN(body->s) = run_start;
+                    for (uint32_t j = 0; j < n_used; j++) {
+                        encode_value(body, e, &zp[j]);
+                    }
+                    return;
+                }
+                uint64_t v = SLOT_DICT_IDX(*s);
+                while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
+                base[pos++] = (char)v;
+            }
+            ZSTR_LEN(body->s) = pos;
+            return;
+        }
+        /* Dense packed, non-string lead — try a numeric typed-run tag. */
+        uint8_t tag = detect_packed_run(ht, n_used);
         smart_str_appendc(body, tag);
         varint_write_u64(body, n_elems);
-        zval *zp = ht->arPacked;
         if (tag == TAG_PACKED_LONGS) {
             /* Reserve the whole run's worst case once, then write raw —
              * collapses n_used per-element capacity checks to one. Nothing
@@ -1046,23 +1072,6 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
 #else
                 memcpy(base + pos, &dv, 8); pos += 8;
 #endif
-            }
-            ZSTR_LEN(body->s) = pos;
-        } else if (tag == TAG_PACKED_STRINGS) {
-            /* detect_packed_run already proved every element is ring-resident
-             * and dict-bound, so read the dict idx straight from the cache
-             * slot instead of re-walking enc_intern_zstr. enc_cache_find is a
-             * lookup (no ring mutation), so the slots stay valid across the
-             * loop; nothing appends to body either, so base stays put. */
-            smart_str_alloc(body, (size_t)n_used * VARINT_MAX_BYTES, 0);
-            char *base = ZSTR_VAL(body->s);
-            size_t pos = ZSTR_LEN(body->s);
-            for (uint32_t i = 0; i < n_used; i++) {
-                intern_slot *s = enc_cache_find(e, Z_STR(zp[i]));
-                ZEND_ASSERT(s && SLOT_IS_DICT(*s));  /* detect_packed_run's contract */
-                uint64_t v = SLOT_DICT_IDX(*s);
-                while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
-                base[pos++] = (char)v;
             }
             ZSTR_LEN(body->s) = pos;
         } else {
