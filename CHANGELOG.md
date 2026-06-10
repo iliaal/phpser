@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Decode resolves dictionary strings against the engine's interned-string
   table; interned hits skip the per-slot allocation and all refcount traffic.
   Rowset decode ~9%, DTO decode ~11-14% faster (arm64, median of 12).
+- Object decode installs declared properties straight into property slots
+  via `ce->properties_info` instead of materializing each object's
+  properties HashTable; DTO decode a further ~22-25% faster, and decoded
+  objects no longer carry the materialized table.
 
 ### Fixed
 

@@ -1356,6 +1356,51 @@ static int dec_install_prop(zend_object *obj, HashTable *obj_props,
     return 0;
 }
 
+/* Resolve a wire property key to its declared-property info when — and only
+ * when — writing OBJ_PROP(obj, info->offset) directly is equivalent to the
+ * materialized-HT install path (dec_install_prop on the IS_INDIRECT entry
+ * that rebuild_object_properties would have created). Returns NULL for every
+ * case that must take the fallback: dynamic props (no declared entry),
+ * statics and virtual/hooked props (no per-object slot, so rebuild skips
+ * them and the fallback turns them into dynamic props), and mangled-name
+ * mismatches (a plain key naming a private/protected prop, or a
+ * parent-private mangled key that the child's properties_info doesn't own —
+ * the materialized HT resolves those by mangled key, so the fallback must
+ * decide).
+ *
+ * ce->properties_info is keyed by the PLAIN name; info->name carries the
+ * mangled form for private/protected. The wire carries info->name. So plain
+ * keys look up directly and mangled keys unmangle first; both then verify
+ * info->name equals the wire key byte-for-byte (pointer-equal in the common
+ * interned case) before the slot write is allowed. */
+static zend_always_inline zend_property_info *dec_prop_info_for_key(
+    zend_class_entry *ce, zend_string *key)
+{
+    zend_property_info *info;
+    if (EXPECTED(ZSTR_LEN(key) > 0 && ZSTR_VAL(key)[0] != '\0')) {
+        info = zend_hash_find_ptr(&ce->properties_info, key);
+        if (!info) return NULL;
+        if (UNEXPECTED(!zend_string_equals(info->name, key))) return NULL;
+    } else {
+        const char *cls_name, *prop_name;
+        size_t prop_len;
+        if (zend_unmangle_property_name_ex(key, &cls_name, &prop_name,
+                                           &prop_len) != SUCCESS) {
+            return NULL;
+        }
+        info = zend_hash_str_find_ptr(&ce->properties_info, prop_name, prop_len);
+        if (!info) return NULL;
+        if (!zend_string_equals(info->name, key)) return NULL;
+    }
+    if (UNEXPECTED(info->flags & ZEND_ACC_STATIC)) return NULL;
+#if PHP_VERSION_ID >= 80400
+    if (UNEXPECTED(info->offset == (uint32_t)ZEND_VIRTUAL_PROPERTY_OFFSET)) {
+        return NULL;
+    }
+#endif
+    return info;
+}
+
 /* Apply a data array (from __serialize) to an object's properties when
  * __unserialize is unavailable. Matches PHP's native fallback: each
  * string key becomes a property write (typed or dynamic), int keys
@@ -1951,15 +1996,29 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 return 0;
             }
 
-            /* Mirror PHP's var_unserializer property installation. The
-             * standard library bypasses write_property (which rejects
-             * NUL-prefixed mangled names) and zend_get_property_info
-             * (which would enforce visibility scope on private props).
-             * Instead it looks up the mangled key directly in the object's
-             * properties HT — declared props show up as IS_INDIRECT entries
-             * pointing into properties_table, and we write straight into
-             * that slot. Dynamic props fall through to zend_hash_update. */
-            HashTable *obj_props = zend_std_get_properties(obj);
+            /* Mirror PHP's var_unserializer property installation semantics
+             * (bypass write_property and visibility scope; typed-slot
+             * verification on declared props; overwrite semantics on dynamic
+             * props) — but resolve declared props through ce->properties_info
+             * and write OBJ_PROP slots directly instead of forcing
+             * zend_std_get_properties. The latter runs
+             * rebuild_object_properties on every fresh object: a HashTable
+             * allocation plus one IS_INDIRECT insert per declared property,
+             * all of it thrown away work when every wire key resolves to a
+             * declared slot (the same-class DTO batch shape this decoder
+             * targets). Skipping it also leaves the decoded object without a
+             * lingering materialized properties table — same memory profile
+             * as a natively-constructed object. The class's properties_info
+             * is shared across the batch, so those lookups stay cache-hot.
+             *
+             * The materialized path remains the fallback for anything
+             * dec_prop_info_for_key can't prove slot-equivalent (dynamic
+             * props, statics, virtual props, shadowed privates) and for
+             * classes with a custom get_properties handler. */
+            HashTable *obj_props = NULL;
+            if (UNEXPECTED(obj->handlers->get_properties != zend_std_get_properties)) {
+                obj_props = zend_std_get_properties(obj);
+            }
 
             for (uint64_t i = 0; i < nprops; i++) {
                 uint64_t key_idx;
@@ -1968,6 +2027,37 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 if (!key) goto obj_fail;
                 zval tmp;
                 if (decode_value(d, &tmp) < 0) goto obj_fail;
+                if (EXPECTED(obj_props == NULL)) {
+                    zend_property_info *info = dec_prop_info_for_key(ce, key);
+                    if (EXPECTED(info != NULL)) {
+                        zval *slot = OBJ_PROP(obj, info->offset);
+                        if (ZEND_TYPE_IS_SET(info->type)) {
+                            if (!zend_verify_prop_assignable_by_ref(
+                                    info, &tmp, /*strict*/ 1)) {
+                                zval_ptr_dtor(&tmp);
+                                goto obj_fail;
+                            }
+                            if (Z_ISREF_P(slot)) {
+                                ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
+                            }
+                            zval_ptr_dtor(slot);
+                            ZVAL_COPY_VALUE(slot, &tmp);
+                            if (Z_ISREF_P(slot)) {
+                                ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
+                            }
+                        } else {
+                            zval_ptr_dtor(slot);
+                            ZVAL_COPY_VALUE(slot, &tmp);
+                        }
+                        continue;
+                    }
+                    /* Dynamic or otherwise non-slot key: materialize once
+                     * and stay in materialized mode — this and every later
+                     * key goes through dec_install_prop, which resolves
+                     * declared props via the HT's IS_INDIRECT entries
+                     * (identical slot writes, just through the table). */
+                    obj_props = zend_std_get_properties(obj);
+                }
                 /* dec_install_prop mirrors var_unserializer.re:608-708:
                  * IS_INDIRECT slots get typed-property verification, dynamic
                  * props go through zend_hash_update with overwrite semantics.
