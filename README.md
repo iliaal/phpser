@@ -118,46 +118,46 @@ model.
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → **4771** (**+4.4%**) | 9.6k → **7.9k** ns (**-18%**) | 11k → 11k ns (~parity) |
-| rowset_1000 | 47K → 48K (**+1.1%**) | 153k → **72k** ns (**-53%**) | 104k → 108k ns (+4%) |
-| packed_1k | 5495 → **1941** (**-65%**) | 4.4k → **1.5k** ns (**-67%**) | 7.0k → **1.8k** ns (**-75%**) |
-| packed_10k | 60K → **22K** (**-63%**) | 44k → **13k** ns (**-70%**) | 73k → **19k** ns (**-74%**) |
-| deep_50 | 419 → 424 (parity) | 1.3k → **0.63k** ns (**-52%**) | 1.8k → **1.6k** ns (**-11%**) |
-| dto_100 | 7083 → **6362** (**-10%**) | 16k → **13k** ns (**-14%**) | 27k → **23k** ns (**-15%**) |
-| dto_1000 | 73K → **65K** (**-12%**) | 186k → **160k** ns (**-14%**) | 272k → **227k** ns (**-16%**) |
-| dto_mixed | 22K → **18K** (**-17%**) | 59k → **40k** ns (**-32%**) | 111k → **79k** ns (**-29%**) |
+| rowset_100 | 4570 → **4771** (**+4.4%**) | 10.2k → **7.5k** ns (**-27%**) | 11.2k → 11.1k ns (~parity) |
+| rowset_1000 | 47K → 48K (**+1.1%**) | 170k → **77k** ns (**-55%**) | 108k → 110k ns (+2%) |
+| packed_1k | 5495 → **1941** (**-65%**) | 4.5k → **1.2k** ns (**-73%**) | 7.4k → **1.8k** ns (**-76%**) |
+| packed_10k | 60K → **22K** (**-63%**) | 46k → **12k** ns (**-73%**) | 76k → **19k** ns (**-75%**) |
+| deep_50 | 419 → 424 (parity) | 1.4k → **0.73k** ns (**-48%**) | 1.9k → **1.6k** ns (**-16%**) |
+| dto_100 | 7083 → **6362** (**-10%**) | 17k → **13k** ns (**-24%**) | 29k → **18k** ns (**-40%**) |
+| dto_1000 | 73K → **65K** (**-12%**) | 204k → **172k** ns (**-16%**) | 297k → **175k** ns (**-41%**) |
+| dto_mixed | 22K → **18K** (**-17%**) | 63k → **43k** ns (**-31%**) | 123k → **61k** ns (**-51%**) |
 
 phpser is faster to encode than igbinary on **every** shape in the
-suite (−14% to −70%) while staying decoder-first. Packed numerics:
-~65% smaller, ~70% faster encode, ~75% faster decode. Deep-nested:
-~52% faster encode at parity size. **Rowsets encode 18-53% faster**,
-size within ~1%; rowset decode pays a small (~4%) tax for the
-front-loaded dict-header walk. DTO workloads (Laravel-queue-style
-payloads, single-class arrays): **10-17% smaller, 15-29% faster
-decode, 14-32% faster encode** vs igbinary — dict dedup on prop
-names, the class-entry lookup cache that amortizes
-`zend_lookup_class_ex` across same-typed batches, and an O(1)
+suite (−16% to −73%) while staying decoder-first. Packed numerics:
+~65% smaller, ~73% faster encode, ~75% faster decode. Deep-nested:
+~48% faster encode at parity size. **Rowsets encode 27-55% faster**,
+size within ~1%, decode at parity on x86 and 8-9% faster on arm64.
+DTO workloads (Laravel-queue-style payloads, single-class arrays):
+**10-17% smaller, 40-51% faster decode, 16-31% faster encode** vs
+igbinary — dict dedup on prop names, the class-entry lookup cache that
+amortizes `zend_lookup_class_ex` across same-typed batches, an O(1)
 pointer-hash intern cache that keeps the per-value dedup lookup off
-the critical path.
+the critical path, dict strings resolved against the engine's
+interned-string table on decode, and declared properties installed
+straight into property slots instead of materializing each object's
+properties HashTable.
 
-The remaining non-wins are small and on the de-prioritized axes:
-rowset size is ~1-4% over igbinary, and `rowset_1000` decode runs ~4%
-slower — the front-loaded dictionary is read once at the head and
-referenced by index, which is exactly what makes the other decodes
-fast (not streamable; you can't have both).
+The remaining non-win is small and on the de-prioritized axis: rowset
+size is ~1-4% over igbinary — the front-loaded dictionary is read once
+at the head and referenced by index, which is exactly what makes the
+decodes fast (not streamable; you can't have both).
 
 Cross-validated on arm64 (aarch64, PHP 8.4.21 NTS, idle, median of 9):
-same direction on every shape — encode −4% to −66%, decode wins on all
-but `rowset_1000` (+4%). The encode margins on object shapes are
-narrower than x86 (dto_100 −4%, dto_mixed −24%) but still ahead.
+decode is faster on every shape including the rowsets (rowset −8/−9%,
+dto −40/−43/−48%, packed −78/−79%, deep −16%); encode −9% to −75%.
 
 For the full four-way picture — phpser vs igbinary vs native `serialize()`
 vs msgpack, with size/encode/decode side by side on every shape — see the
 **[interactive benchmark page](https://iliaal.github.io/phpser/)** (arm64,
 median of 9). Regenerate it with `php ... bench.php --html > docs/index.html`.
-The short version: phpser decodes faster than all three on every shape but
-the rowsets, and the object (`dto_*`) decode that msgpack is slowest at is
-exactly the Laravel-queue workload phpser targets.
+The short version: phpser decodes faster than all three on every shape,
+and the object (`dto_*`) decode that msgpack is slowest at is exactly
+the Laravel-queue workload phpser targets.
 
 ## Design highlights
 
@@ -200,9 +200,13 @@ measurable perf to take, and that this project targets, are:
    miss instead of a linear scan — the change that put encode ahead of
    igbinary on every shape. Skips the byte-hash entirely on hits.
    **Shipped.**
-4. **Eager dict materialization with warm hashes.** All dict zend_strings
-   allocated up front during header parse and their hashes pre-computed.
-   `zend_hash_add_new` reuses the cached hash. **Shipped.**
+4. **Eager dict materialization with warm hashes.** All dict slots are
+   resolved up front during header parse, against the engine's
+   interned-string table first — property names, class names, and hot
+   literals come back as the engine's own interned strings (no
+   allocation, no refcount traffic, pointer-equality hash lookups) —
+   with a regular allocation as the fallback. Hashes are set on both
+   paths; `zend_hash_add_new` reuses the cached hash. **Shipped.**
 5. **Provenance-gated `add_new` on assoc decode.** The default
    (unsigned) path uses `zend_hash_update`: it's the security boundary, and
    adversarial payloads with duplicate keys must collapse to last-write-wins
