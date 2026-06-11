@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-11
+
 ### Added
 
 - PHP 8.2 support (lowered the minimum from 8.3).
@@ -26,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Object encode emits properties in a single pass with a back-patched
   count instead of a count walk plus an emit walk; DTO encode ~4% faster,
   wire bytes unchanged.
+- Packed-array encode (numeric, double, and typed-string runs) now reserves
+  the whole run's worst-case output capacity once, then writes elements raw,
+  instead of running a `smart_str` capacity check per element. On small
+  numeric arrays — where that per-element check was a large fraction of the
+  total work — this cuts encode time ~26% (`packed_1k`); rowsets, whose
+  tag-arrays travel the typed-string run, encode ~2% faster. The mixed-run
+  path is unchanged (its recursion can reallocate the buffer mid-loop). Wire
+  format and decode output are identical.
+- The typed-string packed run now reads each element's dictionary index
+  straight from the intern-cache slot rather than re-walking the intern
+  path, which `detect_packed_run` has already shown is unnecessary (every
+  element is proven dict-bound before the run is chosen). Rowset encode is
+  a further ~5-6% faster on top of the reserve-once change. Decode and wire
+  bytes unchanged.
 
 ### Fixed
 
@@ -50,23 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no longer leaks the decoded object graph. The session decode handler now
   receives a cleared result on this error path, restoring the decoder's
   documented "result is null on failure" contract.
-
-### Changed
-
-- Packed-array encode (numeric, double, and typed-string runs) now reserves
-  the whole run's worst-case output capacity once, then writes elements raw,
-  instead of running a `smart_str` capacity check per element. On small
-  numeric arrays — where that per-element check was a large fraction of the
-  total work — this cuts encode time ~26% (`packed_1k`); rowsets, whose
-  tag-arrays travel the typed-string run, encode ~2% faster. The mixed-run
-  path is unchanged (its recursion can reallocate the buffer mid-loop). Wire
-  format and decode output are identical.
-- The typed-string packed run now reads each element's dictionary index
-  straight from the intern-cache slot rather than re-walking the intern
-  path, which `detect_packed_run` has already shown is unnecessary (every
-  element is proven dict-bound before the run is chosen). Rowset encode is
-  a further ~5-6% faster on top of the reserve-once change. Decode and wire
-  bytes unchanged.
 
 ## [0.1.2] - 2026-06-02
 
@@ -171,7 +170,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.1.2...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.2.0...HEAD
+[0.2.0]: https://github.com/iliaal/phpser/releases/tag/0.2.0
 [0.1.2]: https://github.com/iliaal/phpser/releases/tag/0.1.2
 [0.1.1]: https://github.com/iliaal/phpser/releases/tag/0.1.1
 [0.1.0]: https://github.com/iliaal/phpser/releases/tag/0.1.0
