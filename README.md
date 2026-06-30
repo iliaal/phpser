@@ -18,7 +18,7 @@ phpser is decoder-optimized. Pointer-equality dict intern, refcount-reuse of zen
 
 phpser is now also faster to **encode** than igbinary on every shape in the suite (−14% to −70%), so it's no longer just a read-path win. The remaining non-wins are small and on the de-prioritized axes: rowset size runs ~1-4% over igbinary, and `rowset_1000` decode ~4% slower (the front-loaded dictionary trades streamability for decode speed everywhere else). The bench table below has the full shape-by-shape breakdown.
 
-📖 **The design writeup:** [phpser: a fast, secure binary serializer for PHP cache workloads](https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads) — what the decoder does differently and why decode time is the metric to optimize. The [interactive benchmark page](https://iliaal.github.io/phpser/) compares phpser against igbinary, native `serialize()`, and msgpack across every cache shape.
+📖 **The design writeup:** [phpser: a fast, secure binary serializer for PHP cache workloads](https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads), on what the decoder does differently and why decode time is the metric to optimize. The [interactive benchmark page](https://iliaal.github.io/phpser/) compares phpser against igbinary, native `serialize()`, and msgpack across every cache shape.
 
 ## Install
 
@@ -110,7 +110,7 @@ model.
 
 ## ✨ Features
 
-- **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder. An empty key is rejected on both sides — a keyless HMAC is forgeable, so callers must supply real key material.
+- **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder. An empty key is rejected on both sides. A keyless HMAC is forgeable, so callers must supply real key material.
 - **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode (encode throws, decode returns `null`), and assoc decode uses `zend_hash_update` so duplicate-key payloads collapse to last-write-wins rather than phantom buckets.
 - **PHP 8.2+ (8.3, 8.4, 8.5, master).** BSD 3-Clause.
 
@@ -134,7 +134,7 @@ suite (−16% to −73%) while staying decoder-first. Packed numerics:
 size within ~1%, decode at parity on x86 and 8-9% faster on arm64.
 DTO workloads (Laravel-queue-style payloads, single-class arrays):
 **10-17% smaller, 40-51% faster decode, 16-31% faster encode** vs
-igbinary — dict dedup on prop names, the class-entry lookup cache that
+igbinary: dict dedup on prop names, the class-entry lookup cache that
 amortizes `zend_lookup_class_ex` across same-typed batches, an O(1)
 pointer-hash intern cache that keeps the per-value dedup lookup off
 the critical path, dict strings resolved against the engine's
@@ -143,7 +143,7 @@ straight into property slots instead of materializing each object's
 properties HashTable.
 
 The remaining non-win is small and on the de-prioritized axis: rowset
-size is ~1-4% over igbinary — the front-loaded dictionary is read once
+size is ~1-4% over igbinary; the front-loaded dictionary is read once
 at the head and referenced by index, which is exactly what makes the
 decodes fast (not streamable; you can't have both).
 
@@ -151,8 +151,8 @@ Cross-validated on arm64 (aarch64, PHP 8.4.21 NTS, idle, median of 9):
 decode is faster on every shape including the rowsets (rowset −8/−9%,
 dto −40/−43/−48%, packed −78/−79%, deep −16%); encode −9% to −75%.
 
-For the full four-way picture — phpser vs igbinary vs native `serialize()`
-vs msgpack, with size/encode/decode side by side on every shape — see the
+For the full four-way picture, phpser vs igbinary vs native `serialize()`
+vs msgpack, with size/encode/decode side by side on every shape, see the
 **[interactive benchmark page](https://iliaal.github.io/phpser/)** (arm64,
 median of 9). Regenerate it with `php ... bench.php --html > docs/index.html`.
 The short version: phpser decodes faster than all three on every shape,
@@ -197,14 +197,14 @@ measurable perf to take, and that this project targets, are:
    hash, grown without eviction. Hit rate near 100% on rowset shapes (PHP
    interns literals; the same `"id"` zend_string pointer flows through
    every row), and unique value strings (names, emails) hit a single-probe
-   miss instead of a linear scan — the change that put encode ahead of
+   miss instead of a linear scan, the change that put encode ahead of
    igbinary on every shape. Skips the byte-hash entirely on hits.
    **Shipped.**
 4. **Eager dict materialization with warm hashes.** All dict slots are
    resolved up front during header parse, against the engine's
-   interned-string table first — property names, class names, and hot
+   interned-string table first. Property names, class names, and hot
    literals come back as the engine's own interned strings (no
-   allocation, no refcount traffic, pointer-equality hash lookups) —
+   allocation, no refcount traffic, pointer-equality hash lookups),
    with a regular allocation as the fallback. Hashes are set on both
    paths; `zend_hash_add_new` reuses the cached hash. **Shipped.**
 5. **Provenance-gated `add_new` on assoc decode.** The default
