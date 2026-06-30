@@ -324,16 +324,19 @@ Varints are LEB128 (unsigned); signed values use zigzag encoding. Tags
 encounter order, so the decoder reconstructs back-refs by counting
 container tags as it parses.
 
-## 🔗 PHP Performance Toolkit
+## 🔗 Native PHP extensions
 
 Companion native PHP extensions:
 
-- [php_excel](https://github.com/iliaal/php_excel): native XLS/XLSX read/write via LibXL
-- [mdparser](https://github.com/iliaal/mdparser): native CommonMark + GitHub Flavored Markdown parser
-- [php_clickhouse](https://github.com/iliaal/php_clickhouse): native ClickHouse client over the binary protocol
-- [fastchart](https://github.com/iliaal/fastchart): 26 chart types in one PHP extension
-- [fastjson](https://github.com/iliaal/fastjson): drop-in faster `ext/json`, backed by yyjson
-- [statgrab](https://github.com/iliaal/statgrab): system statistics wrapper around libstatgrab
+- **[php_excel](https://github.com/iliaal/php_excel)**: native Excel I/O via LibXL. 7-10× faster than PhpSpreadsheet, full XLS/XLSX with formulas, formatting, and styling.
+- **[mdparser](https://github.com/iliaal/mdparser)**: native CommonMark + GFM markdown parser via md4c. 15-30× faster than pure-PHP libraries.
+- **[php_clickhouse](https://github.com/iliaal/php_clickhouse)**: native ClickHouse client speaking the wire protocol directly. Picks up where SeasClick left off.
+- **[pdo_duckdb](https://github.com/iliaal/pdo_duckdb)**: PDO driver for DuckDB, analytical SQL in your PHP stack.
+- **[fastjson](https://github.com/iliaal/fastjson)**: drop-in faster `ext/json`, backed by yyjson. 6× encode, 2.7× decode, 5× validate.
+- **[fast_uuid](https://github.com/iliaal/fast_uuid)**: high-throughput UUID generation (v1/v4/v7), batched CSPRNG and SIMD hex formatter, ramsey-compatible API.
+- **[fastchart](https://github.com/iliaal/fastchart)**: native chart-rendering extension. 38 chart types behind one fluent OO API, SVG-canonical with PNG/JPG/WebP and optional PDF output.
+- **[statgrab](https://github.com/iliaal/statgrab)**: system statistics (CPU, memory, disk, network) via libstatgrab, no parsing /proc by hand.
+- **[phonetic](https://github.com/iliaal/phonetic)**: native phonetic name matching (Double Metaphone, Beider-Morse, Daitch-Mokotoff, NYSIIS, Match Rating), the encoders PHP core lacks.
 
 ---
 
