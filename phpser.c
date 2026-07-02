@@ -258,11 +258,12 @@ static inline double le64_read(const uint8_t *src) {
 
 /* Threshold under which we skip the hash_map check on miss and just emit
  * the string inline (potentially duplicating bytes for a key already in
- * the dict). The intern cache is FIFO-evicted, so on rowset-shape
- * payloads with many unique string values (e.g. 1000 row_X) the prop-key
- * cache slots get evicted once unique values overflow the ring. Without hash_map fallback,
- * the next encounter of the prop key would re-emit it inline, bloating
- * the wire format.
+ * the dict). The pointer-keyed intern cache catches pointer-equal repeats
+ * (interned literals) directly; the hash_map is the content-equality
+ * fallback for strings that repeat by value but not by pointer (distinct
+ * zend_string allocations of the same bytes). Below the threshold that
+ * fallback is skipped: a tiny dict rarely holds a value worth re-finding by
+ * content, so a missed content-hit just re-emits a few bytes inline.
  *
  * Lowered from 32 to 4: above 4 dict entries the hash_map lookup cost
  * (~15 cycles) is comfortably less than the inline-emit cost (~30 cycles
@@ -350,6 +351,13 @@ typedef struct {
      * phpser_encode_zval checks this after the walk and fails loudly rather
      * than handing back a lossy payload. */
     uint8_t depth_exceeded;
+    /* Set when a string/blob length exceeds UINT32_MAX. The decoder caps
+     * every string length at UINT32_MAX (a single value is never that large
+     * in a cache payload, and the cap keeps `pos + slen` from overflowing),
+     * so a >4 GiB string would encode fine but decode to NULL — the same
+     * silent-data-loss failure the depth cap rejects. Fail loud at encode
+     * instead of shipping an undecodable payload. */
+    uint8_t size_exceeded;
 } encode_ctx;
 
 static void enc_ctx_init(encode_ctx *e) {
@@ -366,6 +374,7 @@ static void enc_ctx_init(encode_ctx *e) {
     e->dict_cap = 0;
     e->depth = 0;
     e->depth_exceeded = 0;
+    e->size_exceeded = 0;
 }
 
 static void enc_ctx_destroy(encode_ctx *e) {
@@ -446,7 +455,15 @@ static inline int enc_visit(encode_ctx *e, void *ptr, uint32_t *out_id) {
  * call (the bucket at the end of the probe chain is the one we just
  * inserted into). Encoder dispatch holds this invariant: __serialize /
  * __sleep / ce->serialize run user PHP but that user code can't reach
- * back into our encoder's id-table. */
+ * back into our encoder's id-table (a nested phpser_serialize builds its
+ * own encode_ctx, so its id-table is separate).
+ *
+ * Given that invariant, zeroing the slot (no backward-shift) can't orphan
+ * a live entry: linear-probe insertion stops at the first empty slot, so
+ * no later entry's probe chain passes THROUGH this slot — this slot was
+ * empty until the entry we're removing took it, and nothing was inserted
+ * after. A chain break would require an insert after this entry, which the
+ * no-intervening-visit invariant forbids. */
 static inline void enc_unvisit_last(encode_ctx *e, void *ptr) {
     uintptr_t pp = (uintptr_t)ptr;
     uint32_t h = id_hash(pp) & e->id_mask;
@@ -509,6 +526,7 @@ static inline intern_slot *enc_cache_alloc_slot(encode_ctx *e, zend_string *zs) 
  * (small dicts skip the hash work entirely — pointer-equality via cache
  * already catches the literal-interned case). */
 static uint32_t enc_dict_append(encode_ctx *e, zend_string *zs) {
+    if (UNEXPECTED(ZSTR_LEN(zs) > UINT32_MAX)) e->size_exceeded = 1;
     if (e->dict_len == e->dict_cap) {
         e->dict_cap = e->dict_cap ? e->dict_cap * 2 : 16;
         e->dict = erealloc(e->dict, e->dict_cap * sizeof(zend_string *));
@@ -571,9 +589,13 @@ static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
  *     all subsequent occurrences emit `dict_tag` with the assigned idx.
  *   - For pure-singleton strings (e.g. row_X values in a rowset), we never
  *     hit the upgrade branch — no dict header overhead either.
- *   - Eviction from the 16-slot ring is benign: a later re-encounter of
- *     an evicted INLINE_EMITTED string will inline-emit it a second time.
- *     Decode is still correct; the wire just has the same bytes twice.
+ *   - The intern cache grows without eviction, so a pointer-equal repeat
+ *     always finds its INLINE_EMITTED slot and upgrades to a dict ref. A
+ *     value that repeats by content but not by pointer is caught by the
+ *     hash_map fallback above the threshold; below it, or on a genuine
+ *     miss, the string is simply inline-emitted again. Decode is correct
+ *     either way — a second inline emission is a self-contained value that
+ *     claims no id, so duplicate bytes only cost wire size, never meaning.
  *
  * Values pass (TAG_STR_DICT, TAG_STR_INLINE); assoc keys pass
  * (KEY_STR, KEY_STR_INLINE). The logic is identical; only the tag bytes
@@ -605,6 +627,7 @@ static zend_always_inline void enc_emit_str_tagged(
     }
     /* First encounter: emit inline, mark in cache as INLINE_EMITTED so the
      * next occurrence triggers the upgrade above. */
+    if (UNEXPECTED(ZSTR_LEN(zs) > UINT32_MAX)) e->size_exceeded = 1;
     smart_str_appendc(body, inline_tag);
     varint_write_u64(body, ZSTR_LEN(zs));
     smart_str_appendl(body, ZSTR_VAL(zs), ZSTR_LEN(zs));
@@ -780,6 +803,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     smart_str_appendc(body, TAG_NULL);
                     return;
                 }
+                if (UNEXPECTED(len > UINT32_MAX)) e->size_exceeded = 1;
                 uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
                 emit_tag_and_varint(body, TAG_OBJECT_LEGACY, class_idx);
                 varint_write_u64(body, len);
@@ -833,7 +857,19 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 varint_write_u64(body, case_idx);
                 return;
             }
-            uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
+            /* A re-serialized __PHP_Incomplete_Class (produced by an
+             * allowed_classes filter on a prior decode) must recover its
+             * ORIGINAL class name from the magic member and emit under that,
+             * not the literal "__PHP_Incomplete_Class" — so it can round-trip
+             * back to the real class once that class is available/allowed.
+             * Mirrors native's php_var_serialize_class_name. The magic member
+             * itself is then skipped from the property walk below. */
+            zend_string *ic_name = NULL;
+            if (UNEXPECTED(obj->ce == PHP_IC_ENTRY)) {
+                ic_name = php_lookup_class_name(obj);  /* +1 ref, or NULL */
+            }
+            uint32_t class_idx = enc_intern_zstr(e, ic_name ? ic_name : obj->ce->name);
+            if (ic_name) zend_string_release(ic_name);
             /* __sleep: if defined, the method returns an array of property
              * names to serialize. Unknown / static / IS_UNDEF entries are
              * skipped (matches PHP behavior modulo the warnings PHP emits
@@ -943,7 +979,16 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 enc_patch_nprops(body, nprops_off, fp_nprops);
                 return;
             }
-            HashTable *props = obj->handlers->get_properties(obj);
+            /* zend_get_properties_for (not the raw get_properties handler)
+             * because it GC_TRY_ADDREFs the returned table. A property value's
+             * __serialize/__sleep/ce->serialize hook, or a destructor fired by
+             * a temporary dtor, can run mid-walk and add a dynamic property to
+             * THIS object — which reallocs obj->properties in place. Holding a
+             * ref forces that write to COW-separate instead, leaving the table
+             * we're iterating valid (bucket pointers below stay live). Mirrors
+             * native serialize (ext/standard/var.c). Also handles lazy-object
+             * initialize-on-serialize, which the bare handler skips. */
+            HashTable *props = zend_get_properties_for(v, ZEND_PROP_PURPOSE_SERIALIZE);
             /* Single bucket walk; nprops back-patched after the loop. See
              * enc_obj_prop_val for the IS_INDIRECT / IS_UNDEF skip rules. */
             smart_str_appendc(body, TAG_OBJECT);
@@ -951,18 +996,27 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
             size_t nprops_off = ZSTR_LEN(body->s);
             smart_str_appendc(body, 0);  /* placeholder, patched below */
             uint32_t nprops = 0;
+            /* For an incomplete class, class_idx above already carries the
+             * recovered original name; drop the magic name-carrier member so
+             * the emitted object matches one that was never filtered. */
+            bool skip_magic = UNEXPECTED(obj->ce == PHP_IC_ENTRY);
             if (props) {
                 Bucket *b = props->arData;
                 Bucket *end = b + props->nNumUsed;
                 for (; b < end; b++) {
-                    zval *v = enc_obj_prop_val(b);
-                    if (!v) continue;
+                    zval *pv = enc_obj_prop_val(b);
+                    if (!pv) continue;
+                    if (skip_magic && b->key
+                        && zend_string_equals_literal(b->key, MAGIC_MEMBER)) {
+                        continue;
+                    }
                     varint_write_u64(body, enc_intern_zstr(e, b->key));
-                    encode_value(body, e, v);
+                    encode_value(body, e, pv);
                     nprops++;
                 }
             }
             enc_patch_nprops(body, nprops_off, nprops);
+            zend_release_properties(props);
             return;
         }
         default:
@@ -1963,6 +2017,19 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 return -1;
             }
 
+            /* A legacy Serializable class (C-level ce->serialize) with no
+             * __unserialize is encoded by us as TAG_OBJECT_LEGACY, never as
+             * TAG_OBJECT — so a TAG_OBJECT naming such a class is adversarial
+             * wire. Instantiating it and writing raw properties would bypass
+             * the class's Serializable::unserialize() invariant rebuild.
+             * Native unserialize refuses this exact shape (var_unserializer.re:
+             * "if (ce->serialize != NULL && !has_unserialize) ... return 0").
+             * Only real resolved classes carry ce->serialize; incomplete /
+             * stdClass fallbacks do not, so gate on `allowed`. */
+            if (allowed && ce->serialize != NULL && ce->__unserialize == NULL) {
+                return -1;
+            }
+
             if (object_init_ex(out, ce) != SUCCESS) {
                 ZVAL_NULL(out);
                 return -1;
@@ -2291,6 +2358,18 @@ static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
         if (throw_on_overflow) {
             zend_throw_exception_ex(zend_ce_exception, 0,
                 "phpser: maximum nesting depth (%d) exceeded", MAX_DEPTH);
+        }
+        return NULL;
+    }
+    /* Same fail-loud contract for an over-4GiB string/blob: the decoder's
+     * per-string UINT32_MAX cap would reject the whole payload, so refuse to
+     * emit one rather than hand back undecodable bytes. */
+    if (UNEXPECTED(ctx.size_exceeded)) {
+        smart_str_free(&body);
+        enc_ctx_destroy(&ctx);
+        if (throw_on_overflow) {
+            zend_throw_exception_ex(zend_ce_exception, 0,
+                "phpser: string length exceeds the 4 GiB wire-format limit");
         }
         return NULL;
     }

@@ -70,6 +70,25 @@ $c->n = 11;
 $rt = phpser_unserialize(phpser_serialize($c));
 echo ($rt instanceof C_Magic && $rt->getN() === 11) ? "magic_inherited OK\n" : "magic_inherited FAIL\n";
 
+// --- Re-serializing a filtered __PHP_Incomplete_Class recovers its
+// ORIGINAL class name (from the magic member) and drops the magic member,
+// so it round-trips back to the real class once that class is allowed —
+// matching native serialize(). ---
+class Recoverable { public int $a = 1; public string $s = "z"; }
+$filtered = phpser_unserialize(phpser_serialize(new Recoverable()),
+                               ["allowed_classes" => false]);
+echo ($filtered instanceof __PHP_Incomplete_Class) ? "ic_filtered OK\n" : "ic_filtered FAIL\n";
+$reencoded = phpser_serialize($filtered);
+$back = phpser_unserialize($reencoded);  // Recoverable allowed this time
+echo ($back instanceof Recoverable && $back->a === 1 && $back->s === "z")
+    ? "ic_reencode_recovers OK\n" : "ic_reencode_recovers FAIL\n";
+// The magic name-carrier member must not survive as a real property.
+echo !isset($back->{"__PHP_Incomplete_Class_Name"}) ? "ic_no_magic_leak OK\n" : "ic_no_magic_leak FAIL\n";
+// Parity: native recovers the class the same way.
+$nfiltered = unserialize(serialize(new Recoverable()), ["allowed_classes" => false]);
+$nback = unserialize(serialize($nfiltered));
+echo ($nback instanceof Recoverable) ? "ic_native_parity OK\n" : "ic_native_parity FAIL\n";
+
 ?>
 --EXPECT--
 vanishing_known OK
@@ -78,3 +97,7 @@ enum_known OK
 mangled_known OK
 internal_sub OK
 magic_inherited OK
+ic_filtered OK
+ic_reencode_recovers OK
+ic_no_magic_leak OK
+ic_native_parity OK

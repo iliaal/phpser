@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed use-after-free encoding an object whose property `__serialize`/`__sleep` adds a dynamic property mid-walk; the property table is now ref-held during encode, as native `serialize()` does.
+- Decode rejects a crafted `TAG_OBJECT` naming a legacy `Serializable` class with no `__unserialize`, matching native `unserialize` (raw property writes would bypass the class's `unserialize()`).
+- Re-serializing a filtered `__PHP_Incomplete_Class` now recovers its original class name and drops the magic member, so it round-trips back to the real class once allowed, matching native `serialize()`.
+- Encode throws on a string or blob over 4 GiB instead of emitting a payload the decoder's per-string length cap would reject as undecodable.
+
 ## [0.2.0] - 2026-06-11
 
 ### Added

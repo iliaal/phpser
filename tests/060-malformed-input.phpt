@@ -23,7 +23,14 @@ $malformed_static = [
     "\x01\x00\x06\x05",                  // TAG_ASSOC len=5, no entries
     "\x01\x00\x07\xff\xff\xff\xff\xff",  // TAG_PACKED_MIXED len overflow
     "\x01\x00\x08\xff\xff\xff\xff\xff",  // TAG_PACKED_LONGS len overflow
+    "\x01\x00\x09\xff\xff\xff\xff\xff",  // TAG_PACKED_DOUBLES len overflow
+    "\x01\x00\x09\x02\x00\x00",          // TAG_PACKED_DOUBLES n=2 needs 16 bytes, only 2
+    "\x01\x00\x0b\xff\xff\xff\xff\xff",  // TAG_PACKED_STRINGS len overflow
+    "\x01\x00\x0b\x01\x63",              // TAG_PACKED_STRINGS n=1, dict_idx=99 (dict empty)
+    "\x01\x00\x0b\x02\x00",              // TAG_PACKED_STRINGS n=2, idx-run truncated after one
     "\x01\x00\x0c\x05",                  // TAG_STR_INLINE len=5, no bytes
+    "\x01\x00\x06\x01\x01\x63",          // TAG_ASSOC KEY_STR dict_idx=99 (dict empty)
+    "\x01\x00\x0e\x00\x03",              // TAG_OBJECT_MAGIC class_idx=0 (dict empty) inner non-array
 ];
 
 foreach ($malformed_static as $i => $bytes) {
@@ -46,6 +53,8 @@ $valid_payloads = [
     phpser_serialize(["a" => 1, "b" => "two"]),
     phpser_serialize([[1, 2, 3], [4, 5, 6]]),
     phpser_serialize((object) ["x" => 1, "y" => "q"]),
+    phpser_serialize([1.1, 2.2, 3.3, -0.0, INF]),          // TAG_PACKED_DOUBLES
+    phpser_serialize([["a", "b", "c"], ["a", "b", "c"]]),  // row 2 -> TAG_PACKED_STRINGS
 ];
 
 foreach ($valid_payloads as $bytes) {
@@ -78,6 +87,14 @@ echo "fuzz OK\n";
 enum Suit: string { case Hearts = "H"; const FOO = 1; }
 abstract class AbstractFoo {}
 interface IFoo {}
+// Legacy Serializable (C-level ce->serialize, no __unserialize). Our encoder
+// emits this as TAG_OBJECT_LEGACY; a TAG_OBJECT naming it is adversarial wire.
+// @eval so the compile-time "Serializable is deprecated" notice stays local.
+@eval('class LegacySer implements Serializable {
+    public $x = 1;
+    public function serialize(): string { return \serialize($this->x); }
+    public function unserialize($data): void { $this->x = \unserialize($data); }
+}');
 
 $crafted = [
     // enum tag whose case-name slot is not a case at all
@@ -90,6 +107,9 @@ $crafted = [
     "object_abstract"      => "\x01\x01\x0bAbstractFoo\x0a\x00\x00",
     // object tag naming an interface
     "object_interface"     => "\x01\x01\x04IFoo\x0a\x00\x00",
+    // TAG_OBJECT naming a legacy Serializable class with no __unserialize:
+    // native unserialize refuses this (raw props would bypass unserialize()).
+    "object_serializable"  => "\x01\x01\x09LegacySer\x0a\x00\x00",
 ];
 foreach ($crafted as $name => $bytes) {
     $rt = phpser_unserialize($bytes);
