@@ -49,7 +49,12 @@ $make = function () {
     return $c;
 };
 
-$rt = phpser_unserialize(phpser_serialize($make()));
+// Keep each graph in a variable and cut its C->D->C cycle after use, so the
+// objects free by refcount and don't linger as cyclic garbage for the leak
+// checker (the ASAN lane runs LSAN before the shutdown cycle collector).
+$c1 = $make();
+$rt = phpser_unserialize(phpser_serialize($c1));
+$c1->first->parent = null;
 // The properties that existed before the mutation must survive intact; the
 // dynamic props added during __serialize belong to the COW-separated copy
 // and are (correctly) absent from the point-in-time snapshot — same as native.
@@ -63,7 +68,9 @@ echo $ok ? "encode_reentrancy OK\n" : "encode_reentrancy FAIL\n";
 
 // Parity with native on a fresh instance: neither side captures the
 // mid-serialize additions in the emitted snapshot.
-$nc = unserialize(serialize($make()));
+$c2 = $make();
+$nc = unserialize(serialize($c2));
+$c2->first->parent = null;
 echo (($nc->second ?? null) === "second-value" && !isset($nc->dyn0))
     ? "native_parity OK\n" : "native_parity FAIL\n";
 
@@ -90,8 +97,13 @@ $s = new S_sleep();
 $s->a = new E_grow();
 $s->a->parent = $s;
 $rt = phpser_unserialize(phpser_serialize($s));
+$s->a->parent = null;  // cut the S<->E cycle
 echo (($rt->b ?? null) === "b-value" && ($rt->a->v ?? null) === 2)
     ? "sleep_reentrancy OK\n" : "sleep_reentrancy FAIL\n";
+
+// Belt and suspenders: collect anything cyclic left over so the leak
+// checker sees a clean heap at shutdown.
+gc_collect_cycles();
 
 ?>
 --EXPECT--
