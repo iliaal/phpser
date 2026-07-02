@@ -49,6 +49,8 @@ clean:
 # Run the .phpt test suite via the PHP build's run-tests.php. TEST_PHP_ARGS
 # is what run-tests.php injects into every child PHP process — passing
 # `-d extension=...` to our parent invocation wouldn't propagate.
+.PHONY: clean test
+
 test: $(TARGET)
 	TEST_PHP_EXECUTABLE=$(PHP_SRC)/sapi/cli/php \
 	TEST_PHP_ARGS="-d extension=$(CURDIR)/$(TARGET)" \
@@ -56,5 +58,3 @@ test: $(TARGET)
 	  $(PHP_SRC)/run-tests.php \
 	  -P -q --show-diff \
 	  $(CURDIR)/tests
-
-.PHONY: clean test
