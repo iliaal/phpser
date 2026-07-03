@@ -2709,6 +2709,11 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             if (varint_read_u64(d->buf, d->len, &d->pos, &ncols) < 0) return -1;
             if (ncols > UINT32_MAX || nrows > UINT32_MAX || ncols == 0) return -1;
             if (ncols > (d->len - d->pos) / 2) return -1;
+            /* Each of the nrows×ncols cells is at least one byte on the wire, so
+             * a payload can't describe more rows than the bytes that remain.
+             * Reject before the per-column emalloc(nrows) so a tiny payload
+             * claiming billions of rows can't force a multi-GB allocation. */
+            if (nrows > (d->len - d->pos) / ncols) return -1;
             uint64_t *key_idx = (uint64_t *)safe_emalloc((size_t)ncols, sizeof(uint64_t), 0);
             for (uint64_t i = 0; i < ncols; i++) {
                 if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx[i]) < 0) {
@@ -2743,6 +2748,11 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                     }
                     if (d->trusted) {
                         zend_hash_add_new(row, zs, &cols[ci][r]);
+                        /* Ownership moved into the row. Blank the source so a
+                         * later error-path free (table_fail_rows destroys the
+                         * built rows, then dec_table_free_columns walks every
+                         * cell) can't release this cell a second time. */
+                        ZVAL_UNDEF(&cols[ci][r]);
                     } else {
                         zval tmp;
                         ZVAL_COPY(&tmp, &cols[ci][r]);

@@ -147,6 +147,46 @@ $lead = str_replace("ZZ", "05", $lead);
 $rl = phpser_unserialize($lead);
 echo is_string(array_key_first($rl)) ? "numkey_leadzero_string OK\n" : "numkey_leadzero_string FAIL\n";
 
+// 6. Wire v2 tags (0x12 OBJECT_SLOTS, 0x13 ASSOC_DICT, 0x14 ROWSET,
+//    0x15 TABLE). Header version 0x02; dict ["a"] makes index 0 valid and 99
+//    (0x63) an out-of-range dict reference. Every crafted payload must
+//    fail-fast to NULL — no crash, no read past the buffer.
+$H = "\x02\x01\x01a";
+$v2 = [
+    // OBJECT_SLOTS: class_idx varint missing / names an undefined class
+    "slots_trunc"       => "\x02\x00\x12",
+    "slots_badclass"    => "\x02\x01\x03Foo\x12\x00\x00",
+    // ASSOC_DICT: key idx out of range / count overflow / truncated key run
+    "assocdict_badidx"  => "\x02\x00\x13\x01\x05",
+    "assocdict_novflow" => "\x02\x00\x13\xff\xff\xff\xff\xff",
+    "assocdict_trunc"   => "{$H}\x13\x02\x00",
+    // ROWSET: ncols=0 / column key idx out of range
+    "rowset_ncols0"     => "\x02\x00\x14\x02\x00",
+    "rowset_badidx"     => "\x02\x00\x14\x01\x01\x05",
+    // TABLE: ncols=0 / column key idx out of range (untrusted copy path)
+    "table_ncols0"      => "\x02\x00\x15\x02\x00",
+    "table_badidx"      => "{$H}\x15\x01\x02\x00\x63\x07\x0c\x03xyz\x07\x0c\x03pqr",
+];
+foreach ($v2 as $name => $bytes) {
+    $rt = phpser_unserialize($bytes);
+    if ($rt !== null) echo "$name expected NULL, got " . gettype($rt) . "\n";
+}
+echo "v2 tags OK\n";
+
+// 6a. TAG_TABLE nrows is bounded by the bytes that remain: a 14-byte payload
+//     claiming 2^28 rows must reject, not attempt a multi-GB emalloc(nrows).
+ini_set('memory_limit', '64M');
+$dos = "{$H}\x15\x80\x80\x80\x80\x01\x01\x00\x08\x00"; // nrows=2^28, ncols=1, idx=0, LONGS
+echo (phpser_unserialize($dos) === null) ? "table_nrows_dos OK\n" : "table_nrows_dos FAIL\n";
+
+// 6b. Trusted (signed) TAG_TABLE whose 2nd column index is out of range fails
+//     after column 0's cell was already moved into the row. The error path
+//     must not release that moved cell twice (release-silent; ASAN-detectable).
+$key = "phpser-060-key";
+$body = "{$H}\x15\x01\x02\x00\x63\x07\x0c\x03xyz\x07\x0c\x03pqr"; // nrows=1, ncols=2, idx=[0,99]
+$frame = $body . hash_hmac('sha256', $body, $key, true);
+echo (phpser_unserialize_signed($frame, $key) === null) ? "table_trusted_badidx OK\n" : "table_trusted_badidx FAIL\n";
+
 ?>
 --EXPECT--
 static OK
@@ -156,3 +196,6 @@ crafted OK
 numkey_coerced OK
 numkey_dual_collapse OK
 numkey_leadzero_string OK
+v2 tags OK
+table_nrows_dos OK
+table_trusted_badidx OK
