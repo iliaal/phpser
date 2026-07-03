@@ -318,6 +318,9 @@ value tags:
                        initialized; otherwise keyed OBJECT (0x0a) is used.
   0x13 ASSOC_DICT      varint(n), N×varint(dict_key_idx), N×val  // wire v2 only;
                        assoc with all string keys dict-bound; skips KEY_STR tags.
+  0x14 ROWSET          varint(nrows), varint(ncols), N×varint(dict_key_idx),
+                       nrows×ncols×val  // wire v2 only; packed homogeneous assoc
+                       rows (rowset shape). Schema once, values row-major.
 
 key tags:
   0x00 LONG            varint(zigzag)

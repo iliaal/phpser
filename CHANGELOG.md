@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Wire format v2 (`0x02`) adds `TAG_ROWSET` for packed arrays of homogeneous assoc rows: column key schema once, then row-major values only. Falls back to `TAG_PACKED_MIXED` for single rows or mismatched schemas.
 - Wire format v2 (`0x02`) adds `TAG_ASSOC_DICT` for assoc arrays whose keys are all dict-bound string refs, dropping the per-key `KEY_STR` tag byte. Row 2+ of a rowset qualifies once field names have upgraded into the dictionary.
 - Wire format v2 (`0x02`) adds `TAG_OBJECT_SLOTS` for typed objects whose declared properties are all initialized: values emit in `properties_info_table` order with no per-property key index, and decode installs straight into slots without a `properties_info` hash lookup. Falls back to keyed `TAG_OBJECT` for `__unserialize` classes, uninitialized typed slots, and dynamic props. v1 (`0x01`) payloads still decode.
 - Scalar values in assoc, packed-mixed, and object-property loops decode without the full recursive wrapper; HMAC-authenticated decode skips per-object id-table pins. Rowset and DTO decode ~6-8% faster (median of 51 runs, 2000 iters).

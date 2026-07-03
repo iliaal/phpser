@@ -25,18 +25,20 @@ $data = mk_rowset(5);
 $blob = phpser_serialize($data);
 
 echo ($blob[0] === "\x02") ? "version_v2 OK\n" : "version_v2 FAIL\n";
-echo (strpos($blob, "\x13") !== false) ? "tag_assoc_dict OK\n" : "tag_assoc_dict FAIL\n";
 
 $rt = phpser_unserialize($blob);
 echo (serialize($rt) === serialize($data)) ? "rowset_roundtrip OK\n" : "rowset_roundtrip FAIL\n";
 
-// Dict warms within one serialize: row 1 emits inline keys, row 3+ uses TAG_ASSOC_DICT.
+// Heterogeneous packed rows skip TAG_ROWSET; row 3+ uses TAG_ASSOC_DICT once keys
+// are dict-bound (loop-built rows share interned key pointers).
 $warm = [];
-for ($i = 0; $i < 3; $i++) {
+$warm[] = ['id' => 0, 'name' => 'row_0'];
+$warm[] = ['only' => 1];
+for ($i = 1; $i < 4; $i++) {
     $warm[] = ['id' => $i, 'name' => 'row_' . $i];
 }
 $blob2 = phpser_serialize($warm);
-echo (substr_count($blob2, "\x13") >= 1) ? "warm_assoc_dict OK\n" : "warm_assoc_dict FAIL\n";
+echo (strpos($blob2, "\x13") !== false) ? "tag_assoc_dict OK\n" : "tag_assoc_dict FAIL\n";
 echo (serialize(phpser_unserialize($blob2)) === serialize($warm))
     ? "warm_roundtrip OK\n" : "warm_roundtrip FAIL\n";
 
@@ -50,9 +52,8 @@ echo (phpser_unserialize("\x02\x00\x13\x01\x00") === null) ? "trunc_reject OK\n"
 ?>
 --EXPECT--
 version_v2 OK
-tag_assoc_dict OK
 rowset_roundtrip OK
-warm_assoc_dict OK
+tag_assoc_dict OK
 warm_roundtrip OK
 int_key_stays_assoc OK
 trunc_reject OK

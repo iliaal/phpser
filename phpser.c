@@ -113,6 +113,9 @@
 #define TAG_ASSOC_DICT      0x13   /* varint(n), N×varint(dict_key_idx), N×val — assoc whose keys are
                                       all dict-bound string refs (wire v2). Skips the per-key KEY_STR
                                       tag byte; values use the same decode path as TAG_ASSOC. */
+#define TAG_ROWSET          0x14   /* varint(nrows), varint(ncols), N×varint(dict_key_idx),
+                                      nrows×ncols×val — packed array of homogeneous assoc rows (wire
+                                      v2). Emits the column schema once; each row is values only. */
 
 /* Assoc key tags (one byte before the key's payload). */
 #define KEY_LONG        0x00
@@ -1105,6 +1108,96 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
  * fused with the emission loop in encode_hashtable (probe once, emit
  * optimistically, roll back the partial run on the first non-conforming
  * element). */
+/* Return 1 when every packed element is a non-packed assoc array sharing the
+ * same string-key schema as row 0 (insertion order). Emits TAG_ROWSET. */
+static int enc_try_rowset(smart_str *body, encode_ctx *e, zval *zp, uint32_t n_used) {
+    if (n_used < 2 || Z_TYPE(zp[0]) != IS_ARRAY) {
+        return 0;
+    }
+    HashTable *ht0 = Z_ARRVAL(zp[0]);
+    if (HT_IS_PACKED(ht0) || ht0->nNumOfElements == 0) {
+        return 0;
+    }
+    uint32_t ncols = ht0->nNumOfElements;
+    Bucket *b0 = ht0->arData;
+    Bucket *end0 = b0 + ht0->nNumUsed;
+
+    uint32_t *key_idx = (uint32_t *)safe_emalloc((size_t)ncols, sizeof(uint32_t), 0);
+    uint32_t col = 0;
+    for (Bucket *b = b0; b < end0; b++) {
+        if (Z_TYPE(b->val) == IS_UNDEF) continue;
+        if (!b->key) {
+            efree(key_idx);
+            return 0;
+        }
+        key_idx[col++] = enc_intern_zstr(e, b->key);
+    }
+    if (col != ncols) {
+        efree(key_idx);
+        return 0;
+    }
+
+    for (uint32_t r = 1; r < n_used; r++) {
+        if (Z_TYPE(zp[r]) != IS_ARRAY) {
+            efree(key_idx);
+            return 0;
+        }
+        HashTable *ht = Z_ARRVAL(zp[r]);
+        if (HT_IS_PACKED(ht) || ht->nNumOfElements != ncols) {
+            efree(key_idx);
+            return 0;
+        }
+        Bucket *b = ht->arData;
+        Bucket *end = b + ht->nNumUsed;
+        Bucket *ref = b0;
+        uint32_t matched = 0;
+        for (; b < end; b++) {
+            if (Z_TYPE(b->val) == IS_UNDEF) continue;
+            while (ref < end0 && Z_TYPE(ref->val) == IS_UNDEF) ref++;
+            if (ref >= end0 || !b->key || !ref->key) {
+                efree(key_idx);
+                return 0;
+            }
+            if (b->key != ref->key && !zend_string_equals(b->key, ref->key)) {
+                efree(key_idx);
+                return 0;
+            }
+            ref++;
+            matched++;
+        }
+        if (matched != ncols) {
+            efree(key_idx);
+            return 0;
+        }
+    }
+
+    e->wire_v2 = 1;
+    smart_str_appendc(body, TAG_ROWSET);
+    varint_write_u64(body, n_used);
+    varint_write_u64(body, ncols);
+    smart_str_alloc(body, (size_t)ncols * VARINT_MAX_BYTES, 0);
+    char *base = ZSTR_VAL(body->s);
+    size_t pos = ZSTR_LEN(body->s);
+    for (uint32_t i = 0; i < ncols; i++) {
+        uint64_t v = key_idx[i];
+        while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
+        base[pos++] = (char)v;
+    }
+    ZSTR_LEN(body->s) = pos;
+    efree(key_idx);
+
+    for (uint32_t r = 0; r < n_used; r++) {
+        HashTable *ht = Z_ARRVAL(zp[r]);
+        Bucket *b = ht->arData;
+        Bucket *end = b + ht->nNumUsed;
+        for (; b < end; b++) {
+            if (Z_TYPE(b->val) == IS_UNDEF) continue;
+            encode_value(body, e, &b->val);
+        }
+    }
+    return 1;
+}
+
 static uint8_t detect_packed_run(HashTable *ht, uint32_t n_used) {
     zval *zp = ht->arPacked;
     switch (Z_TYPE(zp[0])) {
@@ -1173,6 +1266,9 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
         }
         /* Dense packed, non-string lead — try a numeric typed-run tag. */
         uint8_t tag = detect_packed_run(ht, n_used);
+        if (tag == TAG_PACKED_MIXED && enc_try_rowset(body, e, zp, n_used)) {
+            return;
+        }
         smart_str_appendc(body, tag);
         varint_write_u64(body, n_elems);
         if (tag == TAG_PACKED_LONGS) {
@@ -2401,6 +2497,61 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 dec_defer_wakeup(d, obj);
             }
             return 0;
+        }
+        case TAG_ROWSET: {
+            uint64_t nrows, ncols;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &nrows) < 0) return -1;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &ncols) < 0) return -1;
+            if (ncols > UINT32_MAX || nrows > UINT32_MAX || ncols == 0) return -1;
+            /* Schema indices + at least one byte per value cell. */
+            if (ncols > (d->len - d->pos) / 2
+                || nrows > (d->len - d->pos) / ncols) {
+                return -1;
+            }
+            uint64_t *key_idx = (uint64_t *)safe_emalloc((size_t)ncols, sizeof(uint64_t), 0);
+            for (uint64_t i = 0; i < ncols; i++) {
+                if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx[i]) < 0) {
+                    efree(key_idx);
+                    return -1;
+                }
+            }
+            zend_array *outer = zend_new_array((uint32_t)nrows);
+            zend_hash_real_init_packed(outer);
+            uint64_t r;
+            for (r = 0; r < nrows; r++) {
+                zend_array *row = zend_new_array((uint32_t)ncols);
+                for (uint64_t c = 0; c < ncols; c++) {
+                    zend_string *zs = dec_get_zstr(d, key_idx[c]);
+                    if (!zs) {
+                        zend_array_destroy(row);
+                        goto rowset_fail;
+                    }
+                    zval tmp;
+                    if (decode_value_hot(d, &tmp) < 0) {
+                        zend_array_destroy(row);
+                        goto rowset_fail;
+                    }
+                    if (d->trusted) {
+                        zend_hash_add_new(row, zs, &tmp);
+                    } else {
+                        zend_symtable_update(row, zs, &tmp);
+                    }
+                }
+                ZVAL_ARR(&outer->arPacked[r], row);
+            }
+            efree(key_idx);
+            outer->nNumUsed = (uint32_t)nrows;
+            outer->nNumOfElements = (uint32_t)nrows;
+            outer->nNextFreeElement = (zend_long)nrows;
+            ZVAL_ARR(out, outer);
+            return 0;
+        rowset_fail:
+            efree(key_idx);
+            for (uint64_t i = 0; i < r; i++) {
+                zend_array_destroy(Z_ARR(outer->arPacked[i]));
+            }
+            zend_array_destroy(outer);
+            return -1;
         }
         case TAG_ASSOC_DICT: {
             uint64_t n;
