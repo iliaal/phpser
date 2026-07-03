@@ -110,6 +110,9 @@
                                       values only, in ce->properties_info_table order (wire v2).
                                       Encoder emits when the object matches the property-slot fast-path
                                       eligibility rules and the class has no __unserialize hook. */
+#define TAG_ASSOC_DICT      0x13   /* varint(n), N×varint(dict_key_idx), N×val — assoc whose keys are
+                                      all dict-bound string refs (wire v2). Skips the per-key KEY_STR
+                                      tag byte; values use the same decode path as TAG_ASSOC. */
 
 /* Assoc key tags (one byte before the key's payload). */
 #define KEY_LONG        0x00
@@ -579,6 +582,24 @@ static uint32_t enc_dict_append(encode_ctx *e, zend_string *zs) {
 /* Always-dict intern path: used for object class names and property keys,
  * which we don't try to inline (TAG_OBJECT wire format hardcodes dict refs
  * for those slots). */
+/* Return 1 when `zs` is already in the dict (cache or content map); writes the
+ * index to *out_idx. Used by TAG_ASSOC_DICT / PACKED_STRINGS eligibility. */
+static int enc_str_dict_idx(encode_ctx *e, zend_string *zs, uint32_t *out_idx) {
+    intern_slot *s = enc_cache_find(e, zs);
+    if (s && SLOT_IS_DICT(*s)) {
+        *out_idx = SLOT_DICT_IDX(*s);
+        return 1;
+    }
+    if (e->dict_len >= HASH_MAP_THRESHOLD) {
+        zval *hit = zend_hash_find(&e->hash_map, zs);
+        if (hit) {
+            *out_idx = (uint32_t)Z_LVAL_P(hit);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
     intern_slot *s = enc_cache_find(e, zs);
     if (s && SLOT_IS_DICT(*s)) return SLOT_DICT_IDX(*s);
@@ -1204,19 +1225,57 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
         return;
     }
 
-    /* Non-packed (assoc). */
-    smart_str_appendc(body, TAG_ASSOC);
-    varint_write_u64(body, n_elems);
-    Bucket *b = ht->arData;
-    Bucket *end = b + n_used;
-    for (; b < end; b++) {
-        if (Z_TYPE(b->val) == IS_UNDEF) continue;
-        if (b->key) {
-            enc_emit_str_key(body, e, b->key);
-        } else {
-            emit_tag_and_varint(body, KEY_LONG, zigzag_encode64((int64_t)b->h));
+    /* Non-packed (assoc). Try wire-v2 dict-only keys when every live entry is a
+     * string key already in the dict (row 2+ of a rowset qualifies once row 1's
+     * enc_emit_str_key calls upgraded the field names). */
+    {
+        Bucket *b = ht->arData;
+        Bucket *end = b + n_used;
+        int dict_keys = 1;
+        uint32_t dummy_idx;
+        for (; b < end; b++) {
+            if (Z_TYPE(b->val) == IS_UNDEF) continue;
+            if (!b->key || !enc_str_dict_idx(e, b->key, &dummy_idx)) {
+                dict_keys = 0;
+                break;
+            }
         }
-        encode_value(body, e, &b->val);
+        if (dict_keys && n_elems > 0) {
+            e->wire_v2 = 1;
+            smart_str_appendc(body, TAG_ASSOC_DICT);
+            varint_write_u64(body, n_elems);
+            smart_str_alloc(body, (size_t)n_elems * VARINT_MAX_BYTES, 0);
+            char *base = ZSTR_VAL(body->s);
+            size_t pos = ZSTR_LEN(body->s);
+            b = ht->arData;
+            for (; b < end; b++) {
+                if (Z_TYPE(b->val) == IS_UNDEF) continue;
+                uint32_t kidx;
+                (void)enc_str_dict_idx(e, b->key, &kidx);
+                uint64_t v = kidx;
+                while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
+                base[pos++] = (char)v;
+            }
+            ZSTR_LEN(body->s) = pos;
+            b = ht->arData;
+            for (; b < end; b++) {
+                if (Z_TYPE(b->val) == IS_UNDEF) continue;
+                encode_value(body, e, &b->val);
+            }
+            return;
+        }
+        smart_str_appendc(body, TAG_ASSOC);
+        varint_write_u64(body, n_elems);
+        b = ht->arData;
+        for (; b < end; b++) {
+            if (Z_TYPE(b->val) == IS_UNDEF) continue;
+            if (b->key) {
+                enc_emit_str_key(body, e, b->key);
+            } else {
+                emit_tag_and_varint(body, KEY_LONG, zigzag_encode64((int64_t)b->h));
+            }
+            encode_value(body, e, &b->val);
+        }
     }
 }
 
@@ -2342,6 +2401,40 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 dec_defer_wakeup(d, obj);
             }
             return 0;
+        }
+        case TAG_ASSOC_DICT: {
+            uint64_t n;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
+            /* Wire layout: n key indices, then n values (encoder writes keys
+             * in one pass and values in a second). Each entry needs at least
+             * one byte of key idx and one byte of value tag. */
+            if (n > UINT32_MAX || n > (d->len - d->pos) / 2) return -1;
+            uint64_t *key_idx = (uint64_t *)safe_emalloc((size_t)n, sizeof(uint64_t), 0);
+            for (uint64_t i = 0; i < n; i++) {
+                if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx[i]) < 0) {
+                    efree(key_idx);
+                    return -1;
+                }
+            }
+            zend_array *arr = zend_new_array((uint32_t)n);
+            for (uint64_t i = 0; i < n; i++) {
+                zend_string *zs = dec_get_zstr(d, key_idx[i]);
+                if (!zs) goto assoc_dict_fail;
+                zval tmp;
+                if (decode_value_hot(d, &tmp) < 0) goto assoc_dict_fail;
+                if (d->trusted) {
+                    zend_hash_add_new(arr, zs, &tmp);
+                } else {
+                    zend_symtable_update(arr, zs, &tmp);
+                }
+            }
+            efree(key_idx);
+            ZVAL_ARR(out, arr);
+            return 0;
+        assoc_dict_fail:
+            efree(key_idx);
+            zend_array_destroy(arr);
+            return -1;
         }
         case TAG_ASSOC: {
             uint64_t n;

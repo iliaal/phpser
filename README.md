@@ -316,6 +316,8 @@ value tags:
                        declared-property values in properties_info_table order, no
                        per-prop key index. Emitted when every declared slot is
                        initialized; otherwise keyed OBJECT (0x0a) is used.
+  0x13 ASSOC_DICT      varint(n), N×varint(dict_key_idx), N×val  // wire v2 only;
+                       assoc with all string keys dict-bound; skips KEY_STR tags.
 
 key tags:
   0x00 LONG            varint(zigzag)
