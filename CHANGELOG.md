@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Scalar values in assoc, packed-mixed, and object-property loops decode without the full recursive wrapper; HMAC-authenticated decode skips per-object id-table pins. Rowset and DTO decode ~6-8% faster (median of 51 runs, 2000 iters).
+
 ### Fixed
 
 - Fixed use-after-free encoding an object whose property `__serialize`/`__sleep` adds a dynamic property mid-walk; the property table is now ref-held during encode, as native `serialize()` does.

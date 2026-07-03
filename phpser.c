@@ -1195,6 +1195,7 @@ enum { ID_OBJ, ID_REF, ID_NULL };
 
 typedef struct {
     uint8_t kind;
+    uint8_t pinned; /* 1 if id_table holds an extra GC refcount on u */
     union {
         zend_object    *obj;
         zend_reference *ref;
@@ -1283,14 +1284,24 @@ static int dec_register(decode_ctx *d, zval *z) {
         d->id_table = erealloc(d->id_table, d->id_table_cap * sizeof(id_slot));
     }
     id_slot *s = &d->id_table[d->id_table_len++];
+    s->pinned = 0;
     if (Z_TYPE_P(z) == IS_OBJECT) {
         s->kind = ID_OBJ;
         s->u.obj = Z_OBJ_P(z);
-        GC_ADDREF(s->u.obj);
+        /* HMAC-authenticated payloads are unique-keyed and acyclic in
+         * practice; the object stays alive via its owning zval until the
+         * graph is handed back, so skip the id_table pin. The unsigned path
+         * keeps the addref so a duplicate assoc/property key can't free an
+         * id_table entry while a later TAG_REF still points at it (CR-001). */
+        if (!d->trusted) {
+            GC_ADDREF(s->u.obj);
+            s->pinned = 1;
+        }
     } else if (Z_TYPE_P(z) == IS_REFERENCE) {
         s->kind = ID_REF;
         s->u.ref = Z_REF_P(z);
         GC_ADDREF(s->u.ref);
+        s->pinned = 1;
     } else {
         /* Encoder always claimed an id for this slot; we must register
          * something to keep id counts aligned. Back-refs to a NULL slot
@@ -1562,6 +1573,7 @@ static void decode_destroy(decode_ctx *d) {
          * macro so destructors and ref-table teardown fire correctly. */
         for (uint32_t i = 0; i < d->id_table_len; i++) {
             id_slot *s = &d->id_table[i];
+            if (!s->pinned) continue;
             if (s->kind == ID_OBJ) {
                 OBJ_RELEASE(s->u.obj);
             } else if (s->kind == ID_REF) {
@@ -1628,6 +1640,76 @@ static int decode_key(decode_ctx *d, key_val *out_key) {
 }
 
 static int decode_value_inner(decode_ctx *d, zval *out);
+
+/* Scalar tags are the fixed-width / dict-ref leaves. Container runs
+ * (0x06-0x0b) sit between TAG_DOUBLE and TAG_STR_INLINE and must not
+ * be treated as scalars — TAG_PACKED_STRINGS is 0x0b < TAG_STR_INLINE. */
+static zend_always_inline int dec_is_scalar_tag(uint8_t tag) {
+    return tag <= TAG_DOUBLE || tag == TAG_STR_DICT || tag == TAG_STR_INLINE;
+}
+
+/* Decode a tag whose leading byte was already consumed. Caller must only pass
+ * scalar tags; returns -1 on truncation. */
+static int decode_scalar_tag(decode_ctx *d, zval *out, uint8_t tag) {
+    switch (tag) {
+        case TAG_NULL:  ZVAL_NULL(out); return 0;
+        case TAG_FALSE: ZVAL_FALSE(out); return 0;
+        case TAG_TRUE:  ZVAL_TRUE(out); return 0;
+        case TAG_LONG: {
+            int64_t v;
+            if (varint_read_i64(d->buf, d->len, &d->pos, &v) < 0) return -1;
+            ZVAL_LONG(out, v);
+            return 0;
+        }
+        case TAG_DOUBLE: {
+            if (d->pos + 8 > d->len) return -1;
+            ZVAL_DOUBLE(out, le64_read(d->buf + d->pos));
+            d->pos += 8;
+            return 0;
+        }
+        case TAG_STR_DICT: {
+            uint64_t idx;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) return -1;
+            zend_string *zs = dec_get_zstr(d, idx);
+            if (!zs) return -1;
+            ZVAL_STR_COPY(out, zs);
+            return 0;
+        }
+        case TAG_STR_INLINE: {
+            uint64_t slen;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
+            if (slen > UINT32_MAX || d->pos + slen > d->len) return -1;
+            zend_string *zs = zend_string_init(
+                (const char *)d->buf + d->pos, (size_t)slen, 0);
+            d->pos += slen;
+            ZVAL_STR(out, zs);
+            return 0;
+        }
+        default:
+            return -1;
+    }
+}
+
+/* Hot-loop helper: scalars skip the decode_value wrapper since they never
+ * recurse and don't need a depth bump. Container tags rewind one byte and
+ * fall back to the full path. */
+static zend_always_inline int decode_value_hot(decode_ctx *d, zval *out) {
+    if (UNEXPECTED(d->pos >= d->len)) {
+        ZVAL_UNDEF(out);
+        return -1;
+    }
+    uint8_t tag = d->buf[d->pos++];
+    if (EXPECTED(dec_is_scalar_tag(tag))) {
+        ZVAL_UNDEF(out);
+        int rc = decode_scalar_tag(d, out, tag);
+        if (UNEXPECTED(rc < 0)) {
+            ZVAL_UNDEF(out);
+        }
+        return rc;
+    }
+    d->pos--;
+    return decode_value(d, out);
+}
 
 /* Wrapper enforces two invariants the inner cases would otherwise have to
  * pepper through every error path:
@@ -1718,41 +1800,14 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             }
             return 0;
         }
-        case TAG_NULL:  ZVAL_NULL(out); return 0;
-        case TAG_FALSE: ZVAL_FALSE(out); return 0;
-        case TAG_TRUE:  ZVAL_TRUE(out); return 0;
-        case TAG_LONG: {
-            int64_t v;
-            if (varint_read_i64(d->buf, d->len, &d->pos, &v) < 0) return -1;
-            ZVAL_LONG(out, v);
-            return 0;
-        }
-        case TAG_DOUBLE: {
-            if (d->pos + 8 > d->len) return -1;
-            ZVAL_DOUBLE(out, le64_read(d->buf + d->pos));
-            d->pos += 8;
-            return 0;
-        }
-        case TAG_STR_DICT: {
-            uint64_t idx;
-            if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) return -1;
-            zend_string *zs = dec_get_zstr(d, idx);
-            if (!zs) return -1;
-            ZVAL_STR_COPY(out, zs);  /* addrefs the cached string */
-            return 0;
-        }
-        case TAG_STR_INLINE: {
-            uint64_t slen;
-            if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
-            if (slen > UINT32_MAX || d->pos + slen > d->len) return -1;
-            /* Fresh allocation, refcount=1 — ZVAL_STR consumes it without
-             * bumping refcount, so no extra release is needed. */
-            zend_string *zs = zend_string_init(
-                (const char *)d->buf + d->pos, (size_t)slen, 0);
-            d->pos += slen;
-            ZVAL_STR(out, zs);
-            return 0;
-        }
+        case TAG_NULL:
+        case TAG_FALSE:
+        case TAG_TRUE:
+        case TAG_LONG:
+        case TAG_DOUBLE:
+        case TAG_STR_DICT:
+        case TAG_STR_INLINE:
+            return decode_scalar_tag(d, out, tag);
         case TAG_PACKED_LONGS: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
@@ -1829,7 +1884,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             zend_array *arr = zend_new_array((uint32_t)n);
             zend_hash_real_init_packed(arr);
             for (uint64_t i = 0; i < n; i++) {
-                if (decode_value(d, &arr->arPacked[i]) < 0) {
+                if (decode_value_hot(d, &arr->arPacked[i]) < 0) {
                     arr->nNumUsed = (uint32_t)i;
                     zend_array_destroy(arr);
                     return -1;
@@ -2062,7 +2117,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                     zend_string *key = dec_get_zstr(d, key_idx);
                     if (!key) goto unser_fail;
                     zval tmp;
-                    if (decode_value(d, &tmp) < 0) goto unser_fail;
+                    if (decode_value_hot(d, &tmp) < 0) goto unser_fail;
                     zend_hash_update(Z_ARRVAL(data), key, &tmp);
                     continue;
                 unser_fail:
@@ -2104,7 +2159,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 zend_string *key = dec_get_zstr(d, key_idx);
                 if (!key) goto obj_fail;
                 zval tmp;
-                if (decode_value(d, &tmp) < 0) goto obj_fail;
+                if (decode_value_hot(d, &tmp) < 0) goto obj_fail;
                 if (EXPECTED(obj_props == NULL)) {
                     zend_property_info *info = dec_prop_info_for_key(ce, key);
                     if (EXPECTED(info != NULL)) {
@@ -2169,7 +2224,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 key_val k = {0};
                 if (decode_key(d, &k) < 0) goto assoc_fail;
                 zval tmp;
-                if (decode_value(d, &tmp) < 0) {
+                if (decode_value_hot(d, &tmp) < 0) {
                     if (k.kind == KV_OWNED_STR) zend_string_release(k.owned_str);
                     goto assoc_fail;
                 }
