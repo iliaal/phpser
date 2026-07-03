@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-03
+
 ### Changed
 
 - Wire format v2 (`0x02`) adds `TAG_TABLE` for homogeneous rowsets stored columnar: schema once, then per-column typed runs (`PACKED_LONGS`, `PACKED_DOUBLES`, `PACKED_STRINGS`, or `PACKED_MIXED`). Falls back to `TAG_ROWSET` when column typing does not apply.
@@ -17,12 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Fixed a memory-exhaustion DoS where a small crafted `TAG_TABLE` payload forced a multi-gigabyte allocation on the untrusted decode path.
 - Fixed a double-free decoding a trusted `TAG_TABLE` whose column key index is out of range.
 - Fixed use-after-free encoding an object whose property `__serialize`/`__sleep` adds a dynamic property mid-walk; the property table is now ref-held during encode, as native `serialize()` does.
 - Decode rejects a crafted `TAG_OBJECT` naming a legacy `Serializable` class with no `__unserialize`, matching native `unserialize` (raw property writes would bypass the class's `unserialize()`).
 - Re-serializing a filtered `__PHP_Incomplete_Class` now recovers its original class name and drops the magic member, so it round-trips back to the real class once allowed, matching native `serialize()`.
 - Encode throws on a string or blob over 4 GiB instead of emitting a payload the decoder's per-string length cap would reject as undecodable.
+
+### Security
+
+- Fixed a memory-exhaustion DoS where a small crafted `TAG_TABLE` payload forced a multi-gigabyte allocation on the untrusted decode path.
 
 ## [0.2.0] - 2026-06-11
 
@@ -187,7 +192,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.2.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.3.0...HEAD
+[0.3.0]: https://github.com/iliaal/phpser/releases/tag/0.3.0
 [0.2.0]: https://github.com/iliaal/phpser/releases/tag/0.2.0
 [0.1.2]: https://github.com/iliaal/phpser/releases/tag/0.1.2
 [0.1.1]: https://github.com/iliaal/phpser/releases/tag/0.1.1
