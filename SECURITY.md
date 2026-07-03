@@ -28,10 +28,10 @@ to letting the attacker run those magic methods.
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.1.x   | :white_check_mark: |
+| 0.3.x   | :white_check_mark: |
 
-Once 1.0 ships, the two most recent minor versions will receive security
-fixes.
+Pre-1.0, security fixes land on the latest minor. Once 1.0 ships, the two
+most recent minor versions will receive security fixes.
 
 ## Reporting a vulnerability
 
