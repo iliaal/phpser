@@ -277,6 +277,16 @@ as a `session.serialize_handler` when available.
   `__PHP_Incomplete_Class`. This is deliberate for the typical cache
   workload; `allowed_classes => [...]` produces `__PHP_Incomplete_Class`
   with the original name preserved for disallowed classes, matching PHP.
+- **`TAG_OBJECT_SLOTS` is positional.** Eligible typed objects encode their
+  declared properties as values in `properties_info_table` (declaration)
+  order with no per-property names; decode installs them back in that order.
+  A property *count* mismatch between encode and decode is rejected, but a
+  same-count *reorder* of a class's typed properties is not detected, so the
+  values land in the reordered slots silently. Same-deploy cache round-trips
+  are safe (the class is identical on both sides). For signed payloads that
+  outlive a deploy, evolve classes append-only (add properties at the end,
+  don't reorder or retype existing ones) so older payloads keep decoding
+  into the right slots.
 - **`session.serialize_handler=phpser` is shipped** (compiled in when
   `phpize` detects the session extension; gated on `HAVE_PHP_SESSION` so
   the extension still loads on session-less PHP builds). `phpredis`
