@@ -283,10 +283,10 @@ as a `session.serialize_handler` when available.
   integration is not yet wired; call `phpser_serialize`/`unserialize`
   directly when using the extension as a phpredis serializer.
 
-## Wire format (V1)
+## Wire format (V1 / V2)
 
 ```
-[u8 version=0x01]
+[u8 version=0x01 or 0x02]
 [varint ndict]
   per entry: [varint len] [bytes]
 [value]
@@ -312,6 +312,10 @@ value tags:
                        // ce->serialize / ce->unserialize (Serializable etc.)
   0x10 REF             varint(id)  // back-ref to a previously-emitted container
   0x11 NEW_REF         value  // claims the next id for an IS_REFERENCE wrap
+  0x12 OBJECT_SLOTS    varint(class_idx), varint(nprops), N×val  // wire v2 only;
+                       declared-property values in properties_info_table order, no
+                       per-prop key index. Emitted when every declared slot is
+                       initialized; otherwise keyed OBJECT (0x0a) is used.
 
 key tags:
   0x00 LONG            varint(zigzag)

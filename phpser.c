@@ -72,8 +72,10 @@
 	} while (0)
 #endif
 
-/* Wire format version. Bump on any incompatible change. */
-#define PHPSER_VERSION 0x01
+/* Wire format version. Bump on any incompatible change. v2 adds optional
+ * container tags (TAG_OBJECT_SLOTS today); decoders accept both bytes. */
+#define PHPSER_VERSION   0x01
+#define PHPSER_VERSION_V2 0x02
 
 /* Value tags. */
 #define TAG_NULL            0x00
@@ -99,11 +101,15 @@
                                       are opaque output from ce->serialize. */
 #define TAG_REF             0x10   /* varint(id) — back-reference to a previously-emitted container.
                                       id counts in encounter order on both sides; tags TAG_OBJECT,
-                                      TAG_OBJECT_MAGIC, TAG_OBJECT_LEGACY, TAG_ENUM, and TAG_NEW_REF
-                                      each implicitly claim the next id. */
+                                      TAG_OBJECT_SLOTS, TAG_OBJECT_MAGIC, TAG_OBJECT_LEGACY, TAG_ENUM,
+                                      and TAG_NEW_REF each implicitly claim the next id. */
 #define TAG_NEW_REF         0x11   /* inner value follows — claims the next id for an IS_REFERENCE wrap.
                                       On decode we allocate a fresh zend_reference, register it in the
                                       id table, then decode the inner value into ref->val. */
+#define TAG_OBJECT_SLOTS    0x12   /* varint(class_idx), varint(nprops), N×val — declared-property
+                                      values only, in ce->properties_info_table order (wire v2).
+                                      Encoder emits when the object matches the property-slot fast-path
+                                      eligibility rules and the class has no __unserialize hook. */
 
 /* Assoc key tags (one byte before the key's payload). */
 #define KEY_LONG        0x00
@@ -358,6 +364,8 @@ typedef struct {
      * silent-data-loss failure the depth cap rejects. Fail loud at encode
      * instead of shipping an undecodable payload. */
     uint8_t size_exceeded;
+    /* Set when the body uses a v2-only tag; header version becomes 0x02. */
+    uint8_t wire_v2;
 } encode_ctx;
 
 static void enc_ctx_init(encode_ctx *e) {
@@ -375,6 +383,18 @@ static void enc_ctx_init(encode_ctx *e) {
     e->depth = 0;
     e->depth_exceeded = 0;
     e->size_exceeded = 0;
+    e->wire_v2 = 0;
+}
+
+/* Live declared-property slots in properties_info_table order (NULL entries
+ * skipped). TAG_OBJECT_SLOTS uses this as the fixed per-class schema. */
+static uint32_t ce_table_slot_count(zend_class_entry *ce) {
+    uint32_t n = 0;
+    int pc = ce->default_properties_count;
+    for (int pi = 0; pi < pc; pi++) {
+        if (ce->properties_info_table[pi] != NULL) n++;
+    }
+    return n;
 }
 
 static void enc_ctx_destroy(encode_ctx *e) {
@@ -960,12 +980,44 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
 #if PHP_VERSION_ID >= 80400
                 && !zend_object_is_lazy(obj)
 #endif
+                && ce->__unserialize == NULL
                 ) {
                 int pc = ce->default_properties_count;
+                bool slots_ok = true;
+                for (int pi = 0; pi < pc; pi++) {
+                    zend_property_info *info = ce->properties_info_table[pi];
+                    if (info == NULL) continue;
+                    if (Z_TYPE_P(OBJ_PROP(obj, info->offset)) == IS_UNDEF) {
+                        slots_ok = false;
+                        break;
+                    }
+                }
+                if (slots_ok) {
+                    uint32_t fp_nprops = ce_table_slot_count(ce);
+                    /* Wire v2: values only in declaration-table order. Requires
+                     * every declared slot to be initialized — IS_UNDEF must fall
+                     * back to keyed TAG_OBJECT (skip on wire), same as before. */
+                    e->wire_v2 = 1;
+                    smart_str_appendc(body, TAG_OBJECT_SLOTS);
+                    varint_write_u64(body, class_idx);
+                    size_t nprops_off = ZSTR_LEN(body->s);
+                    smart_str_appendc(body, 0);
+                    uint32_t emitted = 0;
+                    for (int pi = 0; pi < pc; pi++) {
+                        zend_property_info *info = ce->properties_info_table[pi];
+                        if (info == NULL) continue;
+                        encode_value(body, e, OBJ_PROP(obj, info->offset));
+                        emitted++;
+                    }
+                    ZEND_ASSERT(emitted == fp_nprops);
+                    enc_patch_nprops(body, nprops_off, fp_nprops);
+                    return;
+                }
+                /* Uninitialized typed slot: keyed TAG_OBJECT, skip IS_UNDEF. */
                 smart_str_appendc(body, TAG_OBJECT);
                 varint_write_u64(body, class_idx);
                 size_t nprops_off = ZSTR_LEN(body->s);
-                smart_str_appendc(body, 0);  /* placeholder, patched below */
+                smart_str_appendc(body, 0);
                 uint32_t fp_nprops = 0;
                 for (int pi = 0; pi < pc; pi++) {
                     zend_property_info *info = ce->properties_info_table[pi];
@@ -1399,6 +1451,30 @@ static inline int dec_class_allowed(decode_ctx *d, uint64_t class_idx,
  *
  * Takes ownership of *tmp: on success it's moved into the slot; on
  * type-mismatch it's dtor'd. Returns 0/-1. */
+/* Write a decoded value into a declared property slot (typed or untyped). */
+static int dec_install_declared_slot(zend_object *obj, zend_property_info *info,
+                                     zval *tmp) {
+    zval *slot = OBJ_PROP(obj, info->offset);
+    if (ZEND_TYPE_IS_SET(info->type)) {
+        if (!zend_verify_prop_assignable_by_ref(info, tmp, /*strict*/ 1)) {
+            zval_ptr_dtor(tmp);
+            return -1;
+        }
+        if (Z_ISREF_P(slot)) {
+            ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
+        }
+        zval_ptr_dtor(slot);
+        ZVAL_COPY_VALUE(slot, tmp);
+        if (Z_ISREF_P(slot)) {
+            ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
+        }
+    } else {
+        zval_ptr_dtor(slot);
+        ZVAL_COPY_VALUE(slot, tmp);
+    }
+    return 0;
+}
+
 static int dec_install_prop(zend_object *obj, HashTable *obj_props,
                             zend_string *key, zval *tmp) {
     zval *existing = zend_hash_find(obj_props, key);
@@ -1531,7 +1607,8 @@ static int decode_value(decode_ctx *d, zval *out);
  * zend_string and skips its compute step. */
 static int decode_header(decode_ctx *d) {
     if (d->len < 1) return -1;
-    if (d->buf[d->pos++] != PHPSER_VERSION) return -1;
+    uint8_t ver = d->buf[d->pos++];
+    if (ver != PHPSER_VERSION && ver != PHPSER_VERSION_V2) return -1;
     uint64_t n;
     if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
     /* Each dict entry is at least 2 bytes (varint(0) + 0 content, but a
@@ -2039,6 +2116,78 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             dec_register(d, out);
             return 0;
         }
+        case TAG_OBJECT_SLOTS: {
+            uint64_t class_idx, nprops;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &nprops) < 0) return -1;
+            if (nprops > UINT32_MAX || nprops > d->len - d->pos) return -1;
+            zend_string *class_name = dec_get_zstr(d, class_idx);
+            if (!class_name) return -1;
+
+            int allowed = dec_class_allowed(d, class_idx, class_name);
+            /* Slot layout comes from the named class even when the filter
+             * denies instantiation — wire carries values only, no key names. */
+            zend_class_entry *schema_ce = dec_class_resolve(d, class_idx, class_name);
+            if (!schema_ce) {
+                return -1;
+            }
+            if (nprops != ce_table_slot_count(schema_ce)) {
+                return -1;
+            }
+
+            if (!allowed) {
+                if (dec_make_incomplete(out, class_name) < 0) return -1;
+                dec_register(d, out);
+                zend_object *obj = Z_OBJ_P(out);
+                HashTable *obj_props = zend_std_get_properties(obj);
+                int pc = schema_ce->default_properties_count;
+                for (int pi = 0; pi < pc; pi++) {
+                    zend_property_info *info = schema_ce->properties_info_table[pi];
+                    if (info == NULL) continue;
+                    zval tmp;
+                    if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
+                    if (dec_install_prop(obj, obj_props, info->name, &tmp) < 0) {
+                        goto slots_fail;
+                    }
+                }
+                return 0;
+            }
+
+            zend_class_entry *ce = schema_ce;
+            if (ce->ce_flags & (ZEND_ACC_NOT_SERIALIZABLE | ZEND_ACC_UNINSTANTIABLE)) {
+                return -1;
+            }
+            if (ce->serialize != NULL && ce->__unserialize == NULL) {
+                return -1;
+            }
+
+            if (object_init_ex(out, ce) != SUCCESS) {
+                ZVAL_NULL(out);
+                return -1;
+            }
+            zend_object *obj = Z_OBJ_P(out);
+            dec_register(d, out);
+
+            int pc = ce->default_properties_count;
+            for (int pi = 0; pi < pc; pi++) {
+                zend_property_info *info = ce->properties_info_table[pi];
+                if (info == NULL) continue;
+                zval tmp;
+                if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
+                if (dec_install_declared_slot(obj, info, &tmp) < 0) goto slots_fail;
+            }
+            if (zend_hash_find_known_hash(&ce->function_table,
+                    ZSTR_KNOWN(ZEND_STR_WAKEUP)) != NULL) {
+                dec_defer_wakeup(d, obj);
+            }
+            return 0;
+        slots_fail:
+            if (Z_TYPE_P(out) != IS_UNDEF) {
+                zval_ptr_dtor(out);
+                ZVAL_NULL(out);
+            }
+            return -1;
+        }
         case TAG_OBJECT: {
             uint64_t class_idx, nprops;
             if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
@@ -2163,24 +2312,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 if (EXPECTED(obj_props == NULL)) {
                     zend_property_info *info = dec_prop_info_for_key(ce, key);
                     if (EXPECTED(info != NULL)) {
-                        zval *slot = OBJ_PROP(obj, info->offset);
-                        if (ZEND_TYPE_IS_SET(info->type)) {
-                            if (!zend_verify_prop_assignable_by_ref(
-                                    info, &tmp, /*strict*/ 1)) {
-                                zval_ptr_dtor(&tmp);
-                                goto obj_fail;
-                            }
-                            if (Z_ISREF_P(slot)) {
-                                ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
-                            }
-                            zval_ptr_dtor(slot);
-                            ZVAL_COPY_VALUE(slot, &tmp);
-                            if (Z_ISREF_P(slot)) {
-                                ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
-                            }
-                        } else {
-                            zval_ptr_dtor(slot);
-                            ZVAL_COPY_VALUE(slot, &tmp);
+                        if (dec_install_declared_slot(obj, info, &tmp) < 0) {
+                            goto obj_fail;
                         }
                         continue;
                     }
@@ -2445,7 +2578,7 @@ static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
     /* +1 for the smart_str_0 NUL terminator at the end. */
     smart_str_alloc(&out, header_max + body_len + 1, 0);
 
-    smart_str_appendc(&out, PHPSER_VERSION);
+    smart_str_appendc(&out, ctx.wire_v2 ? PHPSER_VERSION_V2 : PHPSER_VERSION);
     varint_write_u64(&out, ctx.dict_len);
     for (uint32_t i = 0; i < ctx.dict_len; i++) {
         zend_string *zs = ctx.dict[i];
