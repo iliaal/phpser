@@ -321,6 +321,9 @@ value tags:
   0x14 ROWSET          varint(nrows), varint(ncols), N×varint(dict_key_idx),
                        nrows×ncols×val  // wire v2 only; packed homogeneous assoc
                        rows (rowset shape). Schema once, values row-major.
+  0x15 TABLE           varint(nrows), varint(ncols), N×varint(dict_key_idx),
+                       ncols×(col_tag, payload)  // wire v2 only; columnar rowset.
+                       col_tag is PACKED_LONGS/DOUBLES/STRINGS/MIXED; nrows implicit.
 
 key tags:
   0x00 LONG            varint(zigzag)

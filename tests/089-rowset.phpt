@@ -25,7 +25,11 @@ $data = mk_rowset(5);
 $blob = phpser_serialize($data);
 
 echo ($blob[0] === "\x02") ? "version_v2 OK\n" : "version_v2 FAIL\n";
-echo (strpos($blob, "\x14") !== false) ? "tag_rowset OK\n" : "tag_rowset FAIL\n";
+// TAG_ROWSET (0x14) decode compat — encoder-produced row-major wire.
+$rowset_wire = hex2bin('0202026964046e616d65140202000103000c05726f775f3003020c05726f775f31');
+$rw = phpser_unserialize($rowset_wire);
+echo (is_array($rw) && $rw[0]['id'] === 0 && $rw[1]['name'] === 'row_1')
+    ? "tag_rowset OK\n" : "tag_rowset FAIL\n";
 
 $rt = phpser_unserialize($blob);
 echo (serialize($rt) === serialize($data)) ? "rowset_roundtrip OK\n" : "rowset_roundtrip FAIL\n";
