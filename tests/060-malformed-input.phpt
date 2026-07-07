@@ -179,7 +179,16 @@ ini_set('memory_limit', '64M');
 $dos = "{$H}\x15\x80\x80\x80\x80\x01\x01\x00\x08\x00"; // nrows=2^28, ncols=1, idx=0, LONGS
 echo (phpser_unserialize($dos) === null) ? "table_nrows_dos OK\n" : "table_nrows_dos FAIL\n";
 
-// 6b. Trusted (signed) TAG_TABLE whose 2nd column index is out of range fails
+// 6b. Duplicate rowset/table schema keys on the unsigned path must keep
+//     last-write-wins semantics. The optimized unique-schema path may use
+//     add_new only after proving these are not duplicate keys.
+$HD = "\x02\x02\x01a\x01a";
+$dup_rowset = "{$HD}\x14\x01\x02\x00\x01\x03\x02\x03\x04"; // [['a'=>1, 'a'=>2]]
+$dup_table  = "{$HD}\x15\x01\x02\x00\x01\x08\x02\x08\x04"; // same, columnar
+echo (phpser_unserialize($dup_rowset) === [['a' => 2]]) ? "rowset_dup_schema OK\n" : "rowset_dup_schema FAIL\n";
+echo (phpser_unserialize($dup_table) === [['a' => 2]]) ? "table_dup_schema OK\n" : "table_dup_schema FAIL\n";
+
+// 6c. Trusted (signed) TAG_TABLE whose 2nd column index is out of range fails
 //     after column 0's cell was already moved into the row. The error path
 //     must not release that moved cell twice (release-silent; ASAN-detectable).
 $key = "phpser-060-key";
@@ -198,4 +207,6 @@ numkey_dual_collapse OK
 numkey_leadzero_string OK
 v2 tags OK
 table_nrows_dos OK
+rowset_dup_schema OK
+table_dup_schema OK
 table_trusted_badidx OK

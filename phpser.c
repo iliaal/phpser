@@ -1915,6 +1915,9 @@ static inline zend_string *dec_get_zstr(decode_ctx *d, uint64_t idx) {
 }
 
 static int decode_value(decode_ctx *d, zval *out);
+static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *schema_unique);
+static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out);
+static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out);
 
 /* Materialize the dict header. We eagerly allocate every dict slot and
  * pre-compute its hash. This trades a tiny up-front cost for one less branch
@@ -2703,146 +2706,6 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             }
             return 0;
         }
-        case TAG_TABLE: {
-            uint64_t nrows, ncols;
-            if (varint_read_u64(d->buf, d->len, &d->pos, &nrows) < 0) return -1;
-            if (varint_read_u64(d->buf, d->len, &d->pos, &ncols) < 0) return -1;
-            if (ncols > UINT32_MAX || nrows > UINT32_MAX || ncols == 0) return -1;
-            if (ncols > (d->len - d->pos) / 2) return -1;
-            /* Each of the nrows×ncols cells is at least one byte on the wire, so
-             * a payload can't describe more rows than the bytes that remain.
-             * Reject before the per-column emalloc(nrows) so a tiny payload
-             * claiming billions of rows can't force a multi-GB allocation. */
-            if (nrows > (d->len - d->pos) / ncols) return -1;
-            uint64_t *key_idx = (uint64_t *)safe_emalloc((size_t)ncols, sizeof(uint64_t), 0);
-            for (uint64_t i = 0; i < ncols; i++) {
-                if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx[i]) < 0) {
-                    efree(key_idx);
-                    return -1;
-                }
-            }
-            zval **cols = (zval **)safe_emalloc((size_t)ncols, sizeof(zval *), 0);
-            uint64_t c;
-            for (c = 0; c < ncols; c++) {
-                if (d->pos >= d->len) goto table_fail;
-                uint8_t col_tag = d->buf[d->pos++];
-                cols[c] = (zval *)safe_emalloc((size_t)nrows, sizeof(zval), 0);
-                if (dec_table_column(d, cols[c], nrows, col_tag) < 0) {
-                    for (uint64_t ri = 0; ri < nrows; ri++) {
-                        zval_ptr_dtor(&cols[c][ri]);
-                    }
-                    efree(cols[c]);
-                    goto table_fail;
-                }
-            }
-            zend_array *outer = zend_new_array((uint32_t)nrows);
-            zend_hash_real_init_packed(outer);
-            uint64_t r;
-            for (r = 0; r < nrows; r++) {
-                zend_array *row = zend_new_array((uint32_t)ncols);
-                for (uint64_t ci = 0; ci < ncols; ci++) {
-                    zend_string *zs = dec_get_zstr(d, key_idx[ci]);
-                    if (!zs) {
-                        zend_array_destroy(row);
-                        goto table_fail_rows;
-                    }
-                    if (d->trusted) {
-                        zend_hash_add_new(row, zs, &cols[ci][r]);
-                        /* Ownership moved into the row. Blank the source so a
-                         * later error-path free (table_fail_rows destroys the
-                         * built rows, then dec_table_free_columns walks every
-                         * cell) can't release this cell a second time. */
-                        ZVAL_UNDEF(&cols[ci][r]);
-                    } else {
-                        zval tmp;
-                        ZVAL_COPY(&tmp, &cols[ci][r]);
-                        zend_symtable_update(row, zs, &tmp);
-                    }
-                }
-                ZVAL_ARR(&outer->arPacked[r], row);
-            }
-            efree(key_idx);
-            for (c = 0; c < ncols; c++) {
-                if (!d->trusted) {
-                    for (uint64_t ri = 0; ri < nrows; ri++) {
-                        zval_ptr_dtor(&cols[c][ri]);
-                    }
-                }
-                efree(cols[c]);
-            }
-            efree(cols);
-            outer->nNumUsed = (uint32_t)nrows;
-            outer->nNumOfElements = (uint32_t)nrows;
-            outer->nNextFreeElement = (zend_long)nrows;
-            ZVAL_ARR(out, outer);
-            return 0;
-        table_fail_rows:
-            for (uint64_t i = 0; i < r; i++) {
-                zend_array_destroy(Z_ARR(outer->arPacked[i]));
-            }
-            zend_array_destroy(outer);
-            c = ncols;
-        table_fail:
-            dec_table_free_columns(cols, ncols, nrows, c);
-            efree(cols);
-            efree(key_idx);
-            return -1;
-        }
-        case TAG_ROWSET: {
-            uint64_t nrows, ncols;
-            if (varint_read_u64(d->buf, d->len, &d->pos, &nrows) < 0) return -1;
-            if (varint_read_u64(d->buf, d->len, &d->pos, &ncols) < 0) return -1;
-            if (ncols > UINT32_MAX || nrows > UINT32_MAX || ncols == 0) return -1;
-            /* Schema indices + at least one byte per value cell. */
-            if (ncols > (d->len - d->pos) / 2
-                || nrows > (d->len - d->pos) / ncols) {
-                return -1;
-            }
-            uint64_t *key_idx = (uint64_t *)safe_emalloc((size_t)ncols, sizeof(uint64_t), 0);
-            for (uint64_t i = 0; i < ncols; i++) {
-                if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx[i]) < 0) {
-                    efree(key_idx);
-                    return -1;
-                }
-            }
-            zend_array *outer = zend_new_array((uint32_t)nrows);
-            zend_hash_real_init_packed(outer);
-            uint64_t r;
-            for (r = 0; r < nrows; r++) {
-                zend_array *row = zend_new_array((uint32_t)ncols);
-                for (uint64_t c = 0; c < ncols; c++) {
-                    zend_string *zs = dec_get_zstr(d, key_idx[c]);
-                    if (!zs) {
-                        zend_array_destroy(row);
-                        goto rowset_fail;
-                    }
-                    zval tmp;
-                    if (decode_value_hot(d, &tmp) < 0) {
-                        zend_array_destroy(row);
-                        goto rowset_fail;
-                    }
-                    if (d->trusted) {
-                        zend_hash_add_new(row, zs, &tmp);
-                    } else {
-                        zend_symtable_update(row, zs, &tmp);
-                    }
-                }
-                ZVAL_ARR(&outer->arPacked[r], row);
-            }
-            efree(key_idx);
-            outer->nNumUsed = (uint32_t)nrows;
-            outer->nNumOfElements = (uint32_t)nrows;
-            outer->nNextFreeElement = (zend_long)nrows;
-            ZVAL_ARR(out, outer);
-            return 0;
-        rowset_fail:
-            efree(key_idx);
-            for (uint64_t i = 0; i < r; i++) {
-                zend_array_destroy(Z_ARR(outer->arPacked[i]));
-            }
-            zend_array_destroy(outer);
-            return -1;
-        }
         case TAG_ASSOC_DICT: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
@@ -2956,9 +2819,179 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             ZVAL_ARR(out, arr);
             return 0;
         }
+        case TAG_TABLE:
+            return dec_decode_table(d, out);
+        case TAG_ROWSET:
+            return dec_decode_rowset(d, out);
         default:
             return -1;
     }
+}
+
+static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
+    uint64_t nrows, ncols;
+    if (varint_read_u64(d->buf, d->len, &d->pos, &nrows) < 0) return -1;
+    if (varint_read_u64(d->buf, d->len, &d->pos, &ncols) < 0) return -1;
+    if (ncols > UINT32_MAX || nrows > UINT32_MAX || ncols == 0) return -1;
+    if (ncols > (d->len - d->pos) / 2) return -1;
+    /* Each of the nrows*ncols cells is at least one byte on the wire. */
+    if (nrows > (d->len - d->pos) / ncols) return -1;
+
+    int schema_unique;
+    zend_string **keys = dec_read_schema_keys(d, ncols, &schema_unique);
+    if (!keys) return -1;
+
+    zval **cols = (zval **)safe_emalloc((size_t)ncols, sizeof(zval *), 0);
+    uint64_t c;
+    for (c = 0; c < ncols; c++) {
+        if (d->pos >= d->len) goto table_fail;
+        uint8_t col_tag = d->buf[d->pos++];
+        cols[c] = (zval *)safe_emalloc((size_t)nrows, sizeof(zval), 0);
+        if (dec_table_column(d, cols[c], nrows, col_tag) < 0) {
+            for (uint64_t ri = 0; ri < nrows; ri++) {
+                zval_ptr_dtor(&cols[c][ri]);
+            }
+            efree(cols[c]);
+            goto table_fail;
+        }
+    }
+
+    zend_array *outer = zend_new_array((uint32_t)nrows);
+    zend_hash_real_init_packed(outer);
+    for (uint64_t r = 0; r < nrows; r++) {
+        zend_array *row = zend_new_array((uint32_t)ncols);
+        for (uint64_t ci = 0; ci < ncols; ci++) {
+            zend_string *zs = keys[ci];
+            if (schema_unique) {
+                zend_hash_add_new(row, zs, &cols[ci][r]);
+                ZVAL_UNDEF(&cols[ci][r]);
+            } else {
+                zval tmp;
+                ZVAL_COPY(&tmp, &cols[ci][r]);
+                zend_symtable_update(row, zs, &tmp);
+            }
+        }
+        ZVAL_ARR(&outer->arPacked[r], row);
+    }
+
+    efree(keys);
+    for (c = 0; c < ncols; c++) {
+        if (!schema_unique) {
+            for (uint64_t ri = 0; ri < nrows; ri++) {
+                zval_ptr_dtor(&cols[c][ri]);
+            }
+        }
+        efree(cols[c]);
+    }
+    efree(cols);
+    outer->nNumUsed = (uint32_t)nrows;
+    outer->nNumOfElements = (uint32_t)nrows;
+    outer->nNextFreeElement = (zend_long)nrows;
+    ZVAL_ARR(out, outer);
+    return 0;
+
+table_fail:
+    dec_table_free_columns(cols, ncols, nrows, c);
+    efree(cols);
+    efree(keys);
+    return -1;
+}
+
+static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out) {
+    uint64_t nrows, ncols;
+    if (varint_read_u64(d->buf, d->len, &d->pos, &nrows) < 0) return -1;
+    if (varint_read_u64(d->buf, d->len, &d->pos, &ncols) < 0) return -1;
+    if (ncols > UINT32_MAX || nrows > UINT32_MAX || ncols == 0) return -1;
+    if (ncols > (d->len - d->pos) / 2
+        || nrows > (d->len - d->pos) / ncols) {
+        return -1;
+    }
+
+    int schema_unique;
+    zend_string **keys = dec_read_schema_keys(d, ncols, &schema_unique);
+    if (!keys) return -1;
+
+    zend_array *outer = zend_new_array((uint32_t)nrows);
+    zend_hash_real_init_packed(outer);
+    uint64_t r;
+    for (r = 0; r < nrows; r++) {
+        zend_array *row = zend_new_array((uint32_t)ncols);
+        for (uint64_t c = 0; c < ncols; c++) {
+            zend_string *zs = keys[c];
+            zval tmp;
+            if (decode_value_hot(d, &tmp) < 0) {
+                zend_array_destroy(row);
+                goto rowset_fail;
+            }
+            if (schema_unique) {
+                zend_hash_add_new(row, zs, &tmp);
+            } else {
+                zend_symtable_update(row, zs, &tmp);
+            }
+        }
+        ZVAL_ARR(&outer->arPacked[r], row);
+    }
+
+    efree(keys);
+    outer->nNumUsed = (uint32_t)nrows;
+    outer->nNumOfElements = (uint32_t)nrows;
+    outer->nNextFreeElement = (zend_long)nrows;
+    ZVAL_ARR(out, outer);
+    return 0;
+
+rowset_fail:
+    efree(keys);
+    for (uint64_t i = 0; i < r; i++) {
+        zend_array_destroy(Z_ARR(outer->arPacked[i]));
+    }
+    zend_array_destroy(outer);
+    return -1;
+}
+
+static int dec_schema_keys_are_unique(zend_string **keys, uint64_t nkeys) {
+    if (nkeys <= 1) {
+        return 1;
+    }
+
+    if (nkeys <= 32) {
+        for (uint64_t i = 1; i < nkeys; i++) {
+            for (uint64_t j = 0; j < i; j++) {
+                if (zend_string_equals(keys[i], keys[j])) {
+                    return 0;
+                }
+            }
+        }
+        return 1;
+    }
+
+    HashTable seen;
+    zend_hash_init(&seen, (uint32_t)nkeys, NULL, NULL, 0);
+    for (uint64_t i = 0; i < nkeys; i++) {
+        if (zend_hash_add_empty_element(&seen, keys[i]) == NULL) {
+            zend_hash_destroy(&seen);
+            return 0;
+        }
+    }
+    zend_hash_destroy(&seen);
+    return 1;
+}
+
+static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *schema_unique) {
+    zend_string **keys = (zend_string **)safe_emalloc((size_t)nkeys, sizeof(zend_string *), 0);
+    for (uint64_t i = 0; i < nkeys; i++) {
+        uint64_t idx;
+        if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) {
+            efree(keys);
+            return NULL;
+        }
+        keys[i] = dec_get_zstr(d, idx);
+        if (!keys[i]) {
+            efree(keys);
+            return NULL;
+        }
+    }
+    *schema_unique = d->trusted || dec_schema_keys_are_unique(keys, nkeys);
+    return keys;
 }
 
 /* -------------------------------------------------------------------------
