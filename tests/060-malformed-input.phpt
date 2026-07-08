@@ -188,6 +188,28 @@ $dup_table  = "{$HD}\x15\x01\x02\x00\x01\x08\x02\x08\x04"; // same, columnar
 echo (phpser_unserialize($dup_rowset) === [['a' => 2]]) ? "rowset_dup_schema OK\n" : "rowset_dup_schema FAIL\n";
 echo (phpser_unserialize($dup_table) === [['a' => 2]]) ? "table_dup_schema OK\n" : "table_dup_schema FAIL\n";
 
+// 6b'. Unique-schema rowset/table with a canonical integer-string key must
+//      coerce it to an int key (PHP array semantics) even on the add_new fast
+//      path — zend_hash_add_new would otherwise store "5" as a string bucket.
+$HN = "\x02\x01\x015"; // dict ["5"]
+$num_rowset = "{$HN}\x14\x01\x01\x00\x03\x02"; // [['5'=>1]] -> [[5=>1]]
+$num_table  = "{$HN}\x15\x01\x01\x00\x08\x02"; // same, columnar LONGS
+echo (phpser_unserialize($num_rowset) === [[5 => 1]]) ? "rowset_num_schema OK\n" : "rowset_num_schema FAIL\n";
+echo (phpser_unserialize($num_table) === [[5 => 1]]) ? "table_num_schema OK\n" : "table_num_schema FAIL\n";
+
+// 6b''. A TAG_TABLE column truncated mid-run must fail cleanly, not crash. The
+//       partial column leaves later cells uninitialized; the error path blanks
+//       them so the uniform per-cell free can't release garbage (ASAN canary).
+$HKV = "\x02\x02\x01k\x01v"; // dict ["k","v"]
+$trunc_col = "{$HKV}\x15\x02\x01\x00\x0b\x01"; // nrows=2, ncols=1, STRINGS col: 1 cell then EOF
+echo (phpser_unserialize($trunc_col) === null) ? "table_trunc_column OK\n" : "table_trunc_column FAIL\n";
+
+// An unknown column tag must reject cleanly: the column buffer is allocated but
+// dec_table_column fills nothing, so every cell must be blanked before the
+// caller's uniform free (same crash class as a truncated column).
+$bad_coltag = "{$HKV}\x15\x02\x01\x00\xff"; // nrows=2, ncols=1, col tag 0xff (undefined)
+echo (phpser_unserialize($bad_coltag) === null) ? "table_bad_coltag OK\n" : "table_bad_coltag FAIL\n";
+
 // 6c. Trusted (signed) TAG_TABLE whose 2nd column index is out of range fails
 //     after column 0's cell was already moved into the row. The error path
 //     must not release that moved cell twice (release-silent; ASAN-detectable).
@@ -209,4 +231,8 @@ v2 tags OK
 table_nrows_dos OK
 rowset_dup_schema OK
 table_dup_schema OK
+rowset_num_schema OK
+table_num_schema OK
+table_trunc_column OK
+table_bad_coltag OK
 table_trusted_badidx OK

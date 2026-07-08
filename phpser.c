@@ -1915,7 +1915,7 @@ static inline zend_string *dec_get_zstr(decode_ctx *d, uint64_t idx) {
 }
 
 static int decode_value(decode_ctx *d, zval *out);
-static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *schema_unique);
+static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *use_add_new);
 static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out);
 static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out);
 
@@ -2141,39 +2141,47 @@ static int decode_value(decode_ctx *d, zval *out) {
 }
 
 static int dec_table_column(decode_ctx *d, zval *col, uint64_t nrows, uint8_t col_tag) {
+    uint64_t i = 0;
     switch (col_tag) {
         case TAG_PACKED_LONGS:
-            for (uint64_t i = 0; i < nrows; i++) {
+            for (; i < nrows; i++) {
                 int64_t lv;
-                if (varint_read_i64(d->buf, d->len, &d->pos, &lv) < 0) return -1;
+                if (varint_read_i64(d->buf, d->len, &d->pos, &lv) < 0) goto fail;
                 ZVAL_LONG(&col[i], lv);
             }
             return 0;
         case TAG_PACKED_DOUBLES:
-            if (nrows > (d->len - d->pos) / 8) return -1;
-            for (uint64_t i = 0; i < nrows; i++) {
-                if (d->pos + 8 > d->len) return -1;
+            if (nrows > (d->len - d->pos) / 8) goto fail;
+            for (; i < nrows; i++) {
+                if (d->pos + 8 > d->len) goto fail;
                 ZVAL_DOUBLE(&col[i], le64_read(d->buf + d->pos));
                 d->pos += 8;
             }
             return 0;
         case TAG_PACKED_STRINGS:
-            for (uint64_t i = 0; i < nrows; i++) {
+            for (; i < nrows; i++) {
                 uint64_t idx;
-                if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) return -1;
+                if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) goto fail;
                 zend_string *zs = dec_get_zstr(d, idx);
-                if (!zs) return -1;
+                if (!zs) goto fail;
                 ZVAL_STR_COPY(&col[i], zs);
             }
             return 0;
         case TAG_PACKED_MIXED:
-            for (uint64_t i = 0; i < nrows; i++) {
-                if (decode_value_hot(d, &col[i]) < 0) return -1;
+            for (; i < nrows; i++) {
+                if (decode_value_hot(d, &col[i]) < 0) goto fail;
             }
             return 0;
-        default:
-            return -1;
     }
+fail:
+    /* A partial column leaves cells [i, nrows) as uninitialized emalloc bytes.
+     * Blank them so the caller's uniform zval_ptr_dtor over all nrows can't
+     * release garbage. On success this label is never reached — no hot-path
+     * cost. */
+    for (; i < nrows; i++) {
+        ZVAL_UNDEF(&col[i]);
+    }
+    return -1;
 }
 
 static void dec_table_free_columns(zval **cols, uint64_t ncols, uint64_t nrows, uint64_t done_cols) {
@@ -2837,8 +2845,8 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
     /* Each of the nrows*ncols cells is at least one byte on the wire. */
     if (nrows > (d->len - d->pos) / ncols) return -1;
 
-    int schema_unique;
-    zend_string **keys = dec_read_schema_keys(d, ncols, &schema_unique);
+    int use_add_new;
+    zend_string **keys = dec_read_schema_keys(d, ncols, &use_add_new);
     if (!keys) return -1;
 
     zval **cols = (zval **)safe_emalloc((size_t)ncols, sizeof(zval *), 0);
@@ -2862,7 +2870,7 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
         zend_array *row = zend_new_array((uint32_t)ncols);
         for (uint64_t ci = 0; ci < ncols; ci++) {
             zend_string *zs = keys[ci];
-            if (schema_unique) {
+            if (use_add_new) {
                 zend_hash_add_new(row, zs, &cols[ci][r]);
                 ZVAL_UNDEF(&cols[ci][r]);
             } else {
@@ -2876,7 +2884,7 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
 
     efree(keys);
     for (c = 0; c < ncols; c++) {
-        if (!schema_unique) {
+        if (!use_add_new) {
             for (uint64_t ri = 0; ri < nrows; ri++) {
                 zval_ptr_dtor(&cols[c][ri]);
             }
@@ -2907,8 +2915,8 @@ static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out) {
         return -1;
     }
 
-    int schema_unique;
-    zend_string **keys = dec_read_schema_keys(d, ncols, &schema_unique);
+    int use_add_new;
+    zend_string **keys = dec_read_schema_keys(d, ncols, &use_add_new);
     if (!keys) return -1;
 
     zend_array *outer = zend_new_array((uint32_t)nrows);
@@ -2923,7 +2931,7 @@ static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out) {
                 zend_array_destroy(row);
                 goto rowset_fail;
             }
-            if (schema_unique) {
+            if (use_add_new) {
                 zend_hash_add_new(row, zs, &tmp);
             } else {
                 zend_symtable_update(row, zs, &tmp);
@@ -2976,8 +2984,9 @@ static int dec_schema_keys_are_unique(zend_string **keys, uint64_t nkeys) {
     return 1;
 }
 
-static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *schema_unique) {
+static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *use_add_new) {
     zend_string **keys = (zend_string **)safe_emalloc((size_t)nkeys, sizeof(zend_string *), 0);
+    int has_numeric = 0;
     for (uint64_t i = 0; i < nkeys; i++) {
         uint64_t idx;
         if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) {
@@ -2989,8 +2998,15 @@ static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *sc
             efree(keys);
             return NULL;
         }
+        zend_ulong h;
+        if (ZEND_HANDLE_NUMERIC(keys[i], h)) has_numeric = 1;
     }
-    *schema_unique = d->trusted || dec_schema_keys_are_unique(keys, nkeys);
+    /* zend_hash_add_new stores the key verbatim; a canonical integer-string
+     * schema key ("5") would land as a string bucket instead of the int key
+     * PHP guarantees. Only take the add_new fast path when every key is
+     * non-numeric (so no coercion is owed) and distinct; otherwise fall back
+     * to zend_symtable_update, which coerces and collapses like the engine. */
+    *use_add_new = !has_numeric && (d->trusted || dec_schema_keys_are_unique(keys, nkeys));
     return keys;
 }
 

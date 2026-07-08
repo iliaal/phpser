@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Decoding a truncated or corrupt `TAG_TABLE` column could dereference uninitialized memory during error cleanup, crashing on malformed input (present since 0.3.0). The decoder now blanks unfilled column cells before releasing them.
+- Rowset/table decode of an untrusted payload whose schema key is a canonical integer string (e.g. `"5"`) now coerces it to an integer array key, matching PHP array semantics and the associative-array decode path.
+
 ## [0.3.0] - 2026-07-03
 
 ### Changed
