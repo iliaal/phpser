@@ -24,6 +24,21 @@ to letting the attacker run those magic methods.
   forgeable, so callers must supply real key material (use a
   high-entropy secret, e.g. 32 random bytes).
 
+**Session handler.** When built against the session extension, phpser
+registers `session.serialize_handler = phpser`. This handler restores
+`$_SESSION` through the **unsigned, all-classes-allowed** decode path —
+it has no `allowed_classes` filter and no HMAC, exactly like the native
+`php_serialize` handler. It therefore trusts the session store: anyone
+who can write the session backend can instantiate arbitrary allowlisted
+classes and trigger their `__wakeup` / `__unserialize` on the next read.
+This is the standard PHP session trust model and is fine for a trusted
+store (a private redis/memcached/file backend). If the session backend
+is attacker-writable, do **not** rely on the open handler — sign the
+payload at the application level with `phpser_serialize_signed` /
+`phpser_unserialize_signed`, or gate reads through an explicit
+`allowed_classes` allowlist. A future INI-configurable allowlist or
+signed session frames would harden this path but are not shipped today.
+
 ## Supported versions
 
 | Version | Supported          |

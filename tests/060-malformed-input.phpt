@@ -213,10 +213,19 @@ echo (phpser_unserialize($bad_coltag) === null) ? "table_bad_coltag OK\n" : "tab
 // 6c. Trusted (signed) TAG_TABLE whose 2nd column index is out of range fails
 //     after column 0's cell was already moved into the row. The error path
 //     must not release that moved cell twice (release-silent; ASAN-detectable).
+//     Since CR-008 the signed decoder throws on an undecodable body (rather than
+//     returning null); the memory-safety intent is unchanged — the moved-cell
+//     path still runs, now unwinding through the throw.
 $key = "phpser-060-key";
 $body = "{$H}\x15\x01\x02\x00\x63\x07\x0c\x03xyz\x07\x0c\x03pqr"; // nrows=1, ncols=2, idx=[0,99]
 $frame = $body . hash_hmac('sha256', $body, $key, true);
-echo (phpser_unserialize_signed($frame, $key) === null) ? "table_trusted_badidx OK\n" : "table_trusted_badidx FAIL\n";
+try {
+    phpser_unserialize_signed($frame, $key);
+    echo "table_trusted_badidx FAIL (no throw)\n";
+} catch (\Exception $e) {
+    echo (strpos($e->getMessage(), "failed to decode") !== false)
+        ? "table_trusted_badidx OK\n" : "table_trusted_badidx FAIL\n";
+}
 
 ?>
 --EXPECT--

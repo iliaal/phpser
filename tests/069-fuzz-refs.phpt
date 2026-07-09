@@ -60,9 +60,15 @@ echo "newref_deep OK\n";
 $rt = phpser_unserialize("\x01\x00\xff");
 echo ($rt === null) ? "garbage_tag OK\n" : "garbage_tag FAIL\n";
 
-// --- Wrong version byte ---
-$rt = phpser_unserialize("\x02\x00\x00");
+// --- Wrong version byte. 0x01 and 0x02 are both valid (v1 / v2), so a real
+// rejection test needs an out-of-range byte; 0x02\x00\x00 is a legitimate v2
+// encoding of null and would pass for the wrong reason. ---
+$rt = phpser_unserialize("\x03\x00\x00");
 echo ($rt === null) ? "wrong_version OK\n" : "wrong_version FAIL\n";
+// Sanity: 0x02 IS accepted (v2 empty-dict null), proving the above rejects on
+// version, not on structure.
+$rt = phpser_unserialize("\x02\x00\x00");
+echo ($rt === null) ? "v2_null OK\n" : "v2_null FAIL\n";
 
 // --- Empty input ---
 $rt = phpser_unserialize("");
@@ -109,6 +115,7 @@ newref_self OK
 newref_deep OK
 garbage_tag OK
 wrong_version OK
+v2_null OK
 empty_input OK
 huge_dict OK
 extra_data OK

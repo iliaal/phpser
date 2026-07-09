@@ -374,6 +374,13 @@ typedef struct {
      * silent-data-loss failure the depth cap rejects. Fail loud at encode
      * instead of shipping an undecodable payload. */
     uint8_t size_exceeded;
+    /* Set when a userland hook (__serialize / __sleep / Serializable::serialize)
+     * throws mid-walk. phpser_encode_zval then refuses to hand back the
+     * truncated frame — the session encoder would otherwise persist a partial
+     * $_SESSION graph while an exception is pending. Zend itself no-ops any
+     * further hook call once an exception is pending, so the remainder of the
+     * walk emits only TAG_NULLs into a buffer that is discarded anyway. */
+    uint8_t failed;
     /* Set when the body uses a v2-only tag; header version becomes 0x02. */
     uint8_t wire_v2;
 } encode_ctx;
@@ -393,6 +400,7 @@ static void enc_ctx_init(encode_ctx *e) {
     e->depth = 0;
     e->depth_exceeded = 0;
     e->size_exceeded = 0;
+    e->failed = 0;
     e->wire_v2 = 0;
 }
 
@@ -600,7 +608,12 @@ static int enc_str_dict_idx(encode_ctx *e, zend_string *zs, uint32_t *out_idx) {
     if (e->dict_len >= HASH_MAP_THRESHOLD) {
         zval *hit = zend_hash_find(&e->hash_map, zs);
         if (hit) {
-            *out_idx = (uint32_t)Z_LVAL_P(hit);
+            uint32_t idx = (uint32_t)Z_LVAL_P(hit);
+            /* Seed the pointer-equality cache so a repeated probe for this
+             * same interned string skips the hash lookup — matches what
+             * enc_intern_zstr does on its content-map hit. */
+            if (s) { s->idx = idx; } else { enc_cache_alloc_slot(e, zs)->idx = idx; }
+            *out_idx = idx;
             return 1;
         }
     }
@@ -675,7 +688,13 @@ static zend_always_inline void enc_emit_str_tagged(
     }
     /* First encounter: emit inline, mark in cache as INLINE_EMITTED so the
      * next occurrence triggers the upgrade above. */
-    if (UNEXPECTED(ZSTR_LEN(zs) > UINT32_MAX)) e->size_exceeded = 1;
+    if (UNEXPECTED(ZSTR_LEN(zs) > UINT32_MAX)) {
+        /* Over the decoder's per-string cap: flag and skip the copy. Appending
+         * the >4 GiB body first (then freeing it in phpser_encode_zval) would
+         * spike peak RSS by the string's full size for a frame we discard. */
+        e->size_exceeded = 1;
+        return;
+    }
     smart_str_appendc(body, inline_tag);
     varint_write_u64(body, ZSTR_LEN(zs));
     smart_str_appendl(body, ZSTR_VAL(zs), ZSTR_LEN(zs));
@@ -739,6 +758,12 @@ static zend_always_inline zval *enc_obj_prop_val(Bucket *b) {
 }
 
 static void encode_value(smart_str *body, encode_ctx *e, zval *v) {
+    /* A userland hook (__serialize / __sleep / Serializable::serialize) already
+     * threw; the frame is discarded by phpser_encode_zval_ex regardless. The
+     * three hook sites individually skip their user-code calls under e->failed,
+     * so no further hook runs either way — this top-level gate just stops the
+     * remaining graph from being walked and appended only to be freed. */
+    if (UNEXPECTED(e->failed)) return;
     /* Declared properties surface as IS_INDIRECT in get_properties() HTs —
      * the bucket holds a pointer to the real slot in properties_table[].
      * Deref before dispatching; otherwise we'd emit NULL for every typed
@@ -848,10 +873,18 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                      * enc_unvisit_last comment. Otherwise back-refs to
                      * this object later in the payload misalign. */
                     enc_unvisit_last(e, obj);
+                    if (EG(exception)) e->failed = 1;
                     smart_str_appendc(body, TAG_NULL);
                     return;
                 }
-                if (UNEXPECTED(len > UINT32_MAX)) e->size_exceeded = 1;
+                if (UNEXPECTED(len > UINT32_MAX)) {
+                    /* Don't copy a >4 GiB blob into the body just to reject the
+                     * whole frame in phpser_encode_zval — that doubles peak RSS.
+                     * Flag it and drop the serializer output now. */
+                    e->size_exceeded = 1;
+                    if (data) efree(data);
+                    return;
+                }
                 uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
                 emit_tag_and_varint(body, TAG_OBJECT_LEGACY, class_idx);
                 varint_write_u64(body, len);
@@ -885,6 +918,10 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     }
                     zval_ptr_dtor(&retval);
                     enc_unvisit_last(e, obj);
+                    /* An exception is now pending (either __serialize threw or
+                     * we just raised the TypeError). Abort the walk rather than
+                     * ship a frame with a TAG_NULL hole. */
+                    if (EG(exception)) e->failed = 1;
                     smart_str_appendc(body, TAG_NULL);
                     return;
                 }
@@ -937,9 +974,13 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 zend_call_known_instance_method_with_0_params(
                     Z_FUNC_P(sleep_fn_zv), obj, &names_zv);
                 if (UNEXPECTED(EG(exception)) || Z_TYPE(names_zv) != IS_ARRAY) {
-                    /* Same id-rollback as the __serialize failure path. */
+                    /* Same id-rollback as the __serialize failure path. A
+                     * non-array __sleep return (no exception) keeps the
+                     * existing lossy-but-warned TAG_NULL behavior; only a
+                     * thrown exception aborts the whole frame. */
                     zval_ptr_dtor(&names_zv);
                     enc_unvisit_last(e, obj);
+                    if (EG(exception)) e->failed = 1;
                     smart_str_appendc(body, TAG_NULL);
                     return;
                 }
@@ -1194,18 +1235,6 @@ static void enc_write_key_idx_run(smart_str *body, uint32_t *key_idx, uint32_t n
     ZSTR_LEN(body->s) = pos;
 }
 
-static zval *enc_row_col_val(zval *row, uint32_t col_idx) {
-    HashTable *ht = Z_ARRVAL_P(row);
-    Bucket *b = ht->arData;
-    Bucket *end = b + ht->nNumUsed;
-    uint32_t c = 0;
-    for (; b < end; b++) {
-        if (Z_TYPE(b->val) == IS_UNDEF) continue;
-        if (c++ == col_idx) return &b->val;
-    }
-    return NULL;
-}
-
 static uint8_t enc_detect_column_tag(encode_ctx *e, zval **cells, uint32_t nrows) {
     uint8_t t0 = Z_TYPE_P(cells[0]);
     for (uint32_t r = 1; r < nrows; r++) {
@@ -1302,16 +1331,28 @@ static int enc_try_table(smart_str *body, encode_ctx *e, zval *zp, uint32_t n_us
         return 0;
     }
 
+    /* Gather cells column-major (col_cells[c * n_used + r]) but fill row-major:
+     * one linear walk of each row's buckets, assigning columns in order. The
+     * old code called enc_row_col_val(row, c) per (c, r), and that helper
+     * rescans the row from bucket 0 to reach column c — O(ncols) per call, so
+     * O(nrows * ncols^2) overall. enc_match_rowset_schema already proved every
+     * row has exactly ncols non-UNDEF keyed cells in matching key order, so the
+     * c-th non-UNDEF bucket is column c and a single pass suffices. */
     zval **col_cells = (zval **)safe_emalloc((size_t)ncols * n_used, sizeof(zval *), 0);
-    for (uint32_t c = 0; c < ncols; c++) {
-        for (uint32_t r = 0; r < n_used; r++) {
-            zval *cell = enc_row_col_val(&zp[r], c);
-            if (!cell) {
-                efree(col_cells);
-                efree(key_idx);
-                return 0;
-            }
-            col_cells[c * n_used + r] = cell;
+    for (uint32_t r = 0; r < n_used; r++) {
+        HashTable *ht = Z_ARRVAL(zp[r]);
+        Bucket *b = ht->arData;
+        Bucket *end = b + ht->nNumUsed;
+        uint32_t c = 0;
+        for (; b < end && c < ncols; b++) {
+            if (Z_TYPE(b->val) == IS_UNDEF) continue;
+            col_cells[c * n_used + r] = &b->val;
+            c++;
+        }
+        if (UNEXPECTED(c != ncols)) {
+            efree(col_cells);
+            efree(key_idx);
+            return 0;
         }
     }
 
@@ -1327,31 +1368,6 @@ static int enc_try_table(smart_str *body, encode_ctx *e, zval *zp, uint32_t n_us
         enc_emit_table_column(body, e, &col_cells[c * n_used], n_used, col_tag);
     }
     efree(col_cells);
-    return 1;
-}
-
-static int enc_try_rowset(smart_str *body, encode_ctx *e, zval *zp, uint32_t n_used) {
-    uint32_t ncols, *key_idx;
-    if (!enc_match_rowset_schema(e, zp, n_used, &key_idx, &ncols)) {
-        return 0;
-    }
-
-    e->wire_v2 = 1;
-    smart_str_appendc(body, TAG_ROWSET);
-    varint_write_u64(body, n_used);
-    varint_write_u64(body, ncols);
-    enc_write_key_idx_run(body, key_idx, ncols);
-    efree(key_idx);
-
-    for (uint32_t r = 0; r < n_used; r++) {
-        HashTable *ht = Z_ARRVAL(zp[r]);
-        Bucket *b = ht->arData;
-        Bucket *end = b + ht->nNumUsed;
-        for (; b < end; b++) {
-            if (Z_TYPE(b->val) == IS_UNDEF) continue;
-            encode_value(body, e, &b->val);
-        }
-    }
     return 1;
 }
 
@@ -1423,10 +1439,12 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
         }
         /* Dense packed, non-string lead — try a numeric typed-run tag. */
         uint8_t tag = detect_packed_run(ht, n_used);
+        /* enc_try_table emits TAG_TABLE on any homogeneous string-keyed rowset,
+         * including all-MIXED columns (each such column falls back to per-cell
+         * encode_value). It therefore supersedes the row-major TAG_ROWSET encode
+         * entirely, so there is no fallback call here. TAG_ROWSET decode is kept
+         * for payloads written by older releases. */
         if (tag == TAG_PACKED_MIXED && enc_try_table(body, e, zp, n_used)) {
-            return;
-        }
-        if (tag == TAG_PACKED_MIXED && enc_try_rowset(body, e, zp, n_used)) {
             return;
         }
         smart_str_appendc(body, tag);
@@ -1720,8 +1738,8 @@ static int dec_defer_wakeup(decode_ctx *d, zend_object *obj) {
  * index) before calling in, so this holds; the assert catches any future
  * caller that forgets. */
 #define DEC_CE_MISSING ((zend_class_entry *)(uintptr_t)-1)
-static inline zend_class_entry *dec_class_resolve(
-    decode_ctx *d, uint64_t class_idx, zend_string *class_name)
+static inline zend_class_entry *dec_class_resolve_ex(
+    decode_ctx *d, uint64_t class_idx, zend_string *class_name, int autoload)
 {
     ZEND_ASSERT(class_idx < d->dict_len);
     if (UNEXPECTED(!d->ce_cache)) {
@@ -1731,9 +1749,22 @@ static inline zend_class_entry *dec_class_resolve(
     if (EXPECTED(ce != NULL)) {
         return ce == DEC_CE_MISSING ? NULL : ce;
     }
-    ce = zend_lookup_class_ex(class_name, NULL, 0);
-    d->ce_cache[class_idx] = ce ? ce : DEC_CE_MISSING;
+    ce = zend_lookup_class_ex(class_name, NULL,
+                              autoload ? 0 : ZEND_FETCH_CLASS_NO_AUTOLOAD);
+    if (ce) {
+        d->ce_cache[class_idx] = ce;
+    } else if (autoload) {
+        /* Only memoize a miss when we actually tried autoloading. A
+         * no-autoload miss must not poison the cache: a later autoloading
+         * caller for the same class_idx still needs its chance to load. */
+        d->ce_cache[class_idx] = DEC_CE_MISSING;
+    }
     return ce;
+}
+static inline zend_class_entry *dec_class_resolve(
+    decode_ctx *d, uint64_t class_idx, zend_string *class_name)
+{
+    return dec_class_resolve_ex(d, class_idx, class_name, /* autoload */ 1);
 }
 
 /* Returns 1 if `class_name` (dict slot class_idx) is allowed by the current
@@ -1874,7 +1905,7 @@ static zend_always_inline zend_property_info *dec_prop_info_for_key(
  * become string-cast dynamic properties. Both regular classes without
  * __unserialize AND __PHP_Incomplete_Class for disallowed classes use
  * this path. */
-static void dec_apply_data_as_props(zend_object *obj, HashTable *data_ht) {
+static int dec_apply_data_as_props(zend_object *obj, HashTable *data_ht) {
     HashTable *obj_props = zend_std_get_properties(obj);
     zend_string *key;
     zend_ulong h;
@@ -1883,15 +1914,21 @@ static void dec_apply_data_as_props(zend_object *obj, HashTable *data_ht) {
         zval tmp;
         ZVAL_COPY(&tmp, val);  /* addref for the new owner */
         if (key) {
-            (void)dec_install_prop(obj, obj_props, key, &tmp);
+            /* dec_install_prop dtors tmp on a typed-slot mismatch and leaves a
+             * pending TypeError. Stop and report so the caller fails the decode
+             * instead of continuing to install props and queue __wakeup under a
+             * pending exception (fail-fast, like TAG_OBJECT / TAG_OBJECT_SLOTS). */
+            if (dec_install_prop(obj, obj_props, key, &tmp) < 0) return -1;
         } else {
             /* Int key — convert to string for the dynamic-property table,
              * matching PHP's behavior (creates property "0", "1", etc.). */
             zend_string *str_key = zend_long_to_str((zend_long)h);
-            (void)dec_install_prop(obj, obj_props, str_key, &tmp);
+            int rc = dec_install_prop(obj, obj_props, str_key, &tmp);
             zend_string_release(str_key);
+            if (rc < 0) return -1;
         }
     } ZEND_HASH_FOREACH_END();
+    return 0;
 }
 
 /* Build an __PHP_Incomplete_Class instance with the original class name
@@ -2443,7 +2480,14 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                  * preserves the serialized props on __PHP_Incomplete_Class.
                  * Without this, the serialized state is silently
                  * dropped. */
-                dec_apply_data_as_props(Z_OBJ_P(out), Z_ARRVAL(data));
+                if (dec_apply_data_as_props(Z_OBJ_P(out), Z_ARRVAL(data)) < 0) {
+                    /* A typed slot rejected the data (pending TypeError). `out`
+                     * is registered; decode_destroy releases it during
+                     * teardown — same convention as the decode-failure path
+                     * above. Do not queue __wakeup. */
+                    zval_ptr_dtor(&data);
+                    return -1;
+                }
                 zval_ptr_dtor(&data);
                 /* Native then calls __wakeup() if the (instantiable, allowed)
                  * class defines it: a __serialize()+__wakeup() class without
@@ -2496,35 +2540,49 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             if (!class_name) return -1;
 
             int allowed = dec_class_allowed(d, class_idx, class_name);
-            /* Slot layout comes from the named class even when the filter
-             * denies instantiation — wire carries values only, no key names. */
-            zend_class_entry *schema_ce = dec_class_resolve(d, class_idx, class_name);
-            if (!schema_ce) {
-                return -1;
-            }
-            if (nprops != ce_table_slot_count(schema_ce)) {
-                return -1;
-            }
 
             if (!allowed) {
+                /* Denied class. Resolve WITHOUT autoloading: the slot layout is
+                 * only needed to name the values, and autoloading an
+                 * attacker-chosen class is exactly the side effect
+                 * allowed_classes exists to prevent. (Other object tags carry
+                 * inline key names, so they never resolve a denied class; SLOTS
+                 * carries values only, which is why the earlier code resolved
+                 * unconditionally.) If the class is already resident we can
+                 * still map props onto the incomplete instance; otherwise
+                 * consume the values and leave it property-less. */
+                zend_class_entry *schema_ce =
+                    dec_class_resolve_ex(d, class_idx, class_name, /* autoload */ 0);
                 if (dec_make_incomplete(out, class_name) < 0) return -1;
                 dec_register(d, out);
                 zend_object *obj = Z_OBJ_P(out);
-                HashTable *obj_props = zend_std_get_properties(obj);
-                int pc = schema_ce->default_properties_count;
-                for (int pi = 0; pi < pc; pi++) {
-                    zend_property_info *info = schema_ce->properties_info_table[pi];
-                    if (info == NULL) continue;
-                    zval tmp;
-                    if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
-                    if (dec_install_prop(obj, obj_props, info->name, &tmp) < 0) {
-                        goto slots_fail;
+                if (schema_ce) {
+                    if (nprops != ce_table_slot_count(schema_ce)) goto slots_fail;
+                    HashTable *obj_props = zend_std_get_properties(obj);
+                    int pc = schema_ce->default_properties_count;
+                    for (int pi = 0; pi < pc; pi++) {
+                        zend_property_info *info = schema_ce->properties_info_table[pi];
+                        if (info == NULL) continue;
+                        zval tmp;
+                        if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
+                        if (dec_install_prop(obj, obj_props, info->name, &tmp) < 0) {
+                            goto slots_fail;
+                        }
+                    }
+                } else {
+                    for (uint64_t i = 0; i < nprops; i++) {
+                        zval tmp;
+                        if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
+                        zval_ptr_dtor(&tmp);
                     }
                 }
                 return 0;
             }
 
-            zend_class_entry *ce = schema_ce;
+            /* Allowed: the layout must come from the real class. */
+            zend_class_entry *ce = dec_class_resolve(d, class_idx, class_name);
+            if (!ce) return -1;
+            if (nprops != ce_table_slot_count(ce)) return -1;
             if (ce->ce_flags & (ZEND_ACC_NOT_SERIALIZABLE | ZEND_ACC_UNINSTANTIABLE)) {
                 return -1;
             }
@@ -2538,6 +2596,32 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             }
             zend_object *obj = Z_OBJ_P(out);
             dec_register(d, out);
+
+            /* __unserialize precedence, mirroring TAG_OBJECT (2630+). The
+             * encoder never emits SLOTS for a class with __unserialize, so this
+             * only fires on adversarial wire or a class that GAINED
+             * __unserialize after the payload was written. Decide the rebuild
+             * path from the current class like native does: hand the slot values
+             * to __unserialize as a name→value array; never install raw slots or
+             * queue __wakeup (which would skip the invariant rebuild). */
+            if (ce->__unserialize != NULL) {
+                zval data;
+                array_init_size(&data, (uint32_t)nprops);
+                zend_hash_real_init_mixed(Z_ARRVAL(data));
+                int pc = ce->default_properties_count;
+                for (int pi = 0; pi < pc; pi++) {
+                    zend_property_info *info = ce->properties_info_table[pi];
+                    if (info == NULL) continue;
+                    zval tmp;
+                    if (decode_value_hot(d, &tmp) < 0) {
+                        zval_ptr_dtor(&data);
+                        goto slots_fail;
+                    }
+                    zend_hash_update(Z_ARRVAL(data), info->name, &tmp);
+                }
+                dec_defer_unserialize(d, obj, &data);
+                return 0;
+            }
 
             int pc = ce->default_properties_count;
             for (int pi = 0; pi < pc; pi++) {
@@ -3097,9 +3181,20 @@ static int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n
  * request shutdown (the session auto-save path runs with no execution
  * frame) surfaces as an uncaught fatal that the hook cannot intercept.
  * Every other input yields a payload (worst case an empty TAG_NULL body). */
-static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
+/* Why phpser_encode_zval_ex returned NULL, so callers can report accurately
+ * (the session encoder must not blame "depth" for a size or exception abort). */
+typedef enum {
+    PHPSER_ENC_OK = 0,
+    PHPSER_ENC_DEPTH,
+    PHPSER_ENC_SIZE,
+    PHPSER_ENC_EXCEPTION,
+} phpser_enc_status;
+
+static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
+                                          phpser_enc_status *status) {
     encode_ctx ctx;
     enc_ctx_init(&ctx);
+    if (status) *status = PHPSER_ENC_OK;
 
     smart_str body = {0};
     /* Pre-size body to skip 5-6 geometric grow cycles that an unconfigured
@@ -3119,11 +3214,23 @@ static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
     smart_str_alloc(&body, body_estimate, 0);
     encode_value(&body, &ctx, value);
 
+    /* A userland __serialize/__sleep/Serializable::serialize threw mid-walk.
+     * Never hand back the truncated frame (it has a TAG_NULL hole where the
+     * throwing object was); the exception stays pending for the caller. Check
+     * before the overflow branches so we never raise a competing depth/size
+     * exception on top of the userland one. */
+    if (UNEXPECTED(ctx.failed)) {
+        smart_str_free(&body);
+        enc_ctx_destroy(&ctx);
+        if (status) *status = PHPSER_ENC_EXCEPTION;
+        return NULL;
+    }
     /* Reject over-deep input rather than ship a truncated payload. The
      * decoder caps at the same MAX_DEPTH, so a payload that hit the encode
      * cap would decode to NULL in full — silent total data loss. Fail
      * loud here instead. */
     if (UNEXPECTED(ctx.depth_exceeded)) {
+        if (status) *status = PHPSER_ENC_DEPTH;
         smart_str_free(&body);
         enc_ctx_destroy(&ctx);
         if (throw_on_overflow) {
@@ -3136,6 +3243,7 @@ static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
      * per-string UINT32_MAX cap would reject the whole payload, so refuse to
      * emit one rather than hand back undecodable bytes. */
     if (UNEXPECTED(ctx.size_exceeded)) {
+        if (status) *status = PHPSER_ENC_SIZE;
         smart_str_free(&body);
         enc_ctx_destroy(&ctx);
         if (throw_on_overflow) {
@@ -3176,6 +3284,10 @@ static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
 
     enc_ctx_destroy(&ctx);
     return out.s;
+}
+
+static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
+    return phpser_encode_zval_ex(value, throw_on_overflow, NULL);
 }
 
 /* Reusable decode: parse a framed payload into `out`. Returns 0 on success,
@@ -3313,10 +3425,30 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
      * writes ZSTR_EMPTY_ALLOC() on a NULL result (the empty write is
      * unavoidable through the serializer-hook contract, and a >MAX_DEPTH
      * $_SESSION can't round-trip regardless). */
-    zend_string *out = phpser_encode_zval(session_vars, /* throw_on_overflow */ false);
+    phpser_enc_status status = PHPSER_ENC_OK;
+    zend_string *out = phpser_encode_zval_ex(session_vars,
+                                             /* throw_on_overflow */ false, &status);
     if (UNEXPECTED(!out)) {
-        php_error_docref(NULL, E_WARNING,
-            "phpser: $_SESSION not serialized — nesting depth exceeds %d", MAX_DEPTH);
+        switch (status) {
+        case PHPSER_ENC_SIZE:
+            php_error_docref(NULL, E_WARNING,
+                "phpser: $_SESSION not serialized — a value exceeds the 4 GiB "
+                "wire-format limit");
+            break;
+        case PHPSER_ENC_EXCEPTION:
+            /* A __serialize/__sleep hook in the session graph threw. The
+             * exception is pending; don't overwrite it, just decline to
+             * persist a partial graph. */
+            php_error_docref(NULL, E_WARNING,
+                "phpser: $_SESSION not serialized — a serialization hook threw");
+            break;
+        case PHPSER_ENC_DEPTH:
+        default:
+            php_error_docref(NULL, E_WARNING,
+                "phpser: $_SESSION not serialized — nesting depth exceeds %d",
+                MAX_DEPTH);
+            break;
+        }
         return NULL;
     }
     return out;
@@ -3540,11 +3672,26 @@ PHP_FUNCTION(phpser_unserialize_signed) {
      * our encoder, which serializes unique-keyed PHP HashTables — no duplicate
      * assoc keys — so the assoc decode loop can use add_new and skip the
      * per-key dup-find. */
-    phpser_decode_buf_opts(payload, frame_len, return_value, allowed_mode, allowed_set, /* trusted */ 1);
+    int rc = phpser_decode_buf_opts(payload, frame_len, return_value, allowed_mode,
+                                    allowed_set, /* trusted */ 1);
 
     if (allowed_set) {
         zend_hash_destroy(allowed_set);
         efree(allowed_set);
+    }
+
+    /* A valid HMAC over a body that then fails to decode (corruption, or a
+     * class the payload needs was removed since it was signed) is an error,
+     * not data — throw rather than return a silent null the caller can't
+     * distinguish from a legitimately-signed null (which decodes as rc==0).
+     * Mirrors the signature-failure throw above. If the decode already left an
+     * exception pending (e.g. a __wakeup hook threw), let that propagate. */
+    if (rc < 0) {
+        if (!EG(exception)) {
+            zend_throw_exception(zend_ce_exception,
+                "phpser: signed payload failed to decode", 0);
+        }
+        RETURN_THROWS();
     }
 }
 

@@ -2,7 +2,7 @@
 
 ## Requirements
 
-- PHP 8.3 or later (debug build recommended for development:
+- PHP 8.2 or later (debug build recommended for development:
   `--enable-debug`)
 - C compiler: GCC 11+, Clang 14+, or MSVC 2019+
 - `phpize` and `php-config` (from `php-dev` or `php8.x-dev`)
@@ -102,8 +102,10 @@ minor — the gen_stub script lives under `build/`).
   already say that. Comments should explain *why* (a hidden constraint,
   workaround, or surprising behavior).
 - Wire-format changes need a corresponding update to the "Wire format"
-  section in `README.md` and a bump of `WIRE_VERSION` if backwards
-  compatibility breaks.
+  section in `README.md`. Additive tags bump the emitted wire byte to
+  `PHPSER_VERSION_V2` (`0x02`); a backwards-incompatible change needs a new
+  `PHPSER_VERSION*` constant (both defined in `phpser.c`) and a decoder that
+  still accepts the older byte.
 
 ### Performance changes
 
@@ -136,7 +138,7 @@ For maintainers cutting a new version:
    then `git push origin X.Y.Z`. Use bare semver (`0.1.1`, not
    `v0.1.1`) to match the fleet convention.
 4. The `release-windows.yml` and `release-linux.yml` workflows pick
-   up the tag, build the full matrix (PHP 8.3-8.5 x TS/NTS x x86/x64
+   up the tag, build the full matrix (PHP 8.2-8.5 x TS/NTS x x86/x64
    for Windows; PHP 8.4-8.5 x glibc/macOS for Linux), and attach the
    binaries to the release.
 5. Packagist's GitHub webhook fires on tag push and re-scans

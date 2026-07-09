@@ -86,7 +86,9 @@ $key = random_bytes(32);  // store this key in your app config; an empty key is 
 $payload = phpser_serialize_signed($cacheValue, $key);
 // ... later, possibly across a process boundary ...
 $value = phpser_unserialize_signed($payload, $key);
-// throws an Exception if the payload was tampered or signed with a different key
+// throws an Exception if the payload was tampered or signed with a different key,
+// or if it verifies but the body then fails to decode (corruption, or a class it
+// needs was removed since signing). A legitimately-signed null decodes to null.
 ```
 
 `allowed_classes` option on both unserialize entry points. Same shape as
@@ -268,10 +270,21 @@ as a `session.serialize_handler` when available.
   orders of magnitude past any legitimate payload.
 - **Closures and resources encode as `NULL`.** Same shape as PHP's own
   `serialize()`; these types are inherently non-serializable.
-- **Unknown classes at decode fall back to `stdClass`** rather than PHP's
-  `__PHP_Incomplete_Class`. This is deliberate for the typical cache
-  workload; `allowed_classes => [...]` produces `__PHP_Incomplete_Class`
-  with the original name preserved for disallowed classes, matching PHP.
+- **Unknown classes at decode fall back to `stdClass`** for plain objects
+  and `__serialize`-based objects, rather than PHP's `__PHP_Incomplete_Class`.
+  This is deliberate for the typical cache workload; `allowed_classes => [...]`
+  produces `__PHP_Incomplete_Class` with the original name preserved for
+  disallowed classes, matching PHP. The fallback does **not** apply to every
+  wire shape: a positional DTO (`TAG_OBJECT_SLOTS`) or an enum (`TAG_ENUM`)
+  whose class no longer exists fails the whole decode (returns `null`) —
+  slots carry only values, so without the class schema there is nothing to
+  decode into — and a legacy `Serializable` value (`TAG_OBJECT_LEGACY`) whose
+  class is gone decodes as `null` in place. Evolve classes append-only if
+  cached payloads must outlive a class rename.
+- **Strings and blobs are capped at 4 GiB (`UINT32_MAX`) on the wire.**
+  Encoding a longer value fails loud (throws for the userland API, an
+  `E_WARNING` for the session handler) rather than emitting bytes the decoder
+  would reject. No single cache value realistically approaches this.
 - **`TAG_OBJECT_SLOTS` is positional.** Eligible typed objects encode their
   declared properties as values in `properties_info_table` (declaration)
   order with no per-property names; decode installs them back in that order.
@@ -286,7 +299,13 @@ as a `session.serialize_handler` when available.
   `phpize` detects the session extension; gated on `HAVE_PHP_SESSION` so
   the extension still loads on session-less PHP builds). `phpredis`
   integration is not yet wired; call `phpser_serialize`/`unserialize`
-  directly when using the extension as a phpredis serializer.
+  directly when using the extension as a phpredis serializer. The handler
+  serializes `$_SESSION` as a single phpser array value — it is **not**
+  byte-compatible with the built-in `php`, `php_binary`, or `igbinary`
+  session formats, so switching handlers doesn't read back sessions written
+  by another. It also decodes with all classes allowed and magic methods
+  enabled: treat the session store as trusted, exactly as with the native
+  `php_serialize` handler.
 
 ## Wire format (V1 / V2)
 
@@ -340,6 +359,15 @@ Varints are LEB128 (unsigned); signed values use zigzag encoding. Tags
 0x10/0x11 plus 0x0a/0x0d/0x0e/0x0f each implicitly claim the next id in
 encounter order, so the decoder reconstructs back-refs by counting
 container tags as it parses.
+
+The version byte is emitted as `0x02` only when the body actually uses a
+v2-only tag (`0x12`–`0x15`); otherwise it stays `0x01`. On decode it is a
+*minimum-reader* signal, not a gate: the tag dispatch is version-agnostic,
+so a hand-built frame carrying a v2 tag under a `0x01` header still decodes.
+This tolerance is deliberate — it keeps the byte purely additive — so don't
+rely on the version byte alone to reject a future format; a
+backwards-incompatible change gets a new version constant *and* explicit tag
+rejection.
 
 ## 🔗 Native PHP extensions
 
