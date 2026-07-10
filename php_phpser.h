@@ -23,7 +23,7 @@
 
 #include "php.h"
 
-#define PHP_PHPSER_VERSION "0.3.0"
+#define PHP_PHPSER_VERSION "0.4.0"
 #define PHP_PHPSER_EXTNAME "phpser"
 
 extern zend_module_entry phpser_module_entry;

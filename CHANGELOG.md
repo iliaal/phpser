@@ -7,10 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-10
+
 ### Changed
 
 - `phpser_unserialize_signed()` now throws instead of returning `null` when a payload verifies but its body fails to decode; a legitimately-signed `null` still decodes. (BC: callers must catch the exception for corrupt signed payloads.)
 - `TAG_TABLE` encode gathers columns in one row-major pass instead of O(rows × cols²) per-column rescans; rowset encode ~20% faster (aarch64), no wire-format change.
+- Rowset and table (`TAG_ROWSET`/`TAG_TABLE`) decode is ~24% faster (aarch64): dictionary strings resolve against the engine's interned-string table, and unique-schema rows skip the per-key duplicate check. No wire-format change.
 - Removed the unreachable `TAG_ROWSET` encode path; `TAG_TABLE` already covers every string-keyed rowset. `TAG_ROWSET` decode is retained for older payloads.
 
 ### Fixed
@@ -214,7 +217,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.3.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.4.0...HEAD
+[0.4.0]: https://github.com/iliaal/phpser/releases/tag/0.4.0
 [0.3.0]: https://github.com/iliaal/phpser/releases/tag/0.3.0
 [0.2.0]: https://github.com/iliaal/phpser/releases/tag/0.2.0
 [0.1.2]: https://github.com/iliaal/phpser/releases/tag/0.1.2
