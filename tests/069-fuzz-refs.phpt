@@ -40,12 +40,12 @@ echo ($rt === null) ? "newref_trunc OK\n" : "newref_trunc FAIL\n";
 // its inner value, so this is a ref-to-self via TAG_REF inside its own
 // TAG_NEW_REF. PHP allows this shape ($r = &$r style). ---
 $rt = phpser_unserialize("\x01\x00\x11\x10\x00");
-// Self-referencing ref. PHP-style: a reference whose value IS the
-// reference itself (a degenerate but legal cycle).
-// We accept it without crash; the deref yields the ref itself, which on
-// PHP-zval-display is *RECURSION*. Just check no crash + something
-// non-null comes back.
-echo ($rt !== null || true) ? "newref_self OK\n" : "newref_self FAIL\n";
+// Self-referencing ref: a reference whose value IS the reference itself
+// (the degenerate $r = &$r cycle). phpser flattens references, so this
+// shape can't be represented and the decoder rejects it to NULL rather
+// than crashing. Pin that value — the earlier `|| true` made this assert
+// a tautology that would pass for any result, including a future crash.
+echo ($rt === null) ? "newref_self OK\n" : "newref_self FAIL\n";
 
 // --- TAG_NEW_REF nested deeply: depth bomb. Our decoder has no explicit
 // max-depth on the decode side, but the C stack frame per recursion is

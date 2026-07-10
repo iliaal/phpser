@@ -9,23 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- **BC:** `phpser_unserialize_signed()` now throws when a payload passes HMAC verification but its body fails to decode (corruption, or a class the payload needs was removed since it was signed), instead of returning `null`. A silent `null` was indistinguishable from a legitimately-signed `null` value; a legitimately-signed `null` still decodes without throwing. This matches the signature-failure path, which already throws. Callers that relied on the `null` return for a corrupt signed payload must catch the exception.
-- `TAG_TABLE` encode gathers columns in a single row-major pass instead of rescanning each row from the start for every column (was O(rows × cols²)); rowset encode is ~8% faster with no wire-format change.
-- Removed the unreachable `TAG_ROWSET` encode path. `TAG_TABLE` already covers every homogeneous string-keyed rowset — all-`PACKED_MIXED` columns fall back to per-cell encoding within `TAG_TABLE` — so the row-major `TAG_ROWSET` was never emitted. `TAG_ROWSET` **decode** is retained for payloads written by earlier releases. (The 0.3.0 "falls back to `TAG_ROWSET`" note never applied.)
+- `phpser_unserialize_signed()` now throws instead of returning `null` when a payload verifies but its body fails to decode; a legitimately-signed `null` still decodes. (BC: callers must catch the exception for corrupt signed payloads.)
+- `TAG_TABLE` encode gathers columns in one row-major pass instead of O(rows × cols²) per-column rescans; rowset encode ~20% faster (aarch64), no wire-format change.
+- Removed the unreachable `TAG_ROWSET` encode path; `TAG_TABLE` already covers every string-keyed rowset. `TAG_ROWSET` decode is retained for older payloads.
 
 ### Fixed
 
-- Decoding a truncated or corrupt `TAG_TABLE` column could dereference uninitialized memory during error cleanup, crashing on malformed input (present since 0.3.0). The decoder now blanks unfilled column cells before releasing them.
-- Rowset/table decode of an untrusted payload whose schema key is a canonical integer string (e.g. `"5"`) now coerces it to an integer array key, matching PHP array semantics and the associative-array decode path.
-- `TAG_OBJECT_MAGIC` decode now fails the whole payload when a typed property rejects the decoded value, instead of continuing to install properties and queueing `__wakeup` while a `TypeError` is pending.
-- A userland `__serialize` / `__sleep` / `Serializable::serialize` that throws mid-encode no longer yields a truncated frame with a `TAG_NULL` hole. Encode aborts and leaves the exception pending; the session handler declines to persist a partial `$_SESSION` instead of writing a corrupt graph.
-- An over-4 GiB string or blob is now skipped rather than copied into the encode buffer before the size check rejects the payload, avoiding a transient ~2× peak-memory spike.
-- The session-encode `E_WARNING` now names the actual failure (nesting depth, the 4 GiB string limit, or a throwing serialization hook) instead of always reporting nesting depth.
+- Fixed a crash decoding a truncated or corrupt `TAG_TABLE` column that dereferenced uninitialized memory during error cleanup (since 0.3.0).
+- Rowset/table decode now coerces a canonical integer-string schema key (e.g. `"5"`) to an integer array key, matching PHP array semantics.
+- `TAG_OBJECT_MAGIC` decode now fails the payload when a typed property rejects the value, instead of installing properties under a pending `TypeError`.
+- A throwing `__serialize`/`__sleep`/`Serializable::serialize` no longer yields a truncated frame; encode aborts and the session handler declines to persist a partial `$_SESSION`.
+- An over-4 GiB string or blob is skipped rather than copied into the encode buffer before rejection, avoiding a transient ~2× memory spike.
+- The session-encode `E_WARNING` now names the actual cause (depth, the 4 GiB limit, or a throwing hook) instead of always reporting depth.
+- `__sleep()` fixes its member set when it returns, matching native `serialize()`; a property created while an earlier member serializes is no longer included.
 
 ### Security
 
-- `TAG_OBJECT_SLOTS` decode now honors `__unserialize`: a crafted slots frame — or a class that gained `__unserialize` after its payload was written — routes decoded values through `__unserialize` like keyed `TAG_OBJECT`, rather than installing raw property slots and running `__wakeup`. This closes an invariant-rebuild bypass reachable with hand-crafted bytes on the untrusted decode path.
-- A `TAG_OBJECT_SLOTS` payload naming a disallowed class (`allowed_classes`) is no longer autoloaded: class resolution is skipped unless the class is already resident, so a filtered payload can't trigger autoload of an attacker-chosen class name. Other object tags already skipped resolution for denied classes; slots was the exception.
+- `TAG_OBJECT_SLOTS` decode now routes values through `__unserialize` when the class defines it, like keyed `TAG_OBJECT`, instead of installing raw slots and running `__wakeup`; closes an invariant-rebuild bypass on the untrusted path.
+- A `TAG_OBJECT_SLOTS` payload naming a disallowed class is no longer autoloaded; resolution is skipped unless the class is already resident, matching the other object tags.
+- Decoding a denied class no longer lets a wire property named `__PHP_Incomplete_Class_Name` overwrite the placeholder's preserved name, which could resurrect an attacker-chosen class on a later decode (since 0.3.0).
 
 ## [0.3.0] - 2026-07-03
 

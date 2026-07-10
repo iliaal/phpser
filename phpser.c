@@ -594,6 +594,24 @@ static uint32_t enc_dict_append(encode_ctx *e, zend_string *zs) {
     return idx;
 }
 
+/* Seed the pointer-equality icache with a DICT mapping for `zs` after a
+ * CONTENT-hash hit — where the dict entry at `idx` is a DIFFERENT zend_string
+ * with the same bytes, so the dict holds no refcount on `zs`. Safe ONLY for
+ * interned strings: a non-interned temp (e.g. a key/value borrowed from a
+ * __serialize return array that is dtored mid-encode) can have its address
+ * reused by a later string, turning the stale DICT slot into a false
+ * pointer-equality hit that emits the wrong dict index — silent payload
+ * corruption. Interned strings live for the request and are never freed, so
+ * their address is a stable key. A non-interned string just re-probes the
+ * content hash (O(1)) on its next occurrence. (Seeding after enc_dict_append,
+ * by contrast, is always safe: that path holds a refcount on `zs` itself.) */
+static zend_always_inline void enc_seed_dict_on_hit(
+    encode_ctx *e, intern_slot *s, zend_string *zs, uint32_t idx)
+{
+    if (!ZSTR_IS_INTERNED(zs)) return;
+    if (s) { s->idx = idx; } else { enc_cache_alloc_slot(e, zs)->idx = idx; }
+}
+
 /* Always-dict intern path: used for object class names and property keys,
  * which we don't try to inline (TAG_OBJECT wire format hardcodes dict refs
  * for those slots). */
@@ -609,10 +627,7 @@ static int enc_str_dict_idx(encode_ctx *e, zend_string *zs, uint32_t *out_idx) {
         zval *hit = zend_hash_find(&e->hash_map, zs);
         if (hit) {
             uint32_t idx = (uint32_t)Z_LVAL_P(hit);
-            /* Seed the pointer-equality cache so a repeated probe for this
-             * same interned string skips the hash lookup — matches what
-             * enc_intern_zstr does on its content-map hit. */
-            if (s) { s->idx = idx; } else { enc_cache_alloc_slot(e, zs)->idx = idx; }
+            enc_seed_dict_on_hit(e, s, zs, idx);
             *out_idx = idx;
             return 1;
         }
@@ -630,7 +645,7 @@ static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
         zval *hit = zend_hash_find(&e->hash_map, zs);
         if (hit) {
             uint32_t idx = (uint32_t)Z_LVAL_P(hit);
-            if (s) { s->idx = idx; } else { enc_cache_alloc_slot(e, zs)->idx = idx; }
+            enc_seed_dict_on_hit(e, s, zs, idx);
             return idx;
         }
     }
@@ -681,7 +696,7 @@ static zend_always_inline void enc_emit_str_tagged(
         zval *hit = zend_hash_find(&e->hash_map, zs);
         if (hit) {
             uint32_t idx = (uint32_t)Z_LVAL_P(hit);
-            enc_cache_alloc_slot(e, zs)->idx = idx;
+            enc_seed_dict_on_hit(e, s, zs, idx);  /* s==NULL here; interned-only */
             emit_tag_and_varint(body, dict_tag, idx);
             return;
         }
@@ -985,15 +1000,21 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     return;
                 }
                 HashTable *names_ht = Z_ARRVAL(names_zv);
-                /* Single pass: each __sleep name costs one properties_info
-                 * lookup (not two), and the skip rules live in exactly one
-                 * place so a count/emit drift is impossible by construction.
-                 * nprops is back-patched once the loop knows the live count. */
-                smart_str_appendc(body, TAG_OBJECT);
-                varint_write_u64(body, class_idx);
-                size_t nprops_off = ZSTR_LEN(body->s);
-                smart_str_appendc(body, 0);  /* placeholder, patched below */
-                uint32_t nprops = 0;
+                /* Snapshot the selected (key, value) set BEFORE emitting any
+                 * value. Emitting a property runs its __serialize/__sleep,
+                 * which can mutate this object's property table — e.g. create a
+                 * property that __sleep listed later. Native fixes the member
+                 * set at __sleep-return time; reading live during emission would
+                 * include such late additions. Capture the set now (COW-copy
+                 * each value to pin it against mutation/free), then emit from the
+                 * snapshot. Keys stay borrowed: info->name is interned and
+                 * dynamic-prop names come from the __sleep return array (held
+                 * live until after emit), so neither pointer can move. The
+                 * lookup/skip rules live in exactly one place, so a count/emit
+                 * drift is impossible by construction. */
+                zend_string **snap_keys = NULL;
+                zval *snap_vals = NULL;
+                uint32_t nprops = 0, snap_cap = 0;
                 zval *zv_name;
                 ZEND_HASH_FOREACH_VAL(names_ht, zv_name) {
                     if (Z_TYPE_P(zv_name) != IS_STRING) continue;
@@ -1015,11 +1036,26 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     } else {
                         continue;
                     }
-                    varint_write_u64(body, enc_intern_zstr(e, key));
-                    encode_value(body, e, p);
+                    if (nprops == snap_cap) {
+                        snap_cap = snap_cap ? snap_cap * 2 : 8;
+                        snap_keys = erealloc(snap_keys, snap_cap * sizeof(zend_string *));
+                        snap_vals = erealloc(snap_vals, snap_cap * sizeof(zval));
+                    }
+                    snap_keys[nprops] = key;
+                    ZVAL_COPY(&snap_vals[nprops], p);
                     nprops++;
                 } ZEND_HASH_FOREACH_END();
-                enc_patch_nprops(body, nprops_off, nprops);
+
+                smart_str_appendc(body, TAG_OBJECT);
+                varint_write_u64(body, class_idx);
+                varint_write_u64(body, nprops);
+                for (uint32_t i = 0; i < nprops; i++) {
+                    varint_write_u64(body, enc_intern_zstr(e, snap_keys[i]));
+                    encode_value(body, e, &snap_vals[i]);
+                }
+                for (uint32_t i = 0; i < nprops; i++) zval_ptr_dtor(&snap_vals[i]);
+                if (snap_keys) efree(snap_keys);
+                if (snap_vals) efree(snap_vals);
                 zval_ptr_dtor(&names_zv);
                 return;
             }
@@ -1696,6 +1732,28 @@ static int dec_register(decode_ctx *d, zval *z) {
     return 0;
 }
 
+/* Pin every id registered at or after `start` that isn't already pinned. The
+ * trusted (signed) fast-path skips the per-object pin in dec_register on the
+ * invariant "the object stays alive via its owning zval in the returned graph."
+ * A discard path (denied unloaded TAG_OBJECT_SLOTS) decodes values only to drop
+ * them — they have no owning zval, so without a pin a later TAG_REF to their id
+ * deref's freed memory. Call this while the owning zval is still live (before
+ * the dtor). No-op on the untrusted path (those ids are pinned already) and for
+ * ID_NULL slots. */
+static void dec_pin_since(decode_ctx *d, uint32_t start) {
+    for (uint32_t i = start; i < d->id_table_len; i++) {
+        id_slot *s = &d->id_table[i];
+        if (s->pinned) continue;
+        if (s->kind == ID_OBJ) {
+            GC_ADDREF(s->u.obj);
+            s->pinned = 1;
+        } else if (s->kind == ID_REF) {
+            GC_ADDREF(s->u.ref);
+            s->pinned = 1;
+        }
+    }
+}
+
 static int dec_defer_unserialize(decode_ctx *d, zend_object *obj, zval *data) {
     if (d->deferred_len == d->deferred_cap) {
         d->deferred_cap = d->deferred_cap ? d->deferred_cap * 2 : 4;
@@ -1823,6 +1881,19 @@ static int dec_install_declared_slot(zend_object *obj, zend_property_info *info,
 
 static int dec_install_prop(zend_object *obj, HashTable *obj_props,
                             zend_string *key, zval *tmp) {
+    /* An incomplete-class placeholder (denied allowed_classes) reserves
+     * __PHP_Incomplete_Class_Name for the engine-set original class name. A
+     * wire property with that exact name would overwrite the marker, letting a
+     * crafted payload dictate the class the object reserializes as and
+     * resurrect an arbitrary class on a later trusted decode — defeating the
+     * filter across a store-reload cycle. The encoder never emits this member
+     * for an incomplete object, so no legitimate payload carries it here; drop
+     * it. (Stricter than native unserialize, which lets it clobber.) */
+    if (UNEXPECTED(obj->ce == PHP_IC_ENTRY)
+        && zend_string_equals_literal(key, MAGIC_MEMBER)) {
+        zval_ptr_dtor(tmp);
+        return 0;
+    }
     zval *existing = zend_hash_find(obj_props, key);
     if (existing) {
         if (Z_TYPE_P(existing) == IS_INDIRECT) {
@@ -2570,9 +2641,16 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                         }
                     }
                 } else {
+                    /* No resident schema: consume the values but keep them for
+                     * the wire's sake (a later TAG_REF may point back at one).
+                     * Pin each before dropping our only reference, or the
+                     * signed fast-path (unpinned) would free an id_table entry
+                     * a back-ref later deref's. */
                     for (uint64_t i = 0; i < nprops; i++) {
+                        uint32_t id_start = d->id_table_len;
                         zval tmp;
                         if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
+                        dec_pin_since(d, id_start);
                         zval_ptr_dtor(&tmp);
                     }
                 }
