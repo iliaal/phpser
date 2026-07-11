@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Trusted (signed) `TAG_ASSOC_DICT` decode no longer builds a phantom duplicate-key bucket when a forged-but-signed payload carries a repeated key: the `add_new` fast path is gated on proven key uniqueness (and non-numeric keys) like the rowset/table paths, otherwise it falls back to last-write-wins. This also coerces a canonical integer-string key (e.g. `"5"`) to an int array key on the signed path, matching PHP array semantics.
+- Encode aborts with the pending exception when a lazy object's initializer throws during serialization (and when a legacy `Serializable` C serializer returns success with an exception pending), instead of returning a truncated frame the session handler would persist.
+
 ## [0.4.0] - 2026-07-10
 
 ### Changed

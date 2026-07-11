@@ -74,6 +74,16 @@ enum Color { case Red; case Blue; }
 $rt = phpser_unserialize(phpser_serialize(Color::Red), ['allowed_classes' => false]);
 echo ($rt instanceof __PHP_Incomplete_Class) ? "enum_filtered OK\n" : "enum_filtered FAIL\n";
 
+// --- Enum filtered via an ARRAY allowlist that omits it (distinct code path
+// from the `false` fast-path: array membership check on TAG_ENUM). ---
+$rt = phpser_unserialize(phpser_serialize(Color::Blue), ['allowed_classes' => ['Approved']]);
+echo ($rt instanceof __PHP_Incomplete_Class) ? "enum_array_denied OK\n" : "enum_array_denied FAIL\n";
+
+// --- Enum allowed via an ARRAY allowlist that includes it comes back as the
+// real case singleton. ---
+$rt = phpser_unserialize(phpser_serialize(Color::Blue), ['allowed_classes' => [Color::class]]);
+echo ($rt === Color::Blue) ? "enum_array_allowed OK\n" : "enum_array_allowed FAIL\n";
+
 // --- Filter is recursive: nested object in __serialize data gets filtered too.
 // Untyped slot — a typed slot would reject the incomplete class at assignment
 // time (real-world allowed_classes pattern: don't use typed object props if
@@ -146,6 +156,8 @@ case_insensitive OK
 magic_filtered OK
 legacy_filtered OK
 enum_filtered OK
+enum_array_denied OK
+enum_array_allowed OK
 nested_filter OK
 invalid_option OK
 empty_array OK

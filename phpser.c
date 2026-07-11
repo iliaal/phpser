@@ -133,6 +133,33 @@
 
 /* A u64 varint is at most 10 bytes (ceil(64/7)); a tag + varint at most 11. */
 #define VARINT_MAX_BYTES 10
+/* Worst-case varint bytes for a value known to fit uint32 (ceil(32/7)). Used
+ * only for pre-size estimates of dict-length / dict-index runs, which the
+ * decoder caps at UINT32_MAX. */
+#define VARINT_MAX_BYTES_U32 5
+
+/* Cursor-style wire writers for batch emit sites that reserve the worst-case
+ * byte count once (VARINT_MAX_BYTES / 8 per element) and then write raw into
+ * `base`, advancing an offset. Single definition of the varint shift-loop and
+ * the little-endian double layout — a new packed/columnar path calls these
+ * instead of open-coding the loop, so the wire encoding can't drift between
+ * copies. Callers must have reserved capacity; these do no bounds check. */
+static zend_always_inline size_t varint_put(char *base, size_t pos, uint64_t v) {
+    while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
+    base[pos++] = (char)v;
+    return pos;
+}
+static zend_always_inline size_t le64_put(char *base, size_t pos, double dv) {
+#ifdef WORDS_BIGENDIAN
+    uint64_t bits;
+    memcpy(&bits, &dv, 8);
+    for (int k = 0; k < 8; k++) base[pos++] = (char)((bits >> (k * 8)) & 0xff);
+#else
+    memcpy(base + pos, &dv, 8);
+    pos += 8;
+#endif
+    return pos;
+}
 
 /* Reserve the worst-case byte count once, then write raw. smart_str_appendc
  * runs smart_str_alloc (a capacity check) per byte, so the byte-at-a-time
@@ -140,14 +167,7 @@
  * check per varint. Output bytes are identical. */
 static inline void varint_write_u64(smart_str *s, uint64_t v) {
     smart_str_alloc(s, VARINT_MAX_BYTES, 0);
-    char *base = ZSTR_VAL(s->s);
-    size_t pos = ZSTR_LEN(s->s);
-    while (v >= 0x80) {
-        base[pos++] = (char)((v & 0x7f) | 0x80);
-        v >>= 7;
-    }
-    base[pos++] = (char)v;
-    ZSTR_LEN(s->s) = pos;
+    ZSTR_LEN(s->s) = varint_put(ZSTR_VAL(s->s), ZSTR_LEN(s->s), v);
 }
 
 /* Common case: tag byte + varint — the dominant pattern for assoc key indices
@@ -157,12 +177,7 @@ static inline void emit_tag_and_varint(smart_str *s, uint8_t tag, uint64_t v) {
     char *base = ZSTR_VAL(s->s);
     size_t pos = ZSTR_LEN(s->s);
     base[pos++] = (char)tag;
-    while (v >= 0x80) {
-        base[pos++] = (char)((v & 0x7f) | 0x80);
-        v >>= 7;
-    }
-    base[pos++] = (char)v;
-    ZSTR_LEN(s->s) = pos;
+    ZSTR_LEN(s->s) = varint_put(base, pos, v);
 }
 
 static inline int varint_read_u64(const uint8_t *buf, size_t buflen, size_t *pos, uint64_t *out) {
@@ -232,15 +247,8 @@ static inline int varint_read_i64(const uint8_t *buf, size_t buflen, size_t *pos
  * smart_str_append_le64 writes directly through smart_str_appendl so we
  * don't pay an intermediate stack-buffer memcpy on the LE fast path. */
 static inline void smart_str_append_le64(smart_str *s, double v) {
-#ifdef WORDS_BIGENDIAN
-    uint64_t bits;
-    memcpy(&bits, &v, 8);
-    char buf[8];
-    for (int i = 0; i < 8; i++) buf[i] = (char)((bits >> (i * 8)) & 0xff);
-    smart_str_appendl(s, buf, 8);
-#else
-    smart_str_appendl(s, (char *)&v, 8);
-#endif
+    smart_str_alloc(s, 8, 0);
+    ZSTR_LEN(s->s) = le64_put(ZSTR_VAL(s->s), ZSTR_LEN(s->s), v);
 }
 
 static inline double le64_read(const uint8_t *src) {
@@ -731,12 +739,9 @@ static void enc_patch_nprops(smart_str *body, size_t off, uint32_t nprops) {
         ZSTR_VAL(body->s)[off] = (char)nprops;
         return;
     }
-    uint8_t var[VARINT_MAX_BYTES];
-    int len = 0;
-    uint64_t v = nprops;
-    while (v >= 0x80) { var[len++] = (uint8_t)((v & 0x7f) | 0x80); v >>= 7; }
-    var[len++] = (uint8_t)v;
-    size_t extra = (size_t)len - 1;
+    char var[VARINT_MAX_BYTES];
+    size_t len = varint_put(var, 0, nprops);
+    size_t extra = len - 1;
     smart_str_alloc(body, extra, 0);
     char *base = ZSTR_VAL(body->s);
     size_t end = ZSTR_LEN(body->s);
@@ -889,6 +894,18 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                      * this object later in the payload misalign. */
                     enc_unvisit_last(e, obj);
                     if (EG(exception)) e->failed = 1;
+                    smart_str_appendc(body, TAG_NULL);
+                    return;
+                }
+                if (UNEXPECTED(EG(exception))) {
+                    /* A C-level serializer that returned SUCCESS with an
+                     * exception still pending (native rechecks after the hook
+                     * regardless of its return). Drop the output and abort
+                     * rather than emit a valid TAG_OBJECT_LEGACY over a thrown
+                     * state, matching the __serialize path. */
+                    if (data) efree(data);
+                    enc_unvisit_last(e, obj);
+                    e->failed = 1;
                     smart_str_appendc(body, TAG_NULL);
                     return;
                 }
@@ -1089,6 +1106,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                 ) {
                 int pc = ce->default_properties_count;
                 bool slots_ok = true;
+                uint32_t slot_count = 0;
                 for (int pi = 0; pi < pc; pi++) {
                     zend_property_info *info = ce->properties_info_table[pi];
                     if (info == NULL) continue;
@@ -1096,9 +1114,14 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                         slots_ok = false;
                         break;
                     }
+                    slot_count++;
                 }
                 if (slots_ok) {
-                    uint32_t fp_nprops = ce_table_slot_count(ce);
+                    /* slot_count is the full non-NULL slot tally: the loop only
+                     * exits early via slots_ok=false, so reaching here means it
+                     * ran to completion. Equals the old ce_table_slot_count(ce)
+                     * without a third walk of properties_info_table. */
+                    uint32_t fp_nprops = slot_count;
                     /* Wire v2: values only in declaration-table order. Requires
                      * every declared slot to be initialized — IS_UNDEF must fall
                      * back to keyed TAG_OBJECT (skip on wire), same as before. */
@@ -1146,6 +1169,21 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
              * native serialize (ext/standard/var.c). Also handles lazy-object
              * initialize-on-serialize, which the bare handler skips. */
             HashTable *props = zend_get_properties_for(v, ZEND_PROP_PURPOSE_SERIALIZE);
+            /* A lazy object's initializer runs here (the call above triggers
+             * initialize-on-serialize) and is user code that can throw. Every
+             * other user-code site in this function converts a pending
+             * exception into e->failed; without the same guard here a throwing
+             * lazy-init leaves e->failed == 0, so phpser_encode_zval_ex returns
+             * a truncated frame that the session encoder would persist. Roll
+             * back the speculative id claimed at enc_visit and abort like the
+             * __serialize / __sleep paths. */
+            if (UNEXPECTED(EG(exception))) {
+                zend_release_properties(props);
+                enc_unvisit_last(e, obj);
+                e->failed = 1;
+                smart_str_appendc(body, TAG_NULL);
+                return;
+            }
             /* Single bucket walk; nprops back-patched after the loop. See
              * enc_obj_prop_val for the IS_INDIRECT / IS_UNDEF skip rules. */
             smart_str_appendc(body, TAG_OBJECT);
@@ -1264,14 +1302,17 @@ static void enc_write_key_idx_run(smart_str *body, uint32_t *key_idx, uint32_t n
     char *base = ZSTR_VAL(body->s);
     size_t pos = ZSTR_LEN(body->s);
     for (uint32_t i = 0; i < ncols; i++) {
-        uint64_t v = key_idx[i];
-        while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
-        base[pos++] = (char)v;
+        pos = varint_put(base, pos, key_idx[i]);
     }
     ZSTR_LEN(body->s) = pos;
 }
 
-static uint8_t enc_detect_column_tag(encode_ctx *e, zval **cells, uint32_t nrows) {
+/* Choose the wire tag for a gathered column. For a string column that resolves
+ * to TAG_PACKED_STRINGS, *out_same_ptr records whether every cell is the same
+ * interned pointer, so the emit pass can skip re-deriving it (and take the
+ * single-intern shortcut) rather than walking the column a second time. */
+static uint8_t enc_detect_column_tag(encode_ctx *e, zval **cells, uint32_t nrows, int *out_same_ptr) {
+    *out_same_ptr = 0;
     uint8_t t0 = Z_TYPE_P(cells[0]);
     for (uint32_t r = 1; r < nrows; r++) {
         if (Z_TYPE_P(cells[r]) != t0) {
@@ -1299,6 +1340,7 @@ static uint8_t enc_detect_column_tag(encode_ctx *e, zval **cells, uint32_t nrows
             }
         }
         if (all_dict || all_same_ptr) {
+            *out_same_ptr = all_same_ptr;
             return TAG_PACKED_STRINGS;
         }
     }
@@ -1306,7 +1348,8 @@ static uint8_t enc_detect_column_tag(encode_ctx *e, zval **cells, uint32_t nrows
 }
 
 static void enc_emit_table_column(
-    smart_str *body, encode_ctx *e, zval **cells, uint32_t nrows, uint8_t col_tag)
+    smart_str *body, encode_ctx *e, zval **cells, uint32_t nrows, uint8_t col_tag,
+    int same_ptr)
 {
     smart_str_appendc(body, col_tag);
     if (col_tag == TAG_PACKED_LONGS) {
@@ -1314,9 +1357,7 @@ static void enc_emit_table_column(
         char *base = ZSTR_VAL(body->s);
         size_t pos = ZSTR_LEN(body->s);
         for (uint32_t r = 0; r < nrows; r++) {
-            uint64_t v = zigzag_encode64(Z_LVAL_P(cells[r]));
-            while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
-            base[pos++] = (char)v;
+            pos = varint_put(base, pos, zigzag_encode64(Z_LVAL_P(cells[r])));
         }
         ZSTR_LEN(body->s) = pos;
     } else if (col_tag == TAG_PACKED_DOUBLES) {
@@ -1324,24 +1365,15 @@ static void enc_emit_table_column(
         char *base = ZSTR_VAL(body->s);
         size_t pos = ZSTR_LEN(body->s);
         for (uint32_t r = 0; r < nrows; r++) {
-            double dv = Z_DVAL_P(cells[r]);
-#ifdef WORDS_BIGENDIAN
-            uint64_t bits; memcpy(&bits, &dv, 8);
-            for (int k = 0; k < 8; k++) base[pos++] = (char)((bits >> (k * 8)) & 0xff);
-#else
-            memcpy(base + pos, &dv, 8); pos += 8;
-#endif
+            pos = le64_put(base, pos, Z_DVAL_P(cells[r]));
         }
         ZSTR_LEN(body->s) = pos;
     } else if (col_tag == TAG_PACKED_STRINGS) {
         smart_str_alloc(body, (size_t)nrows * VARINT_MAX_BYTES, 0);
         char *base = ZSTR_VAL(body->s);
         size_t pos = ZSTR_LEN(body->s);
+        /* same_ptr computed once by enc_detect_column_tag — no second walk. */
         zend_string *s0 = Z_STR_P(cells[0]);
-        int same_ptr = 1;
-        for (uint32_t r = 1; r < nrows; r++) {
-            if (Z_STR_P(cells[r]) != s0) { same_ptr = 0; break; }
-        }
         for (uint32_t r = 0; r < nrows; r++) {
             uint64_t v;
             if (same_ptr) {
@@ -1350,8 +1382,7 @@ static void enc_emit_table_column(
                 intern_slot *sl = enc_cache_find(e, Z_STR_P(cells[r]));
                 v = SLOT_DICT_IDX(*sl);
             }
-            while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
-            base[pos++] = (char)v;
+            pos = varint_put(base, pos, v);
         }
         ZSTR_LEN(body->s) = pos;
     } else {
@@ -1373,7 +1404,19 @@ static int enc_try_table(smart_str *body, encode_ctx *e, zval *zp, uint32_t n_us
      * rescans the row from bucket 0 to reach column c — O(ncols) per call, so
      * O(nrows * ncols^2) overall. enc_match_rowset_schema already proved every
      * row has exactly ncols non-UNDEF keyed cells in matching key order, so the
-     * c-th non-UNDEF bucket is column c and a single pass suffices. */
+     * c-th non-UNDEF bucket is column c and a single pass suffices.
+     *
+     * Safety: these raw &b->val pointers are held across the encode_value calls
+     * in the MIXED-column emit loop below, which run user code (__serialize etc.).
+     * That is safe ONLY because (a) enc_match_rowset_schema rejects any row that
+     * is IS_REFERENCE, so a `&$rowset[r]` alias never reaches here, and (b) PHP
+     * arrays are copy-on-write: for user code to mutate an inner row it needs a
+     * second handle to that array (refcount >= 2), which forces COW-separation
+     * on write, leaving the copy we gathered from untouched. This differs from
+     * the CR-000 object-property-table case, which was NOT COW and needed an
+     * explicit addref. If either invariant is ever relaxed (e.g. accepting
+     * reference rows), this becomes a live use-after-free — see
+     * tests/098-encode-rowset-reentrancy.phpt. */
     zval **col_cells = (zval **)safe_emalloc((size_t)ncols * n_used, sizeof(zval *), 0);
     for (uint32_t r = 0; r < n_used; r++) {
         HashTable *ht = Z_ARRVAL(zp[r]);
@@ -1400,8 +1443,9 @@ static int enc_try_table(smart_str *body, encode_ctx *e, zval *zp, uint32_t n_us
     efree(key_idx);
 
     for (uint32_t c = 0; c < ncols; c++) {
-        uint8_t col_tag = enc_detect_column_tag(e, &col_cells[c * n_used], n_used);
-        enc_emit_table_column(body, e, &col_cells[c * n_used], n_used, col_tag);
+        int same_ptr;
+        uint8_t col_tag = enc_detect_column_tag(e, &col_cells[c * n_used], n_used, &same_ptr);
+        enc_emit_table_column(body, e, &col_cells[c * n_used], n_used, col_tag, same_ptr);
     }
     efree(col_cells);
     return 1;
@@ -1466,9 +1510,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
                     }
                     return;
                 }
-                uint64_t v = SLOT_DICT_IDX(*s);
-                while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
-                base[pos++] = (char)v;
+                pos = varint_put(base, pos, SLOT_DICT_IDX(*s));
             }
             ZSTR_LEN(body->s) = pos;
             return;
@@ -1494,9 +1536,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
             char *base = ZSTR_VAL(body->s);
             size_t pos = ZSTR_LEN(body->s);
             for (uint32_t i = 0; i < n_used; i++) {
-                uint64_t v = zigzag_encode64(Z_LVAL(zp[i]));
-                while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
-                base[pos++] = (char)v;
+                pos = varint_put(base, pos, zigzag_encode64(Z_LVAL(zp[i])));
             }
             ZSTR_LEN(body->s) = pos;
         } else if (tag == TAG_PACKED_DOUBLES) {
@@ -1504,13 +1544,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
             char *base = ZSTR_VAL(body->s);
             size_t pos = ZSTR_LEN(body->s);
             for (uint32_t i = 0; i < n_used; i++) {
-                double dv = Z_DVAL(zp[i]);
-#ifdef WORDS_BIGENDIAN
-                uint64_t bits; memcpy(&bits, &dv, 8);
-                for (int k = 0; k < 8; k++) base[pos++] = (char)((bits >> (k * 8)) & 0xff);
-#else
-                memcpy(base + pos, &dv, 8); pos += 8;
-#endif
+                pos = le64_put(base, pos, Z_DVAL(zp[i]));
             }
             ZSTR_LEN(body->s) = pos;
         } else {
@@ -1562,9 +1596,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht) {
                 if (Z_TYPE(b->val) == IS_UNDEF) continue;
                 uint32_t kidx;
                 (void)enc_str_dict_idx(e, b->key, &kidx);
-                uint64_t v = kidx;
-                while (v >= 0x80) { base[pos++] = (char)((v & 0x7f) | 0x80); v >>= 7; }
-                base[pos++] = (char)v;
+                pos = varint_put(base, pos, kidx);
             }
             ZSTR_LEN(body->s) = pos;
             b = ht->arData;
@@ -1698,7 +1730,20 @@ enum { ALLOWED_ALL = 0, ALLOWED_NONE, ALLOWED_SET };
  * holding the obj — id_table then dangles, and a later TAG_REF to that id
  * deref's freed memory (zend_mm_heap corruption). The addref is per-entity
  * and amortized; cost is negligible vs. the correctness guarantee at the
- * decoder's security boundary. */
+ * decoder's security boundary.
+ *
+ * ID-NUMBERING CONTRACT (encode and decode must claim ids in identical
+ * encounter order or every later TAG_REF derefs the wrong slot):
+ *   encode: enc_visit() claims at IS_REFERENCE (TAG_NEW_REF) and IS_OBJECT,
+ *           before the container tag is chosen; enc_unvisit_last() rolls the
+ *           claim back on any hook-failure path that instead emits TAG_NULL
+ *           (ce->serialize FAILURE / pending-exception, __serialize non-array,
+ *           __sleep non-array). NOT_SERIALIZABLE emits TAG_NULL WITHOUT
+ *           claiming — decode's ID_NULL slot mirrors that.
+ *   decode: dec_register() is called by TAG_NEW_REF, TAG_OBJECT,
+ *           TAG_OBJECT_SLOTS, TAG_OBJECT_MAGIC, TAG_OBJECT_LEGACY, and
+ *           TAG_ENUM — exactly the tags an id-claiming encode path emits.
+ * A new id-claiming tag must appear on BOTH sides. */
 static int dec_register(decode_ctx *d, zval *z) {
     if (d->id_table_len == d->id_table_cap) {
         d->id_table_cap = d->id_table_cap ? d->id_table_cap * 2 : 16;
@@ -2024,6 +2069,7 @@ static inline zend_string *dec_get_zstr(decode_ctx *d, uint64_t idx) {
 
 static int decode_value(decode_ctx *d, zval *out);
 static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *use_add_new);
+static int dec_schema_keys_are_unique(zend_string **keys, uint64_t nkeys);
 static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out);
 static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out);
 
@@ -2883,30 +2929,46 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * in one pass and values in a second). Each entry needs at least
              * one byte of key idx and one byte of value tag. */
             if (n > UINT32_MAX || n > (d->len - d->pos) / 2) return -1;
-            uint64_t *key_idx = (uint64_t *)safe_emalloc((size_t)n, sizeof(uint64_t), 0);
+            /* Resolve all keys up front so the trusted add_new fast path can be
+             * gated on the same invariant as rowset/table (dec_read_schema_keys):
+             * add_new blindly appends without a dup-find, so a forged-but-signed
+             * duplicate key would create a phantom bucket (count != unique-key
+             * count) and a canonical-integer string key would land as a string
+             * bucket instead of the int key PHP guarantees. Fall back to
+             * symtable_update on either, keeping add_new for honest payloads. */
+            zend_string **keys = (zend_string **)safe_emalloc((size_t)n, sizeof(zend_string *), 0);
+            int has_numeric = 0;
             for (uint64_t i = 0; i < n; i++) {
-                if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx[i]) < 0) {
-                    efree(key_idx);
+                uint64_t idx;
+                if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) {
+                    efree(keys);
                     return -1;
                 }
+                keys[i] = dec_get_zstr(d, idx);
+                if (!keys[i]) {
+                    efree(keys);
+                    return -1;
+                }
+                zend_ulong h;
+                if (ZEND_HANDLE_NUMERIC(keys[i], h)) has_numeric = 1;
             }
+            int use_add_new = d->trusted && !has_numeric
+                && dec_schema_keys_are_unique(keys, n);
             zend_array *arr = zend_new_array((uint32_t)n);
             for (uint64_t i = 0; i < n; i++) {
-                zend_string *zs = dec_get_zstr(d, key_idx[i]);
-                if (!zs) goto assoc_dict_fail;
                 zval tmp;
                 if (decode_value_hot(d, &tmp) < 0) goto assoc_dict_fail;
-                if (d->trusted) {
-                    zend_hash_add_new(arr, zs, &tmp);
+                if (use_add_new) {
+                    zend_hash_add_new(arr, keys[i], &tmp);
                 } else {
-                    zend_symtable_update(arr, zs, &tmp);
+                    zend_symtable_update(arr, keys[i], &tmp);
                 }
             }
-            efree(key_idx);
+            efree(keys);
             ZVAL_ARR(out, arr);
             return 0;
         assoc_dict_fail:
-            efree(key_idx);
+            efree(keys);
             zend_array_destroy(arr);
             return -1;
         }
@@ -3118,12 +3180,16 @@ rowset_fail:
     return -1;
 }
 
+/* Below this key count the O(n^2) pairwise scan beats building a HashTable
+ * (no alloc, cache-resident); above it, switch to the hashed set. Columnar
+ * schemas are almost always a handful of columns, so the scan path dominates. */
+#define SCHEMA_UNIQ_SCAN_MAX 32
 static int dec_schema_keys_are_unique(zend_string **keys, uint64_t nkeys) {
     if (nkeys <= 1) {
         return 1;
     }
 
-    if (nkeys <= 32) {
+    if (nkeys <= SCHEMA_UNIQ_SCAN_MAX) {
         for (uint64_t i = 1; i < nkeys; i++) {
             for (uint64_t j = 0; j < i; j++) {
                 if (zend_string_equals(keys[i], keys[j])) {
@@ -3335,12 +3401,14 @@ static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
     /* Frame: [version][varint ndict][per-entry varint(len)+bytes][body].
      *
      * Pre-size `out` to skip smart_str's geometric grow-and-copy cascade.
-     * Worst-case header: 1 (version) + 5 (max varint for dict_len)
-     *                  + ndict * (5 max varint + name bytes).
-     * Add body_len for the final concat. Single allocation, no realloc. */
-    size_t header_max = 1 + 5;
+     * Worst-case header: 1 (version) + VARINT_MAX_BYTES_U32 (dict_len)
+     *                  + ndict * (VARINT_MAX_BYTES_U32 + name bytes).
+     * A soft estimate — smart_str re-checks capacity on each append, so an
+     * under-estimate costs a realloc, not corruption. Add body_len for the
+     * final concat. Single allocation, no realloc in the common case. */
+    size_t header_max = 1 + VARINT_MAX_BYTES_U32;
     for (uint32_t i = 0; i < ctx.dict_len; i++) {
-        header_max += 5 + ZSTR_LEN(ctx.dict[i]);
+        header_max += VARINT_MAX_BYTES_U32 + ZSTR_LEN(ctx.dict[i]);
     }
 
     smart_str out = {0};

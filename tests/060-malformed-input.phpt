@@ -227,6 +227,55 @@ try {
         ? "table_trusted_badidx OK\n" : "table_trusted_badidx FAIL\n";
 }
 
+// 7. TAG_OBJECT_LEGACY (0x0f) adversarial cases (CR-001). The decode path reads
+//    an attacker-controlled blen then hands the bytes to ce->unserialize — the
+//    classic native-unserialize CVE surface. Every shape must reject/NULL, no
+//    crash, no OOB read.
+$HL = "\x02\x01\x08stdClass"; // dict ["stdClass"]
+$legacy = [
+    // blen varint > 64 bits -> varint reader rejects
+    "legacy_blen_overflow" => "{$HL}\x0f\x00\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff",
+    // blen=16 claimed, zero bytes present -> bound check rejects
+    "legacy_blen_truncated" => "{$HL}\x0f\x00\x10",
+    // class_idx out of range (dict has 1 entry) -> reject
+    "legacy_badclass" => "{$HL}\x0f\x05\x00",
+];
+foreach ($legacy as $name => $bytes) {
+    if (phpser_unserialize($bytes) !== null) echo "$name FAIL\n";
+}
+echo "legacy_adversarial OK\n";
+
+// stdClass has no C-level ce->unserialize: the decoder skips the payload,
+// yields NULL, and registers a NULL id-slot so a later back-ref resolves to
+// NULL rather than dangling. Prove both the NULL result and the slot.
+$legacy_null = "{$HL}\x0f\x00\x04GARB";                // -> null
+echo (phpser_unserialize($legacy_null) === null) ? "legacy_no_unser OK\n" : "legacy_no_unser FAIL\n";
+$legacy_ref = "{$HL}\x07\x02\x0f\x00\x00\x10\x00";     // [LEGACY(null id0), REF id0] -> [null,null]
+echo (phpser_unserialize($legacy_ref) === [null, null]) ? "legacy_null_slot_ref OK\n" : "legacy_null_slot_ref FAIL\n";
+
+// 8. TAG_ROWSET nrows DoS (CR-014): the ROWSET counterpart to table_nrows_dos.
+//    A 12-byte payload claiming 2^28 rows must reject, not emalloc gigabytes.
+$rowset_dos = "\x02\x01\x01a\x14\x80\x80\x80\x80\x01\x01\x00"; // nrows=2^28, ncols=1, idx=0
+echo (phpser_unserialize($rowset_dos) === null) ? "rowset_nrows_dos OK\n" : "rowset_nrows_dos FAIL\n";
+
+// 8a. TAG_ENUM (0x0d) naming a resident NON-enum class (CR-008). The decode
+//     guard rejects before zend_enum_get_case (which asserts enum-ness and
+//     would type-confuse under NDEBUG). dict ["stdClass","x"].
+$enum_nonenum = "\x02\x02\x08stdClass\x01x\x0d\x00\x01"; // ENUM class_idx=0, case_idx=1
+echo (phpser_unserialize($enum_nonenum) === null) ? "enum_nonenum OK\n" : "enum_nonenum FAIL\n";
+
+// 9. Trusted (signed) TAG_ASSOC_DICT with a crafted duplicate key (CR-014). The
+//    trusted path uses add_new (unique-key assumption); a forged dup must not
+//    leak the decoded value (ASAN/LSAN canary): a dup drops off the add_new
+//    fast path to symtable_update (last-write-wins), never a phantom bucket.
+$dkey = "phpser-060-adk";
+$dbody = "\x02\x01\x01k\x13\x02\x00\x00\x03\x02\x03\x04"; // ASSOC_DICT n=2 keys[0,0] vals 1,2
+$dframe = $dbody . hash_hmac('sha256', $dbody, $dkey, true);
+// Duplicate key on a forged-signed frame falls off the add_new fast path to
+// last-write-wins (no phantom bucket), matching the unsigned dup semantics.
+$dres = phpser_unserialize_signed($dframe, $dkey);
+echo ($dres === ['k' => 2] && count($dres) === 1) ? "signed_assoc_dict_dup OK\n" : "signed_assoc_dict_dup FAIL " . var_export($dres, true) . "\n";
+
 ?>
 --EXPECT--
 static OK
@@ -245,3 +294,9 @@ table_num_schema OK
 table_trunc_column OK
 table_bad_coltag OK
 table_trusted_badidx OK
+legacy_adversarial OK
+legacy_no_unser OK
+legacy_null_slot_ref OK
+rowset_nrows_dos OK
+enum_nonenum OK
+signed_assoc_dict_dup OK
