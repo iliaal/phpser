@@ -8,6 +8,8 @@ hook must propagate the exception and never hand back a truncated frame with a
 TAG_NULL hole (which the session encoder would otherwise persist).
 --EXTENSIONS--
 phpser
+--SKIPIF--
+<?php if (PHP_VERSION_ID < 80400) die("skip lazy objects (newLazyGhost) require PHP 8.4+"); ?>
 --FILE--
 <?php
 
