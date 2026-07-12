@@ -7,10 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Fixed a use-after-free in signed (`phpser_unserialize_signed`) decode: a forged-but-validly-signed frame carrying a duplicate object-property, assoc, or rowset/table schema key could free an id-registered object on overwrite while a later back-reference still pointed at it. Objects are now pinned unconditionally for the decode pass (the signed fast path previously skipped the pin), and the trusted assoc/schema paths use uniqueness-gated inserts. A valid HMAC proves key possession, not honest-encoder provenance, so the decoder no longer trusts key uniqueness.
+- Fixed a use-after-free in encode: a `__serialize`/`__sleep` hook that grows the array being walked through a by-reference alias reallocated the table under the element iterator. The array walk now holds a reference across user hooks so the write copy-on-write-separates instead, mirroring the existing object-property guard. (Native `serialize()` still exhibits this on the same shape.)
+
 ### Fixed
 
 - Trusted (signed) `TAG_ASSOC_DICT` decode no longer builds a phantom duplicate-key bucket when a forged-but-signed payload carries a repeated key: the `add_new` fast path is gated on proven key uniqueness (and non-numeric keys) like the rowset/table paths, otherwise it falls back to last-write-wins. This also coerces a canonical integer-string key (e.g. `"5"`) to an int array key on the signed path, matching PHP array semantics.
+- Trusted (signed) `TAG_ASSOC` and `TAG_ROWSET`/`TAG_TABLE` decode apply the same uniqueness/numeric-coercion gating: a forged-signed duplicate or canonical-numeric key can no longer produce a phantom bucket or a mistyped string key on the signed path.
+- A non-array `__sleep()` return now emits the same `E_WARNING` as native `serialize()` before writing null in the object's place, instead of dropping the value silently.
 - Encode aborts with the pending exception when a lazy object's initializer throws during serialization (and when a legacy `Serializable` C serializer returns success with an exception pending), instead of returning a truncated frame the session handler would persist.
+- ZTS dynamically-loaded builds now refresh the thread-local storage cache in `RINIT`, not only `MINIT`, so worker threads under a threaded ZTS SAPI don't touch engine globals through an unpopulated cache. NTS builds register no `RINIT` and pay no per-request cost.
+
+### Changed
+
+- `TAG_TABLE` decode streams each column straight into the row arrays instead of materializing the full columnar matrix first, roughly halving peak memory on large tables with no decode-speed change.
 
 ## [0.4.0] - 2026-07-10
 

@@ -13,9 +13,10 @@ phpser
 // silently.
 
 // --- ArrayObject (igbinary_bug54662 shape) ---
-// SPL ArrayObject has a custom internal serializer. We don't honor
-// ce->serialize, __serialize, or Serializable yet — so the internal
-// storage doesn't round-trip. Contract for now: no crash, object
+// __serialize / Serializable ARE supported in general (see 063/064). The gap
+// is specifically ArrayObject: it keeps its elements in a custom internal
+// serializer rather than ordinary properties, so its storage doesn't
+// round-trip through the property walk. Contract for now: no crash, object
 // instance comes back as the same class.
 class StorageBug054662 { public $storage = "a string"; }
 $collection = new ArrayObject();

@@ -43,7 +43,7 @@ signed session frames would harden this path but are not shipped today.
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.3.x   | :white_check_mark: |
+| 0.4.x   | :white_check_mark: |
 
 Pre-1.0, security fixes land on the latest minor. Once 1.0 ships, the two
 most recent minor versions will receive security fixes.
@@ -97,6 +97,30 @@ Out of scope:
   effects in user code when the class is allowlisted. Those are the
   application's responsibility — phpser only decides which classes
   get instantiated.
+
+## Deliberate divergences from native `unserialize()`
+
+phpser matches PHP's `unserialize($bytes, ['allowed_classes' => ...])`
+semantics closely, with two intentional differences:
+
+- **Enums are filtered by `allowed_classes`.** Native `unserialize()`
+  does *not* consult `allowed_classes` on the enum (`E:`) path — a
+  serialized enum is always resurrected even under
+  `allowed_classes => false`. phpser applies the filter to enums too:
+  a disallowed enum decodes to `__PHP_Incomplete_Class`. Enum cases are
+  inert singletons, so the security delta is small, but a decoder that
+  advertises an allowlist should not instantiate an arbitrary enum
+  outside it. If you rely on enums round-tripping through a filtered
+  decode, include their class names in the allowlist.
+
+- **Failure return value.** `phpser_unserialize()` returns `null` on a
+  decode failure (malformed bytes, truncation, over-depth), which is
+  indistinguishable from a successfully-decoded `null`. Native
+  `unserialize()` returns `false` plus an `E_WARNING`.
+  `phpser_unserialize_signed()` instead *throws* on failure (since
+  0.4.0), so the signed path — the one you use for untrusted bytes —
+  is unambiguous. Prefer it when you need to distinguish a decode
+  failure from a legitimate `null`.
 - Resource exhaustion from payloads larger than available memory.
   Cap input size at the application layer before calling decode.
 - Attacks requiring write access to the PHP source, the extension

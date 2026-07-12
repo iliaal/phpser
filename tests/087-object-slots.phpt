@@ -5,6 +5,21 @@ phpser
 --FILE--
 <?php
 
+// Return the top-level value tag byte, skipping the [version][dict] header,
+// so tag assertions can't be fooled by a 0x0a/0x12 byte occurring inside dict
+// content or a varint (a plain strpos over the whole frame can — see CR-019).
+function top_tag(string $blob): int {
+    $p = 1; // skip version byte
+    $rd = function () use ($blob, &$p): int {
+        $v = 0; $shift = 0;
+        do { $b = ord($blob[$p++]); $v |= ($b & 0x7f) << $shift; $shift += 7; } while ($b & 0x80);
+        return $v;
+    };
+    $ndict = $rd();
+    for ($i = 0; $i < $ndict; $i++) { $p += $rd(); }
+    return ord($blob[$p]);
+}
+
 final class UserDto {
     public function __construct(
         public int $id,
@@ -24,10 +39,10 @@ $u = new UserDto(
 );
 $blob = phpser_serialize($u);
 
-// Wire v2: version 0x02 and TAG_OBJECT_SLOTS (0x12), not TAG_OBJECT (0x0a).
+// Wire v2: version 0x02 and top-level TAG_OBJECT_SLOTS (0x12), not TAG_OBJECT (0x0a).
 echo ($blob[0] === "\x02") ? "version_v2 OK\n" : "version_v2 FAIL\n";
-echo (strpos($blob, "\x12") !== false) ? "tag_slots OK\n" : "tag_slots FAIL\n";
-echo (strpos($blob, "\x0a") === false) ? "no_tag_object OK\n" : "no_tag_object FAIL\n";
+echo (top_tag($blob) === 0x12) ? "tag_slots OK\n" : "tag_slots FAIL\n";
+echo (top_tag($blob) !== 0x0a) ? "no_tag_object OK\n" : "no_tag_object FAIL\n";
 
 $rt = phpser_unserialize($blob);
 echo ($rt instanceof UserDto && $rt->id === 42 && $rt->phone === null && $rt->tags === ['a', 'b'])
@@ -51,7 +66,7 @@ class HasUnser {
     public function __unserialize(array $data): void { $this->n = (int)$data['n']; }
 }
 $legacy = phpser_serialize(new HasUnser());
-echo (strpos($legacy, "\x0a") !== false) ? "unserialize_class_uses_object OK\n"
+echo (top_tag($legacy) === 0x0a) ? "unserialize_class_uses_object OK\n"
     : "unserialize_class_uses_object FAIL\n";
 echo (phpser_unserialize($legacy)->n === 1) ? "unserialize_class_rt OK\n"
     : "unserialize_class_rt FAIL\n";

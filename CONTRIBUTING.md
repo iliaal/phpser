@@ -109,9 +109,9 @@ minor — the gen_stub script lives under `build/`).
 
 ### Performance changes
 
-Benchmark before claiming a perf win. The `bench/` directory has the
-standard A/B harness against igbinary; the README's bench table is
-the regression target. Always:
+Benchmark before claiming a perf win. `bench.php` is the standard A/B
+harness against igbinary; the README's bench table is the regression
+target. Always:
 
 1. Build both the baseline (`master`) and the candidate with the same
    compiler flags (`-O2 -DNDEBUG` is the default for opt builds).
@@ -131,7 +131,9 @@ For maintainers cutting a new version:
 1. Bump `PHP_PHPSER_VERSION` in `php_phpser.h` to the new semver and
    update the top section of `CHANGELOG.md`. The current
    `[Unreleased]` entries become the new version section with a
-   release date and a compare link.
+   release date and a compare link. Update the **Supported versions**
+   table in `SECURITY.md` to the new minor (pre-1.0: latest minor
+   only) — it does not track the version automatically.
 2. Commit + push to master. CI (Tests workflow, all jobs green) is
    required before tagging.
 3. `git tag -a X.Y.Z -m "phpser X.Y.Z"` with a release-note body,
