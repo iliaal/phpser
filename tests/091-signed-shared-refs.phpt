@@ -17,7 +17,7 @@ function sround($v) {
     return phpser_unserialize_signed(phpser_serialize_signed($v, $key), $key);
 }
 
-// IS_REFERENCE sharing (references stay pinned even on the trusted path).
+// IS_REFERENCE sharing (references and objects are both pinned in the id-table).
 $x = 1;
 $rt = sround([&$x, &$x]);
 $rt[0] = 99;
@@ -34,7 +34,7 @@ echo $ok ? "obj_identity OK\n" : "obj_identity FAIL\n";
 $rt[0]->n = 7;
 echo ($rt[1]->n === 7 && $rt[2]['nested']->n === 7) ? "obj_identity_mut OK\n" : "obj_identity_mut FAIL\n";
 
-// Object cycle A<->B: the back-ref must resolve to the unpinned root object.
+// Object cycle A<->B: the back-ref must resolve to the same root object.
 class Node { public ?Node $other = null; public string $name; public function __construct(string $n) { $this->name = $n; } }
 $a = new Node("A");
 $b = new Node("B");
@@ -74,7 +74,7 @@ echo $ok ? "magic_cycle OK\n" : "magic_cycle FAIL\n";
 $rt->partner->partner = null;
 $m1->partner = $m2->partner = null; // break the source cycle too
 
-// Many shared objects: id-table growth on the unpinned path.
+// Many shared objects: id-table growth with many pinned entries.
 $o = new Thing(1);
 $big = [];
 for ($i = 0; $i < 500; $i++) $big[] = $o;

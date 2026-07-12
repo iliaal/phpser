@@ -6,10 +6,11 @@ phpser
 <?php
 // Hand-built v2 frame: PACKED_MIXED[ SLOTS(Foo, 1 slot = stdClass{x:42}), REF -> that stdClass ].
 // "Foo" is never defined here, so the denied SLOTS path resolves no schema and
-// consumes-then-discards its slot value. On the signed (trusted) path that value
-// skips the id-table pin, so a later TAG_REF to it would deref freed memory —
-// this pins the discarded value's lifetime. Regression guard for the
-// discard-frees-a-referenced-object UAF (crashes zend_mm without the fix).
+// consumes-then-discards its slot value. That value is registered in the
+// id-table and pinned there at registration, so it survives the local discard
+// dtor and a later TAG_REF resolves to the live object instead of deref'ing
+// freed memory. Regression guard for the discard-frees-a-referenced-object UAF
+// (crashes zend_mm without the registration pin).
 function v($n){ $o=""; while($n>=0x80){ $o.=chr(($n&0x7f)|0x80); $n>>=7;} return $o.chr($n); }
 $key = str_repeat("k",32);
 $frame =
