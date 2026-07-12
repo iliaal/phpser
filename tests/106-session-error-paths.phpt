@@ -19,17 +19,19 @@ session.cache_limiter=
 session_save_path(sys_get_temp_dir());
 session_start();
 
-// (1) A serialization hook that throws during session encode. The phpser
-// encode handler flags PHPSER_ENC_EXCEPTION, emits an E_WARNING, and declines
-// to persist a partial graph; the pending exception then propagates out of
-// session_encode() rather than a partial session being written. No fatal.
+// (1) A serialization hook that throws during session encode. The phpser encode
+// handler flags PHPSER_ENC_EXCEPTION and emits this specific E_WARNING — asserted
+// below (not suppressed) so a regression of THIS arm is observable: the
+// __serialize exception propagates whether phpser returns NULL or a partial
+// frame, so the warning is the only thing that pins the arm. The exception then
+// propagates out of session_encode(); no partial graph is written.
 class BoomEnc {
     public $x = 1;
     public function __serialize(): array { throw new Exception("boom-encode"); }
 }
 $_SESSION = ['b' => new BoomEnc()];
 try {
-    @session_encode();
+    session_encode();
     echo "encode_hook_throw: no-throw FAIL\n";
 } catch (\Throwable $e) {
     echo "encode_hook_throw: ", $e->getMessage(), "\n";
@@ -48,7 +50,8 @@ $_SESSION = [];
 session_write_close();
 echo "DONE\n";
 ?>
---EXPECT--
+--EXPECTF--
+Warning: session_encode(): phpser: $_SESSION not serialized — a serialization hook threw in %s on line %d
 encode_hook_throw: boom-encode
 nonarray_root_decode: OK
 DONE
