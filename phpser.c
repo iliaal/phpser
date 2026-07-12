@@ -780,11 +780,17 @@ static zend_always_inline zval *enc_obj_prop_val(Bucket *b) {
 
 static void encode_value(smart_str *body, encode_ctx *e, zval *v) {
     /* A userland hook (__serialize / __sleep / Serializable::serialize) already
-     * threw; the frame is discarded by phpser_encode_zval_ex regardless. The
-     * three hook sites individually skip their user-code calls under e->failed,
-     * so no further hook runs either way — this top-level gate just stops the
-     * remaining graph from being walked and appended only to be freed. */
-    if (UNEXPECTED(e->failed)) return;
+     * threw; the frame is discarded by phpser_encode_zval_ex regardless, and no
+     * further hook runs. Emit a TAG_NULL placeholder (like the depth gate below)
+     * rather than nothing: the parent container already wrote its element count,
+     * so appending nothing would leave the body with fewer elements than the
+     * count claims — structurally valid only because the frame is thrown away.
+     * The placeholder keeps count == elements-written, so correctness no longer
+     * rests on the discard actually happening. */
+    if (UNEXPECTED(e->failed)) {
+        smart_str_appendc(body, TAG_NULL);
+        return;
+    }
     /* Declared properties surface as IS_INDIRECT in get_properties() HTs —
      * the bucket holds a pointer to the real slot in properties_table[].
      * Deref before dispatching; otherwise we'd emit NULL for every typed
