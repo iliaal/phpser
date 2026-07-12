@@ -715,7 +715,12 @@ static zend_always_inline void enc_emit_str_tagged(
     if (UNEXPECTED(ZSTR_LEN(zs) > UINT32_MAX)) {
         /* Over the decoder's per-string cap: flag and skip the copy. Appending
          * the >4 GiB body first (then freeing it in phpser_encode_zval) would
-         * spike peak RSS by the string's full size for a frame we discard. */
+         * spike peak RSS by the string's full size for a frame we discard. No
+         * placeholder is emitted here (unlike the value-slot abort paths): this
+         * helper is shared between key and value emission, so a TAG_NULL would
+         * be structurally wrong in a key slot. A >4 GiB string is an encode-side
+         * impossibility that always sets size_exceeded and discards the frame,
+         * so this one path stays discard-dependent by design. */
         e->size_exceeded = 1;
         return;
     }
@@ -943,12 +948,16 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v) {
                     /* Don't copy a >4 GiB blob into the body just to reject the
                      * whole frame in phpser_encode_zval — that doubles peak RSS.
                      * Flag it and drop the serializer output now. Roll back the
-                     * speculatively-claimed id like every other abort path so
-                     * the id-numbering stays consistent even though a
-                     * size_exceeded frame is ultimately discarded. */
+                     * speculatively-claimed id AND emit a TAG_NULL placeholder,
+                     * exactly like the __serialize / ce->serialize failure paths
+                     * above: the parent already wrote its element count, so this
+                     * value slot needs one placeholder to keep the body
+                     * structurally well-formed even though a size_exceeded frame
+                     * is ultimately discarded. */
                     e->size_exceeded = 1;
                     if (data) efree(data);
                     enc_unvisit_last(e, obj);
+                    smart_str_appendc(body, TAG_NULL);
                     return;
                 }
                 uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
