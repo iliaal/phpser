@@ -1827,28 +1827,6 @@ static int dec_register(decode_ctx *d, zval *z) {
     return 0;
 }
 
-/* Pin every id registered at or after `start` that isn't already pinned. The
- * trusted (signed) fast-path skips the per-object pin in dec_register on the
- * invariant "the object stays alive via its owning zval in the returned graph."
- * A discard path (denied unloaded TAG_OBJECT_SLOTS) decodes values only to drop
- * them — they have no owning zval, so without a pin a later TAG_REF to their id
- * deref's freed memory. Call this while the owning zval is still live (before
- * the dtor). No-op on the untrusted path (those ids are pinned already) and for
- * ID_NULL slots. */
-static void dec_pin_since(decode_ctx *d, uint32_t start) {
-    for (uint32_t i = start; i < d->id_table_len; i++) {
-        id_slot *s = &d->id_table[i];
-        if (s->pinned) continue;
-        if (s->kind == ID_OBJ) {
-            GC_ADDREF(s->u.obj);
-            s->pinned = 1;
-        } else if (s->kind == ID_REF) {
-            GC_ADDREF(s->u.ref);
-            s->pinned = 1;
-        }
-    }
-}
-
 static int dec_defer_unserialize(decode_ctx *d, zend_object *obj, zval *data) {
     if (d->deferred_len == d->deferred_cap) {
         d->deferred_cap = d->deferred_cap ? d->deferred_cap * 2 : 4;
@@ -2733,16 +2711,15 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                         }
                     }
                 } else {
-                    /* No resident schema: consume the values but keep them for
-                     * the wire's sake (a later TAG_REF may point back at one).
-                     * Pin each before dropping our only reference, or the
-                     * signed fast-path (unpinned) would free an id_table entry
-                     * a back-ref later deref's. */
+                    /* No resident schema: consume the values and drop them. A
+                     * later TAG_REF may still point back at one, but every
+                     * registered object/ref is pinned in the id_table at
+                     * registration (dec_register), so the pin — not this local
+                     * zval — keeps it alive past the dtor; decode_destroy
+                     * releases it at the end of the pass. */
                     for (uint64_t i = 0; i < nprops; i++) {
-                        uint32_t id_start = d->id_table_len;
                         zval tmp;
                         if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
-                        dec_pin_since(d, id_start);
                         zval_ptr_dtor(&tmp);
                     }
                 }

@@ -1,16 +1,15 @@
 --TEST--
-phpser: signed (trusted) shared refs, object identity, cycles — ASAN coverage for the id-table pin-skip
+phpser: signed (trusted) shared refs, object identity, cycles — ASAN coverage for the id-table pin
 --EXTENSIONS--
 phpser
 --FILE--
 <?php
-// Commit "Decode hot loops skip the recursive wrapper for scalar tags" also
-// stopped GC-pinning every object registered in the id table on the
-// HMAC-authenticated (trusted) decode path: a registered object stays alive
-// through its owning zval instead of an extra addref. 065-shared-refs covers
-// these shapes on the untrusted path only; this mirrors them through
-// phpser_unserialize_signed so the ASAN lane exercises the unpinned path for
-// shared objects, back-references, and cycles.
+// Signed (HMAC-authenticated) decode pins every id-table object with an addref
+// for the decode pass, same as the untrusted path. 065-shared-refs covers these
+// shapes on the untrusted path; this mirrors them through
+// phpser_unserialize_signed so the ASAN lane exercises shared objects,
+// back-references, and cycles on the trusted path — where a forged-but-signed
+// duplicate key could otherwise free a still-referenced object (CR-001).
 $key = str_repeat("s", 32);
 
 function sround($v) {

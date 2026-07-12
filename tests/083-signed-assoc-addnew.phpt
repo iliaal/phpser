@@ -1,14 +1,15 @@
 --TEST--
-phpser: signed (trusted) decode uses add_new for assoc arrays — all key shapes round-trip == native
+phpser: signed (trusted) decode of assoc arrays — all key shapes round-trip == native
 --EXTENSIONS--
 phpser
 --FILE--
 <?php
-// phpser_unserialize_signed decodes HMAC-authenticated bytes with the trusted
-// fast path (zend_hash_*_add_new, skipping the dup-key find). Authenticated
-// data comes from our encoder, which serializes unique-keyed HashTables, so
-// add_new is safe. Verify every assoc key shape still round-trips identically
-// to native serialize().
+// phpser_unserialize_signed decodes HMAC-authenticated bytes. Dict-keyed assoc
+// (TAG_ASSOC_DICT) and rowset/table schemas take the add_new fast path only
+// when the keys are pre-scanned unique and non-numeric; plain TAG_ASSOC always
+// uses update (last-write-wins + numeric coercion). A valid HMAC proves key
+// possession, not uniqueness, so uniqueness is enforced, not assumed. Verify
+// every assoc key shape still round-trips identically to native serialize().
 $key = str_repeat("k", 32);
 
 function rt_ok($v) {

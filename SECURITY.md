@@ -97,6 +97,10 @@ Out of scope:
   effects in user code when the class is allowlisted. Those are the
   application's responsibility — phpser only decides which classes
   get instantiated.
+- Resource exhaustion from payloads larger than available memory.
+  Cap input size at the application layer before calling decode.
+- Attacks requiring write access to the PHP source, the extension
+  binary, or the HMAC key material.
 
 ## Deliberate divergences from native `unserialize()`
 
@@ -121,7 +125,3 @@ semantics closely, with two intentional differences:
   0.4.0), so the signed path — the one you use for untrusted bytes —
   is unambiguous. Prefer it when you need to distinguish a decode
   failure from a legitimate `null`.
-- Resource exhaustion from payloads larger than available memory.
-  Cap input size at the application layer before calling decode.
-- Attacks requiring write access to the PHP source, the extension
-  binary, or the HMAC key material.
