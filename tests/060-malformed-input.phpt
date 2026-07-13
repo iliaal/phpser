@@ -276,6 +276,12 @@ $dframe = $dbody . hash_hmac('sha256', $dbody, $dkey, true);
 $dres = phpser_unserialize_signed($dframe, $dkey);
 echo ($dres === ['k' => 2] && count($dres) === 1) ? "signed_assoc_dict_dup OK\n" : "signed_assoc_dict_dup FAIL " . var_export($dres, true) . "\n";
 
+// 10. Class names in the dictionary must use canonical PHP syntax. A leading
+//     namespace separator is accepted by lookup APIs but is not valid in a
+//     serialized class name and must reject before lookup or autoload.
+$bad_class = "\x01\x01\x09\\stdClass\x0a\x00\x00";
+echo (phpser_unserialize($bad_class) === null) ? "invalid_class_name OK\n" : "invalid_class_name FAIL\n";
+
 ?>
 --EXPECT--
 static OK
@@ -300,3 +306,4 @@ legacy_null_slot_ref OK
 rowset_nrows_dos OK
 enum_nonenum OK
 signed_assoc_dict_dup OK
+invalid_class_name OK
