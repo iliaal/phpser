@@ -12,6 +12,7 @@ $malformed_static = [
     "\x01",                              // version only, no dict count
     "\x01\xff",                          // version + bogus varint cut off
     "\x01\xff\xff\xff\xff\xff\xff\xff\xff\xff", // varint > 64 bits
+    "\x01\xff\xff\xff\xff\x0f",         // dict count UINT32_MAX must not wrap allocation
     "\x01\x01",                          // claims 1 dict entry but no entry
     "\x01\x01\x05",                      // claims 5-byte entry, no bytes
     "\x01\x01\x05abc",                   // partial dict entry
@@ -30,22 +31,22 @@ $malformed_static = [
     "\x01\x00\x0b\x02\x00",              // TAG_PACKED_STRINGS n=2, idx-run truncated after one
     "\x01\x00\x0c\x05",                  // TAG_STR_INLINE len=5, no bytes
     "\x01\x00\x06\x01\x01\x63",          // TAG_ASSOC KEY_STR dict_idx=99 (dict empty)
-    "\x01\x00\x0e\x00\x03",              // TAG_OBJECT_MAGIC class_idx=0 (dict empty) inner non-array
+    "\x01\x01\x08stdClass\x0e\x00\x03\x02", // TAG_OBJECT_MAGIC with scalar inner value
 ];
 
+$malformed_fail = 0;
 foreach ($malformed_static as $i => $bytes) {
     $rt = phpser_unserialize($bytes);
-    // Just need to not crash; result can be NULL or partially decoded.
-    if ($rt !== null && !is_scalar($rt) && !is_array($rt) && !is_object($rt)) {
-        echo "case $i unexpected type\n";
+    if ($rt !== null) {
+        echo "case $i expected NULL, got " . get_debug_type($rt) . "\n";
+        $malformed_fail++;
     }
 }
-echo "static OK\n";
+echo $malformed_fail ? "static FAIL $malformed_fail\n" : "static OK\n";
 
 // 2. Truncate valid payloads at every length and decode each. Verifies
 //    bounds checks on every read.
 $valid_payloads = [
-    phpser_serialize(null),
     phpser_serialize(42),
     phpser_serialize(3.14),
     phpser_serialize("hello world"),
@@ -57,13 +58,17 @@ $valid_payloads = [
     phpser_serialize([["a", "b", "c"], ["a", "b", "c"]]),  // row 2 -> TAG_PACKED_STRINGS
 ];
 
-foreach ($valid_payloads as $bytes) {
+$truncate_fail = 0;
+foreach ($valid_payloads as $payload_i => $bytes) {
     for ($len = 0; $len < strlen($bytes); $len++) {
         $rt = phpser_unserialize(substr($bytes, 0, $len));
-        // Don't care what; just shouldn't segfault.
+        if ($rt !== null) {
+            echo "truncate $payload_i:$len expected NULL, got " . get_debug_type($rt) . "\n";
+            $truncate_fail++;
+        }
     }
 }
-echo "truncate OK\n";
+echo $truncate_fail ? "truncate FAIL $truncate_fail\n" : "truncate OK\n";
 
 // 3. Random byte fuzz seeded for reproducibility. Each iter substitutes a
 //    chunk of random bytes mid-payload, then decodes.

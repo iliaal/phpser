@@ -427,7 +427,7 @@ static void enc_ctx_init(encode_ctx *e) {
 }
 
 /* Live declared-property slots in properties_info_table order (NULL entries
- * skipped). TAG_OBJECT_SLOTS uses this as the fixed per-class schema. */
+ * skipped). TAG_OBJECT_SLOTS uses this as its positional per-class schema. */
 static uint32_t ce_table_slot_count(zend_class_entry *ce) {
     uint32_t n = 0;
     int pc = ce->default_properties_count;
@@ -435,6 +435,25 @@ static uint32_t ce_table_slot_count(zend_class_entry *ce) {
         if (ce->properties_info_table[pi] != NULL) n++;
     }
     return n;
+}
+
+/* Exclusive properties_info_table index covering the first `nprops` live
+ * slots. The current-schema path returns the full table immediately; only an
+ * older append-only payload needs the prefix scan. */
+static int ce_table_slot_prefix_limit(
+    zend_class_entry *ce, uint32_t nprops, uint32_t current_nprops)
+{
+    int pc = ce->default_properties_count;
+    if (nprops == current_nprops) return pc;
+    if (nprops == 0) return 0;
+
+    uint32_t seen = 0;
+    for (int pi = 0; pi < pc; pi++) {
+        if (ce->properties_info_table[pi] != NULL && ++seen == nprops) {
+            return pi + 1;
+        }
+    }
+    return pc;
 }
 
 static zend_always_inline void enc_id_release(id_entry *entry) {
@@ -892,6 +911,116 @@ static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
     e->depth--;
 }
 
+/* Keep the __sleep snapshot's key/value ownership and cleanup rules together. */
+static zend_always_inline void enc_encode_sleep_object(
+    smart_str *body, encode_ctx *e, zend_object *obj,
+    zend_function *sleep_fn, uint32_t class_idx, bool identity_tracked)
+{
+    zval names_zv;
+    ZVAL_UNDEF(&names_zv);
+    enc_pins_activate(e);
+    zend_call_known_instance_method_with_0_params(sleep_fn, obj, &names_zv);
+    if (UNEXPECTED(EG(exception)) || Z_TYPE(names_zv) != IS_ARRAY) {
+        /* Same id-rollback as the __serialize failure path. A non-array
+         * __sleep return (no exception) matches native: emit the warning and
+         * serialize null in the object's place. Only a thrown exception aborts
+         * the whole frame. */
+        if (!EG(exception) && Z_TYPE(names_zv) != IS_ARRAY) {
+            php_error_docref(NULL, E_WARNING,
+                "%s::__sleep() should return an array only containing the names of instance-variables to serialize",
+                ZSTR_VAL(obj->ce->name));
+        }
+        zval_ptr_dtor(&names_zv);
+        enc_unvisit_last(e, obj, identity_tracked);
+        if (EG(exception)) e->failed = 1;
+        smart_str_appendc(body, TAG_NULL);
+        return;
+    }
+
+    HashTable *names_ht = Z_ARRVAL(names_zv);
+    /* Fix the selected member set at __sleep-return time. Own both keys and
+     * values because emitting an earlier value can run a nested hook that
+     * mutates the object or replaces a referenced name in `names_ht`. */
+    zend_string **snap_keys = NULL;
+    zval *snap_vals = NULL;
+    uint32_t nprops = 0, snap_cap = 0;
+    zval *zv_name;
+    ZEND_HASH_FOREACH_VAL(names_ht, zv_name) {
+        ZVAL_DEREF(zv_name);
+        zend_string *tmp_name = NULL;
+        zend_string *nm;
+        if (Z_TYPE_P(zv_name) != IS_STRING) {
+            php_error_docref(NULL, E_WARNING,
+                "%s::__sleep() should return an array only containing the names of instance-variables to serialize",
+                ZSTR_VAL(obj->ce->name));
+            nm = zval_get_tmp_string(zv_name, &tmp_name);
+            if (UNEXPECTED(EG(exception))) {
+                zend_tmp_string_release(tmp_name);
+                e->failed = 1;
+                break;
+            }
+        } else {
+            nm = Z_STR_P(zv_name);
+        }
+
+        zend_property_info *info = zend_hash_find_ptr(
+            &obj->ce->properties_info, nm);
+        zend_string *key;
+        zval *p;
+        if (info != NULL) {
+            if (info->flags & ZEND_ACC_STATIC) {
+                zend_tmp_string_release(tmp_name);
+                continue;
+            }
+#if PHP_VERSION_ID >= 80400
+            if (info->offset == (uint32_t)ZEND_VIRTUAL_PROPERTY_OFFSET) {
+                zend_tmp_string_release(tmp_name);
+                continue;
+            }
+#endif
+            p = OBJ_PROP(obj, info->offset);
+            if (Z_TYPE_P(p) == IS_UNDEF) {
+                zend_tmp_string_release(tmp_name);
+                continue;
+            }
+            key = info->name;
+        } else if (obj->properties
+                   && (p = zend_hash_find(obj->properties, nm)) != NULL
+                   && Z_TYPE_P(p) != IS_UNDEF) {
+            key = nm;
+        } else {
+            zend_tmp_string_release(tmp_name);
+            continue;
+        }
+
+        if (nprops == snap_cap) {
+            snap_cap = snap_cap ? snap_cap * 2 : 8;
+            snap_keys = erealloc(
+                snap_keys, snap_cap * sizeof(zend_string *));
+            snap_vals = erealloc(snap_vals, snap_cap * sizeof(zval));
+        }
+        snap_keys[nprops] = zend_string_copy(key);
+        ZVAL_COPY(&snap_vals[nprops], p);
+        nprops++;
+        zend_tmp_string_release(tmp_name);
+    } ZEND_HASH_FOREACH_END();
+
+    smart_str_appendc(body, TAG_OBJECT);
+    varint_write_u64(body, class_idx);
+    varint_write_u64(body, nprops);
+    for (uint32_t i = 0; i < nprops; i++) {
+        varint_write_u64(body, enc_intern_zstr(e, snap_keys[i]));
+        encode_value_ex(body, e, &snap_vals[i], true);
+    }
+    for (uint32_t i = 0; i < nprops; i++) {
+        zend_string_release(snap_keys[i]);
+        zval_ptr_dtor(&snap_vals[i]);
+    }
+    if (snap_keys) efree(snap_keys);
+    if (snap_vals) efree(snap_vals);
+    zval_ptr_dtor(&names_zv);
+}
+
 static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                                bool in_rcn_array) {
     switch (Z_TYPE_P(v)) {
@@ -1122,8 +1251,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             if (ic_name) zend_string_release(ic_name);
             /* __sleep: if defined, the method returns an array of property
              * names to serialize. Unknown / static / IS_UNDEF entries are
-             * skipped (matches PHP behavior modulo the warnings PHP emits
-             * that we don't propagate). For declared props, ce->properties_info
+             * skipped (matches PHP behavior). For declared props, ce->properties_info
              * gives us the mangled name + offset; for dynamic props, fall
              * back to obj->properties. Output stays TAG_OBJECT — the decode
              * side doesn't need to know __sleep ran.
@@ -1132,87 +1260,9 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
              * a struct member of zend_class_entry; PHP keeps it as a regular
              * function and finds it via the function_table on demand. */
             if (sleep_fn_zv != NULL) {
-                zval names_zv;
-                ZVAL_UNDEF(&names_zv);
-                enc_pins_activate(e);
-                zend_call_known_instance_method_with_0_params(
-                    Z_FUNC_P(sleep_fn_zv), obj, &names_zv);
-                if (UNEXPECTED(EG(exception)) || Z_TYPE(names_zv) != IS_ARRAY) {
-                    /* Same id-rollback as the __serialize failure path. A
-                     * non-array __sleep return (no exception) matches native:
-                     * emit the E_WARNING and serialize null in the object's
-                     * place (ext/standard/var.c). Only a thrown exception
-                     * aborts the whole frame. */
-                    if (!EG(exception) && Z_TYPE(names_zv) != IS_ARRAY) {
-                        php_error_docref(NULL, E_WARNING,
-                            "%s::__sleep() should return an array only containing the names of instance-variables to serialize",
-                            ZSTR_VAL(obj->ce->name));
-                    }
-                    zval_ptr_dtor(&names_zv);
-                    enc_unvisit_last(e, obj, identity_tracked);
-                    if (EG(exception)) e->failed = 1;
-                    smart_str_appendc(body, TAG_NULL);
-                    return;
-                }
-                HashTable *names_ht = Z_ARRVAL(names_zv);
-                /* Snapshot the selected (key, value) set BEFORE emitting any
-                 * value. Emitting a property runs its __serialize/__sleep,
-                 * which can mutate this object's property table — e.g. create a
-                 * property that __sleep listed later. Native fixes the member
-                 * set at __sleep-return time; reading live during emission would
-                 * include such late additions. Capture the set now (COW-copy
-                 * each value to pin it against mutation/free), then emit from the
-                 * snapshot. Keys stay borrowed: info->name is interned and
-                 * dynamic-prop names come from the __sleep return array (held
-                 * live until after emit), so neither pointer can move. The
-                 * lookup/skip rules live in exactly one place, so a count/emit
-                 * drift is impossible by construction. */
-                zend_string **snap_keys = NULL;
-                zval *snap_vals = NULL;
-                uint32_t nprops = 0, snap_cap = 0;
-                zval *zv_name;
-                ZEND_HASH_FOREACH_VAL(names_ht, zv_name) {
-                    ZVAL_DEREF(zv_name);
-                    if (Z_TYPE_P(zv_name) != IS_STRING) continue;
-                    zend_string *nm = Z_STR_P(zv_name);
-                    zend_property_info *info = zend_hash_find_ptr(&obj->ce->properties_info, nm);
-                    zend_string *key;
-                    zval *p;
-                    if (info != NULL) {
-                        if (info->flags & ZEND_ACC_STATIC) continue;
-#if PHP_VERSION_ID >= 80400
-                        if (info->offset == (uint32_t)ZEND_VIRTUAL_PROPERTY_OFFSET) continue;
-#endif
-                        p = OBJ_PROP(obj, info->offset);
-                        if (Z_TYPE_P(p) == IS_UNDEF) continue;
-                        key = info->name;
-                    } else if (obj->properties && (p = zend_hash_find(obj->properties, nm)) != NULL
-                               && Z_TYPE_P(p) != IS_UNDEF) {
-                        key = nm;
-                    } else {
-                        continue;
-                    }
-                    if (nprops == snap_cap) {
-                        snap_cap = snap_cap ? snap_cap * 2 : 8;
-                        snap_keys = erealloc(snap_keys, snap_cap * sizeof(zend_string *));
-                        snap_vals = erealloc(snap_vals, snap_cap * sizeof(zval));
-                    }
-                    snap_keys[nprops] = key;
-                    ZVAL_COPY(&snap_vals[nprops], p);
-                    nprops++;
-                } ZEND_HASH_FOREACH_END();
-
-                smart_str_appendc(body, TAG_OBJECT);
-                varint_write_u64(body, class_idx);
-                varint_write_u64(body, nprops);
-                for (uint32_t i = 0; i < nprops; i++) {
-                    varint_write_u64(body, enc_intern_zstr(e, snap_keys[i]));
-                    encode_value_ex(body, e, &snap_vals[i], true);
-                }
-                for (uint32_t i = 0; i < nprops; i++) zval_ptr_dtor(&snap_vals[i]);
-                if (snap_keys) efree(snap_keys);
-                if (snap_vals) efree(snap_vals);
-                zval_ptr_dtor(&names_zv);
+                enc_encode_sleep_object(
+                    body, e, obj, Z_FUNC_P(sleep_fn_zv), class_idx,
+                    identity_tracked);
                 return;
             }
             /* Fast path for the common typed-object shape (DTOs, value
@@ -1810,7 +1860,9 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
             if (b->key) {
                 enc_emit_str_key(body, e, b->key);
             } else {
-                emit_tag_and_varint(body, KEY_LONG, zigzag_encode64((int64_t)b->h));
+                emit_tag_and_varint(
+                    body, KEY_LONG,
+                    zigzag_encode64((int64_t)(zend_long)b->h));
             }
             encode_value_ex(body, e, &b->val, in_rcn_array);
         }
@@ -1881,8 +1933,8 @@ typedef struct {
      * every TAG_OBJECT/TAG_OBJECT_MAGIC/TAG_OBJECT_LEGACY/TAG_ENUM. Real
      * cache workloads serialize batches of same-typed DTOs; without
      * this cache, decoding a 1000-DTO payload calls zend_lookup_class_ex
-     * 1000 times. Sentinel (zend_class_entry *)-1 marks "looked up but
-     * not found" so we don't repeatedly retry missing classes. */
+     * 1000 times. Only successes are cached because an autoloader may make a
+     * previously missing class available later in the same graph. */
     zend_class_entry **ce_cache;
     /* Allow-decision cache for ALLOWED_SET mode: (class_idx → 0 unknown /
      * 1 allowed / 2 denied). Sized to dict_len, lazy-allocated on first
@@ -1901,17 +1953,43 @@ typedef struct {
      * stack at ~100K nested frames. Bracket decode_value with ++/-- and
      * reject when >= MAX_DEPTH. */
     uint32_t depth;
-    /* Set only for HMAC-authenticated payloads (phpser_unserialize_signed):
-     * the bytes provably came from our own encoder, which walks PHP
-     * HashTables and so never emits a duplicate assoc key. That lets the
-     * assoc decode loop use zend_hash_*_add_new (skips the per-key dup-find)
-     * instead of _update. The unsigned path leaves this 0 and keeps _update,
-     * which collapses crafted duplicate keys to last-write-wins and preserves
-     * the CR-001 back-ref safety (see tests/077). */
+    /* Set only for HMAC-authenticated payloads (phpser_unserialize_signed).
+     * Authentication validates the tag, not wire invariants: key holders can
+     * sign arbitrary bytes. Fast paths gated on this flag must independently
+     * validate uniqueness and numeric-key coercion before using add_new. */
     uint8_t trusted;
 } decode_ctx;
 
 enum { ALLOWED_ALL = 0, ALLOWED_NONE, ALLOWED_SET };
+
+/* Zend's string hash is deliberately stable and therefore craftable. Bound
+ * every wire-controlled bucket walk before it becomes quadratic. Normal
+ * tables almost never reach this chain length, and packed arrays never touch
+ * arHash. */
+#define MAX_HASH_CHAIN_LENGTH 64
+static zend_always_inline int dec_hash_chain_exhausted(
+    HashTable *ht, zend_ulong h)
+{
+    if (EXPECTED(ht->nNumOfElements < MAX_HASH_CHAIN_LENGTH)
+        || HT_IS_PACKED(ht)) {
+        return 0;
+    }
+
+    uint32_t idx = HT_HASH(ht, (uint32_t)h | ht->nTableMask);
+    uint32_t remaining = MAX_HASH_CHAIN_LENGTH;
+    while (idx != HT_INVALID_IDX) {
+        if (UNEXPECTED(--remaining == 0)) return 1;
+        Bucket *bucket = HT_HASH_TO_BUCKET(ht, idx);
+        idx = Z_NEXT(bucket->val);
+    }
+    return 0;
+}
+
+static zend_always_inline int dec_string_hash_chain_exhausted(
+    HashTable *ht, zend_string *key)
+{
+    return dec_hash_chain_exhausted(ht, zend_string_hash_val(key));
+}
 
 /* Register the GC entity at `z` (must be IS_OBJECT or IS_REFERENCE), claiming
  * the next id. Holds an explicit refcount on the entity for the lifetime of
@@ -2012,16 +2090,14 @@ static int dec_defer_wakeup(decode_ctx *d, zend_object *obj) {
 }
 
 /* Resolve a class entry from a dict-indexed class name with memoization
- * keyed by class_idx. Sentinel (zend_class_entry *)-1 marks "tried,
- * not found" so we don't re-call zend_lookup_class_ex for missing
- * classes either. Caller still gets NULL for unknown classes.
+ * keyed by class_idx. Only successful lookups are cached: an autoloader may
+ * intentionally make a class available on a later attempt in the same graph.
  *
  * class_idx < d->dict_len is a precondition: the ce_cache is sized to
  * dict_len, so an out-of-range index would be an OOB read/write here.
  * Every caller resolves the class name via dec_get_zstr (which bounds the
  * index) before calling in, so this holds; the assert catches any future
  * caller that forgets. */
-#define DEC_CE_MISSING ((zend_class_entry *)(uintptr_t)-1)
 static inline zend_class_entry *dec_class_resolve_ex(
     decode_ctx *d, uint64_t class_idx, zend_string *class_name, int autoload)
 {
@@ -2031,17 +2107,12 @@ static inline zend_class_entry *dec_class_resolve_ex(
     }
     zend_class_entry *ce = d->ce_cache[class_idx];
     if (EXPECTED(ce != NULL)) {
-        return ce == DEC_CE_MISSING ? NULL : ce;
+        return ce;
     }
     ce = zend_lookup_class_ex(class_name, NULL,
                               autoload ? 0 : ZEND_FETCH_CLASS_NO_AUTOLOAD);
     if (ce) {
         d->ce_cache[class_idx] = ce;
-    } else if (autoload) {
-        /* Only memoize a miss when we actually tried autoloading. A
-         * no-autoload miss must not poison the cache: a later autoloading
-         * caller for the same class_idx still needs its chance to load. */
-        d->ce_cache[class_idx] = DEC_CE_MISSING;
     }
     return ce;
 }
@@ -2119,6 +2190,10 @@ static int dec_install_prop(zend_object *obj, HashTable *obj_props,
         && zend_string_equals_literal(key, MAGIC_MEMBER)) {
         zval_ptr_dtor(tmp);
         return 0;
+    }
+    if (UNEXPECTED(dec_string_hash_chain_exhausted(obj_props, key))) {
+        zval_ptr_dtor(tmp);
+        return -1;
     }
     zval *existing = zend_hash_find(obj_props, key);
     if (existing) {
@@ -2308,6 +2383,8 @@ static inline zend_string *dec_get_class_name(decode_ctx *d, uint64_t idx) {
 
 static int decode_value(decode_ctx *d, zval *out);
 static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *use_add_new);
+/* Returns 1 for unique, 0 for duplicates, -1 when the collision budget is
+ * exhausted. */
 static int dec_schema_keys_are_unique(zend_string **keys, uint64_t nkeys);
 static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out);
 static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out);
@@ -2322,12 +2399,12 @@ static int decode_header(decode_ctx *d) {
     if (ver != PHPSER_VERSION && ver != PHPSER_VERSION_V2) return -1;
     uint64_t n;
     if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-    /* Each dict entry is at least 2 bytes (varint(0) + 0 content, but a
-     * realistic minimum is 1 byte length + at least 1 byte content). Bound
-     * N by remaining input so an oversized varint can't OOM the ecalloc. */
-    if (n > UINT32_MAX || n > d->len - d->pos) return -1;
+    /* Even an empty dict entry consumes a one-byte length varint. Bound N by
+     * remaining input before allocating, and reject UINT32_MAX explicitly so
+     * the allocation count can never wrap in size arithmetic. */
+    if (n >= UINT32_MAX || n > d->len - d->pos) return -1;
     d->dict_len = (uint32_t)n;
-    d->dict = ecalloc(d->dict_len + 1, sizeof(zend_string *));
+    d->dict = ecalloc((size_t)d->dict_len + 1, sizeof(zend_string *));
     for (uint32_t i = 0; i < d->dict_len; i++) {
         uint64_t slen;
         if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
@@ -2388,35 +2465,49 @@ static void decode_destroy(decode_ctx *d) {
  * caller decides where to insert. Returns 0/-1. */
 /* Three flavors of assoc key: int, dict-indexed string, owned-string-inline.
  * The "owned" case allocates a fresh zend_string; the caller releases its
- * reference after handing it to zend_hash_add_new (which addrefs internally
- * for non-interned strings). */
+ * reference after the destination table takes its own reference. */
 enum { KV_LONG, KV_DICT_STR, KV_OWNED_STR };
 
 typedef struct {
     int kind;
     int64_t lval;            /* KV_LONG */
-    uint64_t dict_idx;       /* KV_DICT_STR — bound-check at decode time, not narrowed */
-    zend_string *owned_str;  /* KV_OWNED_STR — refcount=1, caller releases */
+    zend_string *str;        /* string key; refcount=1 only for KV_OWNED_STR */
 } key_val;
+
+static zend_always_inline int dec_i64_fits_zend_long(int64_t value) {
+#if SIZEOF_ZEND_LONG == 4
+    return value >= ZEND_LONG_MIN && value <= ZEND_LONG_MAX;
+#else
+    return 1;
+#endif
+}
 
 static int decode_key(decode_ctx *d, key_val *out_key) {
     if (d->pos >= d->len) return -1;
     uint8_t tag = d->buf[d->pos++];
     if (tag == KEY_LONG) {
+        int64_t value;
+        if (varint_read_i64(d->buf, d->len, &d->pos, &value) < 0
+            || UNEXPECTED(!dec_i64_fits_zend_long(value))) {
+            return -1;
+        }
         out_key->kind = KV_LONG;
-        return varint_read_i64(d->buf, d->len, &d->pos, &out_key->lval);
+        out_key->lval = value;
+        return 0;
     } else if (tag == KEY_STR) {
         uint64_t idx;
         if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) return -1;
+        zend_string *zs = dec_get_zstr(d, idx);
+        if (!zs) return -1;
         out_key->kind = KV_DICT_STR;
-        out_key->dict_idx = idx;
+        out_key->str = zs;
         return 0;
     } else if (tag == KEY_STR_INLINE) {
         uint64_t slen;
         if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
         if (slen > UINT32_MAX || d->pos + slen > d->len) return -1;
         out_key->kind = KV_OWNED_STR;
-        out_key->owned_str = zend_string_init(
+        out_key->str = zend_string_init(
             (const char *)d->buf + d->pos, (size_t)slen, 0);
         d->pos += slen;
         return 0;
@@ -2442,7 +2533,10 @@ static int decode_scalar_tag(decode_ctx *d, zval *out, uint8_t tag) {
         case TAG_TRUE:  ZVAL_TRUE(out); return 0;
         case TAG_LONG: {
             int64_t v;
-            if (varint_read_i64(d->buf, d->len, &d->pos, &v) < 0) return -1;
+            if (varint_read_i64(d->buf, d->len, &d->pos, &v) < 0
+                || UNEXPECTED(!dec_i64_fits_zend_long(v))) {
+                return -1;
+            }
             ZVAL_LONG(out, v);
             return 0;
         }
@@ -2496,6 +2590,57 @@ static zend_always_inline int decode_value_hot(decode_ctx *d, zval *out) {
     return decode_value(d, out);
 }
 
+/* Update a fresh, pre-sized TAG_ASSOC table while bounding the same bucket
+ * walk zend_hash_update would perform internally. Returning -1 leaves `value`
+ * owned by the caller. */
+static zend_always_inline int dec_assoc_update_bounded(
+    HashTable *ht, key_val *key, zval *value)
+{
+    zend_ulong h;
+    zend_string *zs = NULL;
+    if (key->kind == KV_LONG) {
+        h = (zend_ulong)key->lval;
+    } else if (!ZEND_HANDLE_NUMERIC(key->str, h)) {
+        zs = key->str;
+        h = zend_string_hash_val(zs);
+    }
+
+    uint32_t nIndex = (uint32_t)h | ht->nTableMask;
+    uint32_t idx = HT_HASH(ht, nIndex);
+    uint32_t chain_len = 0;
+    while (idx != HT_INVALID_IDX) {
+        Bucket *bucket = HT_HASH_TO_BUCKET(ht, idx);
+        if (bucket->h == h
+            && ((zs == NULL && bucket->key == NULL)
+                || (zs != NULL && bucket->key != NULL
+                    && zend_string_equals(bucket->key, zs)))) {
+            zval_ptr_dtor(&bucket->val);
+            ZVAL_COPY_VALUE(&bucket->val, value);
+            return 0;
+        }
+        if (UNEXPECTED(++chain_len >= MAX_HASH_CHAIN_LENGTH)) return -1;
+        idx = Z_NEXT(bucket->val);
+    }
+
+    uint32_t new_idx = ht->nNumUsed++;
+    ht->nNumOfElements++;
+    Bucket *bucket = ht->arData + new_idx;
+    bucket->h = h;
+    bucket->key = zs;
+    if (zs != NULL && !ZSTR_IS_INTERNED(zs)) {
+        zend_string_addref(zs);
+        HT_FLAGS(ht) &= ~HASH_FLAG_STATIC_KEYS;
+    }
+    Z_NEXT(bucket->val) = HT_HASH(ht, nIndex);
+    HT_HASH(ht, nIndex) = HT_IDX_TO_HASH(new_idx);
+    if (zs == NULL && (zend_long)h >= ht->nNextFreeElement) {
+        ht->nNextFreeElement = (zend_long)h < ZEND_LONG_MAX
+            ? h + 1 : ZEND_LONG_MAX;
+    }
+    ZVAL_COPY_VALUE(&bucket->val, value);
+    return 0;
+}
+
 /* Wrapper enforces two invariants the inner cases would otherwise have to
  * pepper through every error path:
  *   1. C-stack guard — adversarial wire format can recurse arbitrarily;
@@ -2536,7 +2681,10 @@ static int dec_table_column(decode_ctx *d, zval *col, uint64_t nrows, uint8_t co
         case TAG_PACKED_LONGS:
             for (; i < nrows; i++) {
                 int64_t lv;
-                if (varint_read_i64(d->buf, d->len, &d->pos, &lv) < 0) goto fail;
+                if (varint_read_i64(d->buf, d->len, &d->pos, &lv) < 0
+                    || UNEXPECTED(!dec_i64_fits_zend_long(lv))) {
+                    goto fail;
+                }
                 ZVAL_LONG(&col[i], lv);
             }
             return 0;
@@ -2650,7 +2798,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             zend_hash_real_init_packed(arr);
             for (uint64_t i = 0; i < n; i++) {
                 int64_t lv;
-                if (varint_read_i64(d->buf, d->len, &d->pos, &lv) < 0) {
+                if (varint_read_i64(d->buf, d->len, &d->pos, &lv) < 0
+                    || UNEXPECTED(!dec_i64_fits_zend_long(lv))) {
                     zend_array_destroy(arr);
                     return -1;
                 }
@@ -2906,9 +3055,11 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 dec_register(d, out);
                 zend_object *obj = Z_OBJ_P(out);
                 if (schema_ce) {
-                    if (nprops != ce_table_slot_count(schema_ce)) goto slots_fail;
+                    uint32_t current_nprops = ce_table_slot_count(schema_ce);
+                    if (nprops > current_nprops) goto slots_fail;
                     HashTable *obj_props = zend_std_get_properties(obj);
-                    int pc = schema_ce->default_properties_count;
+                    int pc = ce_table_slot_prefix_limit(
+                        schema_ce, (uint32_t)nprops, current_nprops);
                     for (int pi = 0; pi < pc; pi++) {
                         zend_property_info *info = schema_ce->properties_info_table[pi];
                         if (info == NULL) continue;
@@ -2937,7 +3088,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             /* Allowed: the layout must come from the real class. */
             zend_class_entry *ce = dec_class_resolve(d, class_idx, class_name);
             if (!ce) return -1;
-            if (nprops != ce_table_slot_count(ce)) return -1;
+            uint32_t current_nprops = ce_table_slot_count(ce);
+            if (nprops > current_nprops) return -1;
             if (ce->ce_flags & (ZEND_ACC_NOT_SERIALIZABLE | ZEND_ACC_UNINSTANTIABLE)) {
                 return -1;
             }
@@ -2951,6 +3103,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             }
             zend_object *obj = Z_OBJ_P(out);
             dec_register(d, out);
+            int pc = ce_table_slot_prefix_limit(
+                ce, (uint32_t)nprops, current_nprops);
 
             /* __unserialize precedence, mirroring TAG_OBJECT (2630+). The
              * encoder never emits SLOTS for a class with __unserialize, so this
@@ -2963,7 +3117,6 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 zval data;
                 array_init_size(&data, (uint32_t)nprops);
                 zend_hash_real_init_mixed(Z_ARRVAL(data));
-                int pc = ce->default_properties_count;
                 for (int pi = 0; pi < pc; pi++) {
                     zend_property_info *info = ce->properties_info_table[pi];
                     if (info == NULL) continue;
@@ -2978,7 +3131,6 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 return 0;
             }
 
-            int pc = ce->default_properties_count;
             for (int pi = 0; pi < pc; pi++) {
                 zend_property_info *info = ce->properties_info_table[pi];
                 if (info == NULL) continue;
@@ -3077,6 +3229,11 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                     if (!key) goto unser_fail;
                     zval tmp;
                     if (decode_value_hot(d, &tmp) < 0) goto unser_fail;
+                    if (UNEXPECTED(dec_string_hash_chain_exhausted(
+                            Z_ARRVAL(data), key))) {
+                        zval_ptr_dtor(&tmp);
+                        goto unser_fail;
+                    }
                     zend_hash_update(Z_ARRVAL(data), key, &tmp);
                     continue;
                 unser_fail:
@@ -3172,7 +3329,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * duplicate key would create a phantom bucket (count != unique-key
              * count) and a canonical-integer string key would land as a string
              * bucket instead of the int key PHP guarantees. Fall back to
-             * symtable_update on either, keeping add_new for honest payloads. */
+             * symtable_update on either, keeping add_new for validated unique
+             * non-numeric schemas. */
             zend_string **keys = (zend_string **)safe_emalloc((size_t)n, sizeof(zend_string *), 0);
             int has_numeric = 0;
             for (uint64_t i = 0; i < n; i++) {
@@ -3189,8 +3347,12 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 zend_ulong h;
                 if (ZEND_HANDLE_NUMERIC(keys[i], h)) has_numeric = 1;
             }
-            int use_add_new = d->trusted && !has_numeric
-                && dec_schema_keys_are_unique(keys, n);
+            int unique = dec_schema_keys_are_unique(keys, n);
+            if (UNEXPECTED(unique < 0)) {
+                efree(keys);
+                return -1;
+            }
+            int use_add_new = d->trusted && !has_numeric && unique;
             zend_array *arr = zend_new_array((uint32_t)n);
             for (uint64_t i = 0; i < n; i++) {
                 zval tmp;
@@ -3215,56 +3377,24 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             /* Each assoc entry is at least 2 bytes (key tag + value tag). */
             if (n > UINT32_MAX || n > (d->len - d->pos) / 2) return -1;
             zend_array *arr = zend_new_array((uint32_t)n);
+            zend_hash_real_init_mixed(arr);
             for (uint64_t i = 0; i < n; i++) {
-                /* Zero-init so gcc's -Wmaybe-uninitialized doesn't false-
-                 * positive on k.lval/k.owned_str: decode_key sets k.kind
-                 * AND the corresponding union member before returning 0,
-                 * but compiler flow analysis can't see the invariant. */
                 key_val k = {0};
                 if (decode_key(d, &k) < 0) goto assoc_fail;
                 zval tmp;
                 if (decode_value_hot(d, &tmp) < 0) {
-                    if (k.kind == KV_OWNED_STR) zend_string_release(k.owned_str);
+                    if (k.kind == KV_OWNED_STR) zend_string_release(k.str);
                     goto assoc_fail;
                 }
-                /* Update semantics on EVERY path (signed or not). A crafted
-                 * payload with duplicate keys collapses to the last value
-                 * (matches native unserialize) instead of a corrupt HT where
-                 * count() and $arr[key] disagree, and a dup that overwrites an
-                 * id-table-registered object frees it safely (objects are
-                 * pinned at registration — see dec_register / CR-001). The
-                 * add_new fast path is NOT taken here: TAG_ASSOC reads keys
-                 * inline (no cheap pre-scan for uniqueness + numeric coercion),
-                 * and a valid HMAC does not prove the keys are unique — the old
-                 * trusted-only add_new produced phantom buckets and left
-                 * canonical-numeric string keys ("5") as string buckets
-                 * instead of the int key PHP guarantees (CR-003). The pre-
-                 * scanned TAG_ASSOC_DICT / schema paths keep their gated
-                 * add_new; the security boundary keeps update. */
-                switch (k.kind) {
-                    case KV_LONG:
-                        zend_hash_index_update(arr, (zend_ulong)k.lval, &tmp);
-                        break;
-                    /* symtable_update (not hash_update) so a crafted
-                     * canonical-numeric string key like "5" coerces to
-                     * integer 5, exactly as native unserialize and every
-                     * PHP array write do. hash_update would let an attacker
-                     * smuggle a value under string "5" that survives next
-                     * to (or instead of) int 5 — a HashTable state no PHP
-                     * code can produce, breaking isset()/array_key_exists
-                     * dedup assumptions downstream. */
-                    case KV_DICT_STR: {
-                        zend_string *zs = dec_get_zstr(d, k.dict_idx);
-                        if (!zs) { zval_ptr_dtor(&tmp); goto assoc_fail; }
-                        zend_symtable_update(arr, zs, &tmp);
-                        break;
-                    }
-                    case KV_OWNED_STR:
-                        zend_symtable_update(arr, k.owned_str, &tmp);
-                        /* hash addref'd it for the bucket; drop our ref. */
-                        zend_string_release(k.owned_str);
-                        break;
+                /* TAG_ASSOC keeps update semantics for duplicate collapse and
+                 * canonical numeric-string coercion on signed and unsigned
+                 * frames; HMAC verification does not prove key uniqueness. */
+                if (UNEXPECTED(dec_assoc_update_bounded(arr, &k, &tmp) < 0)) {
+                    zval_ptr_dtor(&tmp);
+                    if (k.kind == KV_OWNED_STR) zend_string_release(k.str);
+                    goto assoc_fail;
                 }
+                if (k.kind == KV_OWNED_STR) zend_string_release(k.str);
                 continue;
             assoc_fail:
                 zend_array_destroy(arr);
@@ -3426,6 +3556,10 @@ static int dec_schema_keys_are_unique(zend_string **keys, uint64_t nkeys) {
     HashTable seen;
     zend_hash_init(&seen, (uint32_t)nkeys, NULL, NULL, 0);
     for (uint64_t i = 0; i < nkeys; i++) {
+        if (UNEXPECTED(dec_string_hash_chain_exhausted(&seen, keys[i]))) {
+            zend_hash_destroy(&seen);
+            return -1;
+        }
         if (zend_hash_add_empty_element(&seen, keys[i]) == NULL) {
             zend_hash_destroy(&seen);
             return 0;
@@ -3462,7 +3596,12 @@ static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *us
      * and skipping the scan on `d->trusted` produced per-row phantom buckets
      * and — via the numeric-forced update path with an unpinned cell — the
      * CR-001 UAF class (CR-004). */
-    *use_add_new = !has_numeric && dec_schema_keys_are_unique(keys, nkeys);
+    int unique = dec_schema_keys_are_unique(keys, nkeys);
+    if (UNEXPECTED(unique < 0)) {
+        efree(keys);
+        return NULL;
+    }
+    *use_add_new = !has_numeric && unique;
     return keys;
 }
 
@@ -3545,14 +3684,11 @@ static int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n
  * ------------------------------------------------------------------------- */
 
 /* Reusable encode: produce a framed payload zend_string from a zval.
- * Caller owns the returned zend_string. Returns NULL only when the input
- * nests deeper than MAX_DEPTH — a lossy, undecodable payload would
- * otherwise result. When throw_on_overflow is set, that case also throws
- * an Exception so the userland entry points fail loud; the session handler
- * passes false and degrades to a warning, because a thrown exception during
- * request shutdown (the session auto-save path runs with no execution
- * frame) surfaces as an uncaught fatal that the hook cannot intercept.
- * Every other input yields a payload (worst case an empty TAG_NULL body). */
+ * Caller owns the returned zend_string. Returns NULL when a hook throws or
+ * cleanup raises, or when depth/size limits would make the frame undecodable.
+ * With throw_on_overflow, the userland entry points turn limit failures into
+ * exceptions; the session handler passes false and degrades them to warnings,
+ * because request-shutdown auto-save may have no execution frame to catch one. */
 /* Why phpser_encode_zval_ex returned NULL, so callers can report accurately
  * (the session encoder must not blame "depth" for a size or exception abort). */
 typedef enum {
@@ -3591,7 +3727,8 @@ static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
      * throwing object was); the exception stays pending for the caller. Check
      * before the overflow branches so we never raise a competing depth/size
      * exception on top of the userland one. */
-    if (UNEXPECTED(ctx.failed)) {
+    if (UNEXPECTED(ctx.failed
+        || (ctx.pins_active && EG(exception)))) {
         smart_str_free(&body);
         enc_ctx_destroy(&ctx);
         if (status) *status = PHPSER_ENC_EXCEPTION;
@@ -3604,7 +3741,12 @@ static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
     if (UNEXPECTED(ctx.depth_exceeded)) {
         if (status) *status = PHPSER_ENC_DEPTH;
         smart_str_free(&body);
+        bool cleanup_can_throw = ctx.pins_active;
         enc_ctx_destroy(&ctx);
+        if (UNEXPECTED(cleanup_can_throw && EG(exception))) {
+            if (status) *status = PHPSER_ENC_EXCEPTION;
+            return NULL;
+        }
         if (throw_on_overflow) {
             zend_throw_exception_ex(zend_ce_exception, 0,
                 "phpser: maximum nesting depth (%d) exceeded", MAX_DEPTH);
@@ -3617,7 +3759,12 @@ static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
     if (UNEXPECTED(ctx.size_exceeded)) {
         if (status) *status = PHPSER_ENC_SIZE;
         smart_str_free(&body);
+        bool cleanup_can_throw = ctx.pins_active;
         enc_ctx_destroy(&ctx);
+        if (UNEXPECTED(cleanup_can_throw && EG(exception))) {
+            if (status) *status = PHPSER_ENC_EXCEPTION;
+            return NULL;
+        }
         if (throw_on_overflow) {
             zend_throw_exception_ex(zend_ce_exception, 0,
                 "phpser: string length exceeds the 4 GiB wire-format limit");
@@ -3656,7 +3803,13 @@ static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
     }
     smart_str_0(&out);
 
+    bool cleanup_can_throw = ctx.pins_active;
     enc_ctx_destroy(&ctx);
+    if (UNEXPECTED(cleanup_can_throw && EG(exception))) {
+        zend_string_release(out.s);
+        if (status) *status = PHPSER_ENC_EXCEPTION;
+        return NULL;
+    }
     return out.s;
 }
 
@@ -4031,10 +4184,9 @@ PHP_FUNCTION(phpser_unserialize_signed) {
         RETURN_THROWS();
     }
 
-    /* trusted=1: the HMAC verified above proves these bytes were produced by
-     * our encoder, which serializes unique-keyed PHP HashTables — no duplicate
-     * assoc keys — so the assoc decode loop can use add_new and skip the
-     * per-key dup-find. */
+    /* trusted=1 records successful authentication only. A key holder can sign
+     * arbitrary wire bytes, so every add_new fast path still validates the
+     * required uniqueness and numeric-key invariants itself. */
     int rc = phpser_decode_buf_opts(payload, frame_len, return_value, allowed_mode,
                                     allowed_set, /* trusted */ 1);
 

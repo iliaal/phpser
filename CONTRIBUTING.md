@@ -139,14 +139,16 @@ For maintainers cutting a new version:
 3. `git tag -a X.Y.Z -m "phpser X.Y.Z"` with a release-note body,
    then `git push origin X.Y.Z`. Use bare semver (`0.1.1`, not
    `v0.1.1`) to match the fleet convention.
-4. The `release-windows.yml` and `release-linux.yml` workflows pick
-   up the tag, build the full matrix (PHP 8.2-8.5 x TS/NTS x x86/x64
-   for Windows; PHP 8.4-8.5 x glibc/macOS for Linux), and attach the
-   binaries to the release.
-5. Packagist's GitHub webhook fires on tag push and re-scans
+4. Create and **publish** the GitHub Release for that tag. A tag push alone
+   does not start the binary workflows; both listen for the
+   `release.published` event.
+5. The `release-windows.yml` and `release-linux.yml` workflows build the full
+   matrix (PHP 8.2-8.5 x TS/NTS x x86/x64 for Windows; PHP 8.4-8.5 x
+   glibc/macOS for Linux) and attach the binaries to the published release.
+6. Packagist's GitHub webhook fires on tag push and re-scans
    versions. `pie install iliaal/phpser` resolves to the new tag
    within a minute or two.
-6. Before the first tag of any release cycle, confirm `composer.json`
+7. Before the first tag of any release cycle, confirm `composer.json`
    exists at HEAD (`git ls-tree HEAD | grep composer.json`).
    Packagist silently skips tags whose commit doesn't contain
    `composer.json` at the root.

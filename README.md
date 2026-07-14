@@ -14,9 +14,9 @@ where decode time matters more than encode time or payload size.
 
 PHP cache workloads pay decode cost on every read. Encode happens once per write. The default `igbinary` was the right answer for over a decade, but lags on three shapes that show up everywhere: packed numeric arrays, deep-nested structures, and same-class DTO batches (Laravel queue payloads, cached models).
 
-phpser is decoder-optimized. Pointer-equality dict intern, refcount-reuse of zend_strings, pre-sized hash tables with direct `arPacked` writes, tagged scalar runs, an O(1) pointer-hash intern cache. On the shapes above, it cuts size by 60-65% and decode time by 70-77% vs igbinary. The wire-v2 columnar rowset format makes general-purpose rowsets 40-41% smaller than igbinary, 38-53% faster to encode, and 20-29% faster to decode.
+phpser is decoder-optimized. It uses pointer-equality dict interning, reuses decoded zend_strings by refcount, pre-sizes hash tables, writes straight into packed zval storage, and emits tagged scalar runs. On the current ARM benchmark, phpser beats igbinary on encode and decode in eight of nine cases. Packed numeric arrays decode 77-79% faster, deep nesting decodes 24% faster, and DTO batches decode 46-57% faster.
 
-phpser is also faster to **encode** than igbinary on every shape in the suite (-13% to -75%), so it's not just a read-path win. As of the wire-v2 decode and columnar-encode work it's now faster to **decode** on every shape too, including rowsets (`rowset_1000` -20%), which previously ran at decode parity. The bench table below has the full shape-by-shape breakdown.
+String allocation identity controls the rowset result. Literal-backed rowsets decode 21-31% faster than igbinary, while `rowset_distinct_1000`, where equal repeated strings have separate allocations, is 16% larger, 19% slower to encode, and 43% slower to decode. Use the case that matches how your application obtains row values.
 
 📖 **The design writeup:** [phpser: a fast, secure binary serializer for PHP cache workloads](https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads), on what the decoder does differently and why decode time is the metric to optimize. The [interactive benchmark page](https://iliaal.github.io/phpser/) compares phpser against igbinary, native `serialize()`, and msgpack across every cache shape.
 
@@ -113,43 +113,45 @@ model.
 ## ✨ Features
 
 - **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder. An empty key is rejected on both sides. A keyless HMAC is forgeable, so callers must supply real key material.
-- **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode (encode throws, decode returns `null`), and assoc decode uses `zend_hash_update` so duplicate-key payloads collapse to last-write-wins rather than phantom buckets.
+- **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode (encode throws, decode returns `null`), and assoc decode uses bounded update semantics so duplicate-key payloads collapse to last-write-wins rather than phantom buckets.
 - **PHP 8.2+ (8.3, 8.4, 8.5, master).** BSD 3-Clause.
 
-## Bench (PHP 8.4.22 aarch64, idle box, 1000 iters, median of 7)
+## Bench (PHP 8.4.22 aarch64, idle box, 1000 iters, median of 35)
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → **2727** (**-40%**) | 18.2k → **11.3k** ns (**-38%**) | 20.9k → **14.9k** ns (**-29%**) |
-| rowset_1000 | 47K → **28K** (**-41%**) | 259k → **121k** ns (**-53%**) | 212k → **170k** ns (**-20%**) |
-| packed_1k | 5495 → **1941** (**-65%**) | 9.7k → **2.4k** ns (**-75%**) | 15.7k → **3.4k** ns (**-78%**) |
-| packed_10k | 60K → **22K** (**-63%**) | 94k → **24k** ns (**-74%**) | 154k → **36k** ns (**-77%**) |
-| deep_50 | 419 → 424 (parity) | 2.7k → **2.1k** ns (**-25%**) | 3.5k → **2.9k** ns (**-17%**) |
-| dto_100 | 7083 → **5506** (**-22%**) | 28k → **24.5k** ns (**-13%**) | 56k → **30k** ns (**-46%**) |
-| dto_1000 | 73K → **57K** (**-23%**) | 315k → **249k** ns (**-21%**) | 611k → **309k** ns (**-49%**) |
-| dto_mixed | 22K → **14K** (**-34%**) | 107k → **73k** ns (**-32%**) | 231k → **101k** ns (**-56%**) |
+| rowset_100 | 4570 → **2727** (**-40%**) | 17.9k → **11.2k** ns (**-37%**) | 21.8k → **15.0k** ns (**-31%**) |
+| rowset_1000 | 47K → **28K** (**-41%**) | 255.7k → **126.0k** ns (**-51%**) | 223.6k → **177.1k** ns (**-21%**) |
+| rowset_distinct_1000 | **59K** → 69K (**+16%**) | **337.5k** → 402.1k ns (**+19%**) | **314.1k** → 450.1k ns (**+43%**) |
+| packed_1k | 5495 → **1941** (**-65%**) | 9.7k → **2.4k** ns (**-75%**) | 16.2k → **3.5k** ns (**-79%**) |
+| packed_10k | 60K → **22K** (**-63%**) | 93.1k → **24.6k** ns (**-74%**) | 161.5k → **37.4k** ns (**-77%**) |
+| deep_50 | 419 → 424 (parity) | 2.8k → **2.1k** ns (**-25%**) | 3.7k → **2.8k** ns (**-24%**) |
+| dto_100 | 7083 → **5506** (**-22%**) | 28.0k → **27.0k** ns (**-3%**) | 56.1k → **30.3k** ns (**-46%**) |
+| dto_1000 | 73K → **57K** (**-23%**) | 318.6k → **301.5k** ns (**-5%**) | 627.2k → **313.2k** ns (**-50%**) |
+| dto_mixed | 22K → **14K** (**-34%**) | 107.2k → **96.6k** ns (**-10%**) | 238.9k → **102.6k** ns (**-57%**) |
 
-phpser encodes faster than igbinary on every shape in the suite (-13% to
--75%) and, since the wire-v2 decode and columnar-encode work, decodes faster
-on every shape too, including rowsets (-20% to -29%), which used to run at
-parity. Packed numerics: ~64% smaller, ~74% faster encode, ~78% faster
-decode. Deep-nested: ~25% faster encode at parity size.
+phpser encodes 3-75% faster and decodes 21-79% faster than igbinary across
+eight cases. Packed numerics are about 64% smaller, 74-75% faster to encode,
+and 77-79% faster to decode. Deep nesting is 25% faster to encode and 24%
+faster to decode at parity size.
 
-Rowsets are the wire-v2 headline. The columnar `TAG_TABLE` format makes
-them **40-41% smaller** than igbinary, where they used to run ~1% larger,
-**38-53% faster to encode**, and **20-29% faster to decode** (they were near
-decode parity before the wire-v2 decode work). A 41% smaller payload with a
-decode win is the whole reason to store a rowset column-major.
+Rowsets are sensitive to string allocation identity. The table's
+`rowset_100` and `rowset_1000` reuse PHP literal strings, so pointer-equality
+interning is effective and columnar `TAG_TABLE` makes them **40-41%
+smaller**, **37-51% faster to encode**, and **21-31% faster to decode** than
+igbinary. Equal strings with separate allocations do not take that fast path. In
+the distinct-allocation case, phpser is **16% larger, 19% slower to encode,
+and 43% slower to decode**.
 
 DTO workloads (Laravel-queue-style payloads, single-class arrays) are now
-**22-34% smaller, 46-56% faster to decode, 13-32% faster to encode** than
+**22-34% smaller, 46-57% faster to decode, 3-10% faster to encode** than
 igbinary. Wire-v2 `TAG_OBJECT_SLOTS` drops the per-property key indices and
 installs declared values straight into property slots; the dict dedups prop
 names once, and the class-entry lookup cache amortizes `zend_lookup_class_ex`
 across same-typed batches.
 
 Sizes are byte-identical on x86 (the wire format is architecture-neutral);
-the ns/op columns are from an idle aarch64 box, median of 7. For the full
+the ns/op columns are from an idle aarch64 box, median of 35. For the full
 four-way picture, phpser vs igbinary vs native `serialize()` vs msgpack,
 with size, encode, and decode side by side on every shape, see the
 **[interactive benchmark page](https://iliaal.github.io/phpser/)**.
@@ -203,14 +205,14 @@ measurable perf to take, and that this project targets, are:
    allocation, no refcount traffic, pointer-equality hash lookups),
    with a regular allocation as the fallback. Hashes are set on both
    paths; `zend_hash_add_new` reuses the cached hash. **Shipped.**
-5. **Provenance-gated `add_new` on assoc decode.** The default
-   (unsigned) path uses `zend_hash_update`: it's the security boundary, and
-   adversarial payloads with duplicate keys must collapse to last-write-wins
-   rather than produce phantom buckets (`count($arr) !=
-   count(array_unique(array_keys($arr)))`). The HMAC-authenticated
-   `phpser_unserialize_signed` path provably came from our own encoder
-   (unique-keyed HashTables, no duplicates), so it uses `zend_hash_*_add_new`
-   and skips the per-key existence check. **Shipped.**
+5. **Invariant-gated `add_new` on assoc decode.** Wire-controlled duplicate
+   keys must collapse to last-write-wins rather than produce phantom buckets
+   (`count($arr) != count(array_unique(array_keys($arr)))`), and canonical
+   integer strings must coerce to integer keys. Authentication proves key
+   possession, not that the bytes came from phpser's encoder: a key holder can
+   sign a handcrafted frame. `TAG_ASSOC` therefore always uses update
+   semantics; schema-based paths use `add_new` only after validating distinct,
+   non-numeric keys once at schema read. **Shipped.**
 6. **Inline-short-string tag with upgrade-on-second-encounter.**
    `TAG_STR_INLINE` (0x0c) and `KEY_STR_INLINE` (0x02) are emitted on a
    string's first occurrence; the next occurrence triggers an in-place
@@ -268,19 +270,24 @@ as a `session.serialize_handler` when available.
   this cap for shared-graph cases; the cap only fires on genuinely deep
   trees. Cache workloads typically nest 5-10 deep, so the cap is many
   orders of magnitude past any legitimate payload.
-- **Closures and resources encode as `NULL`.** Same shape as PHP's own
-  `serialize()`; these types are inherently non-serializable.
+- **Closures and resources encode as `NULL`.** This behavior differs from
+  native `serialize()` by design: PHP throws when serializing a `Closure` and
+  serializes a resource as its numeric resource id. phpser treats both as
+  unsupported cache values and writes `NULL`.
 - **Unknown classes at decode fall back to `stdClass`** for plain objects
   and `__serialize`-based objects, rather than PHP's `__PHP_Incomplete_Class`.
   This is deliberate for the typical cache workload; `allowed_classes => [...]`
   produces `__PHP_Incomplete_Class` with the original name preserved for
   disallowed classes, matching PHP. The fallback does **not** apply to every
   wire shape: a positional DTO (`TAG_OBJECT_SLOTS`) or an enum (`TAG_ENUM`)
-  whose class no longer exists fails the whole decode (returns `null`) —
-  slots carry only values, so without the class schema there is nothing to
-  decode into — and a legacy `Serializable` value (`TAG_OBJECT_LEGACY`) whose
-  class is gone decodes as `null` in place. Evolve classes append-only if
-  cached payloads must outlive a class rename.
+  whose class no longer exists fails the whole decode (returns `null`) because
+  slots carry only values and have no schema to decode into. A legacy
+  `Serializable` value (`TAG_OBJECT_LEGACY`) whose class is gone decodes as
+  `null` in place. Evolve classes append-only if
+  cached payloads must outlive a schema change. When a positional DTO is
+  disallowed and its class is not already loaded, phpser does not autoload it
+  for the sole purpose of recovering property names. The incomplete object
+  keeps its original class marker but discards its unnamed slot values.
 - **Strings and blobs are capped at 4 GiB (`UINT32_MAX`) on the wire.**
   Encoding a longer value fails loud (throws for the userland API, an
   `E_WARNING` for the session handler) rather than emitting bytes the decoder
@@ -288,24 +295,28 @@ as a `session.serialize_handler` when available.
 - **`TAG_OBJECT_SLOTS` is positional.** Eligible typed objects encode their
   declared properties as values in `properties_info_table` (declaration)
   order with no per-property names; decode installs them back in that order.
-  A property *count* mismatch between encode and decode is rejected, but a
-  same-count *reorder* of a class's typed properties is not detected, so the
-  values land in the reordered slots silently. Same-deploy cache round-trips
-  are safe (the class is identical on both sides). For signed payloads that
-  outlive a deploy, evolve classes append-only (add properties at the end,
-  don't reorder or retype existing ones) so older payloads keep decoding
-  into the right slots.
+  An older payload carrying a prefix of the current effective slot table is
+  accepted and appended properties retain their class defaults. A
+  payload with more slots than the current class is rejected. A same-count
+  reorder is not detectable, so values can land in the wrong slots; removing,
+  reordering, or changing a slot to an incompatible type breaks compatibility.
+  For payloads that outlive a deploy, append properties only at the end of the
+  effective `properties_info_table` order. Adding a parent property can insert
+  before child slots and break append-only order.
 - **`session.serialize_handler=phpser` is shipped** (compiled in when
   `phpize` detects the session extension; gated on `HAVE_PHP_SESSION` so
   the extension still loads on session-less PHP builds). `phpredis`
   integration is not yet wired; call `phpser_serialize`/`unserialize`
   directly when using the extension as a phpredis serializer. The handler
-  serializes `$_SESSION` as a single phpser array value — it is **not**
+  serializes `$_SESSION` as a single phpser array value; it is **not**
   byte-compatible with the built-in `php`, `php_binary`, or `igbinary`
   session formats, so switching handlers doesn't read back sessions written
   by another. It also decodes with all classes allowed and magic methods
   enabled: treat the session store as trusted, exactly as with the native
-  `php_serialize` handler.
+  `php_serialize` handler. If session encode fails, the callback returns
+  failure and emits a warning, but PHP's session core may persist an empty
+  payload in place of the previous session; it does not preserve the old bytes
+  on failure.
 
 ## Wire format (V1 / V2)
 
@@ -356,16 +367,16 @@ key tags:
 ```
 
 Varints are LEB128 (unsigned); signed values use zigzag encoding. Tags
-0x10/0x11 plus 0x0a/0x0d/0x0e/0x0f each implicitly claim the next id in
-encounter order, so the decoder reconstructs back-refs by counting
+0x10/0x11 plus 0x0a/0x0d/0x0e/0x0f/0x12 each claim the next id in encounter
+order, so the decoder reconstructs back-refs by counting
 container tags as it parses.
 
 The version byte is emitted as `0x02` only when the body actually uses a
 v2-only tag (`0x12`–`0x15`); otherwise it stays `0x01`. On decode it is a
 *minimum-reader* signal, not a gate: the tag dispatch is version-agnostic,
 so a hand-built frame carrying a v2 tag under a `0x01` header still decodes.
-This tolerance is deliberate — it keeps the byte purely additive — so don't
-rely on the version byte alone to reject a future format; a
+This tolerance keeps the version byte additive. Don't rely on it alone to
+reject a future format; a
 backwards-incompatible change gets a new version constant *and* explicit tag
 rejection.
 

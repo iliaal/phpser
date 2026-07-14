@@ -125,6 +125,32 @@ try {
 }
 echo $caught ? "unsigned_in_signed_rejected OK\n" : "unsigned_in_signed_rejected FAIL\n";
 
+// Authentication failure must stop before class lookup or object hooks. The
+// first frame names an unloaded class; the second is a valid object frame with
+// a deliberately corrupted tag and a visible __wakeup side effect.
+$autoloads = 0;
+spl_autoload_register(function (string $class) use (&$autoloads): void {
+    if ($class === 'SignedAutoloadProbe') $autoloads++;
+});
+$unknown_body = "\x01\x01\x13SignedAutoloadProbe\x0a\x00\x00";
+try {
+    phpser_unserialize_signed($unknown_body . str_repeat("\0", 32), $key);
+} catch (Exception $e) {
+}
+
+class SignedWakeProbe {
+    public static int $wakes = 0;
+    public function __wakeup(): void { self::$wakes++; }
+}
+$wake_frame = phpser_serialize_signed(new SignedWakeProbe(), $key);
+$wake_frame[strlen($wake_frame) - 1] = chr(ord($wake_frame[strlen($wake_frame) - 1]) ^ 1);
+try {
+    phpser_unserialize_signed($wake_frame, $key);
+} catch (Exception $e) {
+}
+echo ($autoloads === 0 && SignedWakeProbe::$wakes === 0)
+    ? "reject_before_decode OK\n" : "reject_before_decode FAIL\n";
+
 // --- Encoded values can include null and false (which the legacy
 // "false=failure" pattern would have ambiguity for — we throw on bad sig
 // instead, so the return slot is free). ---
@@ -164,6 +190,7 @@ deterministic OK
 no_crash_unsigned_path OK
 signed_allowed_classes OK
 unsigned_in_signed_rejected OK
+reject_before_decode OK
 null_value OK
 false_value OK
 known_answer OK

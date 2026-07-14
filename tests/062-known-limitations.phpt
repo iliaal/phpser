@@ -13,16 +13,16 @@ phpser
 // silently.
 
 // --- ArrayObject (igbinary_bug54662 shape) ---
-// __serialize / Serializable ARE supported in general (see 063/064). The gap
-// is specifically ArrayObject: it keeps its elements in a custom internal
-// serializer rather than ordinary properties, so its storage doesn't
-// round-trip through the property walk. Contract for now: no crash, object
-// instance comes back as the same class.
+// Internal __serialize support must preserve both the container and its stored
+// object; checking only the class would let silent state loss pass.
 class StorageBug054662 { public $storage = "a string"; }
 $collection = new ArrayObject();
 $collection->append(new StorageBug054662());
 $rt = phpser_unserialize(phpser_serialize($collection));
-echo $rt instanceof ArrayObject ? "arrayobject_class OK\n" : "arrayobject_class FAIL\n";
+$item = $rt instanceof ArrayObject ? $rt[0] ?? null : null;
+echo $rt instanceof ArrayObject && count($rt) === 1
+    && $item instanceof StorageBug054662 && $item->storage === "a string"
+    ? "arrayobject_state OK\n" : "arrayobject_state FAIL\n";
 
 // __serialize / __unserialize: SUPPORTED — see 063-magic-serialize.phpt.
 // IS_REFERENCE sharing, object identity, and cycles: SUPPORTED —
@@ -39,6 +39,6 @@ echo $rt === null ? "resource_null OK\n" : "resource_null FAIL\n";
 fclose($r);
 ?>
 --EXPECT--
-arrayobject_class OK
+arrayobject_state OK
 closure_null OK
 resource_null OK

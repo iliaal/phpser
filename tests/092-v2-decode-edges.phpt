@@ -96,15 +96,18 @@ for ($i = 0; $i < $ndict; $i++) {
 echo (ord($enc[$pos]) === 0x12) ? "dto_slots_tag OK\n"
     : "dto_slots_tag FAIL (got " . dechex(ord($enc[$pos])) . ")\n";
 
-// --- CR-010: the TAG_OBJECT_SLOTS nprops integrity gate. A slots frame whose
-// nprops disagrees with the class's declared slot count must reject (null), not
-// mis-slot values. (087's historical "bad_slots" craft rejected at dict parsing
-// instead, never reaching this check.) Real class + correct dict here. ---
+// --- CR-010: the TAG_OBJECT_SLOTS nprops integrity gate. An older prefix is
+// accepted so properties appended to the effective slot table keep their class
+// defaults; a newer payload with more slots than this class knows still rejects.
+// (087's historical "bad_slots" craft rejected at dict parsing instead, never
+// reaching this check.) Real class + correct dict here. ---
 class Dto2 { public int $a = 0; public string $b = ""; }  // slot_count = 2
-$np_low  = "\x02\x01\x04Dto2\x12\x00\x01\x03\x02";                  // nprops=1 (too few)
+$np_low  = "\x02\x01\x04Dto2\x12\x00\x01\x03\x02";                  // nprops=1 (older prefix)
 $np_high = "\x02\x01\x04Dto2\x12\x00\x03\x03\x02\x0c\x01x\x03\x02"; // nprops=3 (too many)
 $np_ok   = "\x02\x01\x04Dto2\x12\x00\x02\x03\x02\x0c\x01x";         // nprops=2 (exact)
-echo (phpser_unserialize($np_low) === null) ? "nprops_low OK\n" : "nprops_low FAIL\n";
+$np_l = phpser_unserialize($np_low);
+echo ($np_l instanceof Dto2 && $np_l->a === 1 && $np_l->b === "")
+    ? "nprops_low OK\n" : "nprops_low FAIL\n";
 echo (phpser_unserialize($np_high) === null) ? "nprops_high OK\n" : "nprops_high FAIL\n";
 $np_c = phpser_unserialize($np_ok);
 echo ($np_c instanceof Dto2 && $np_c->a === 1 && $np_c->b === "x")

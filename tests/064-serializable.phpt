@@ -70,6 +70,20 @@ try {
 }
 echo $caught ? "throws_propagated OK\n" : "throws_propagated FAIL\n";
 
+// Throwing from the legacy unserialize hook must propagate too. Mutate only
+// the opaque legacy payload, keeping the frame structurally valid so this
+// reaches LegacySer::unserialize() rather than failing at header parsing.
+$bad = phpser_serialize(new LegacySer("payload"));
+$at = strpos($bad, "v1|payload");
+$bad[$at] = "x";
+$caught = false;
+try {
+    phpser_unserialize($bad);
+} catch (RuntimeException $e) {
+    $caught = ($e->getMessage() === "bad version");
+}
+echo $caught ? "unserialize_throws OK\n" : "unserialize_throws FAIL\n";
+
 // SplPriorityQueue / SplMinHeap — PHP's own serialize() returns empty
 // O:N:"Class":0:{} for these (their internal heap data isn't accessible
 // to a serializer). We expect to match that behavior — class survives,
@@ -92,5 +106,6 @@ user_legacy OK
 array_of_legacy OK
 subclass OK
 throws_propagated OK
+unserialize_throws OK
 splpq_class OK
 splheap_class OK

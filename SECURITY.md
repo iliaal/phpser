@@ -11,7 +11,8 @@ to letting the attacker run those magic methods.
 
 - `phpser_unserialize($payload, ['allowed_classes' => false])` —
   rejects all classes (decodes them as `__PHP_Incomplete_Class`),
-  matches PHP's native opt-out.
+  matching PHP's native instantiation opt-out; positional object state has
+  the documented divergence below.
 - `phpser_unserialize($payload, ['allowed_classes' => [Foo::class, Bar::class]])` —
   allowlist; classes outside the list decode as
   `__PHP_Incomplete_Class` with the original name preserved.
@@ -23,6 +24,17 @@ to letting the attacker run those magic methods.
   exception on both the signing and verifying side — a keyless HMAC is
   forgeable, so callers must supply real key material (use a
   high-entropy secret, e.g. 32 random bytes).
+
+A valid HMAC proves that the signer possessed the key. It does not prove the
+body was emitted by `phpser_serialize_signed()`: code with the key can sign
+handcrafted wire bytes. The signed decoder therefore applies the same
+duplicate-key, numeric-key, integer-range, nesting, and collision-work checks
+as the unsigned decoder before taking any structural fast path.
+
+Wire-controlled HashTable keys are rejected when a collision chain exhausts
+the decoder's bounded work budget. This prevents deterministic collisions in
+Zend's stable string hash from turning a bounded payload into quadratic decode
+CPU while leaving ordinary large arrays unrestricted by a global element cap.
 
 **Session handler.** When built against the session extension, phpser
 registers `session.serialize_handler = phpser`. This handler restores
@@ -105,7 +117,7 @@ Out of scope:
 ## Deliberate divergences from native `unserialize()`
 
 phpser matches PHP's `unserialize($bytes, ['allowed_classes' => ...])`
-semantics closely, with two intentional differences:
+semantics, with these intentional differences:
 
 - **Enums are filtered by `allowed_classes`.** Native `unserialize()`
   does *not* consult `allowed_classes` on the enum (`E:`) path — a
@@ -125,3 +137,13 @@ semantics closely, with two intentional differences:
   0.4.0), so the signed path — the one you use for untrusted bytes —
   is unambiguous. Prefer it when you need to distinguish a decode
   failure from a legitimate `null`.
+
+- **Unloaded, disallowed positional objects keep no slot state.**
+  `TAG_OBJECT_SLOTS` carries values in class slot order without property names.
+  Under `allowed_classes => false`, phpser will not autoload an
+  attacker-selected class for the sole purpose of recovering that schema. If
+  the class is not already resident, the result is an
+  `__PHP_Incomplete_Class` with its original class marker but no decoded slot
+  properties. Native serialization carries
+  property names and can preserve that state. If the phpser class is already
+  loaded, the known prefix is mapped without autoloading.

@@ -11,6 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Fixed a use-after-free in signed (`phpser_unserialize_signed`) decode: a forged-but-validly-signed frame carrying a duplicate object-property, assoc, or rowset/table schema key could free an id-registered object on overwrite while a later back-reference still pointed at it. Objects are now pinned unconditionally for the decode pass (the signed fast path previously skipped the pin), and the trusted assoc/schema paths use uniqueness-gated inserts. A valid HMAC proves key possession, not honest-encoder provenance, so the decoder no longer trusts key uniqueness.
 - Fixed a use-after-free in encode: a `__serialize`/`__sleep` hook that grows the array being walked through a by-reference alias reallocated the table under the element iterator. The array walk now holds a reference across user hooks so the write copy-on-write-separates instead, mirroring the existing object-property guard. (Native `serialize()` still exhibits this on the same shape.)
+- Fixed a use-after-free when a nested serialization hook replaced a referenced `__sleep()` member name after phpser had borrowed its string pointer. The encoder now owns the selected property names until it finishes the object.
+- Bounded decoder work on crafted Zend hash collisions. Wire-controlled keys can no longer turn associative arrays, object properties, or rowset schemas into quadratic CPU work.
+- Rejected a dictionary count of `UINT32_MAX` before allocation. The previous `dict_len + 1` calculation wrapped to zero before the decoder populated the slots.
 
 ### Fixed
 
@@ -19,10 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A non-array `__sleep()` return now emits the same `E_WARNING` as native `serialize()` before writing null in the object's place, instead of dropping the value silently.
 - Encode aborts with the pending exception when a lazy object's initializer throws during serialization (and when a legacy `Serializable` C serializer returns success with an exception pending), instead of returning a truncated frame the session handler would persist.
 - ZTS dynamically-loaded builds now refresh the thread-local storage cache in `RINIT`, not only `MINIT`, so worker threads under a threaded ZTS SAPI don't touch engine globals through an unpopulated cache. NTS builds register no `RINIT` and pay no per-request cost.
+- Encode now discards a completed frame if releasing its temporary hook snapshots throws, so the userland and session entry points never return or persist bytes under a pending exception.
+- Scalar `__sleep()` member names now raise PHP's native warning and coerce to strings instead of being dropped without a warning.
+- A failed class lookup no longer poisons later lookups for the same wire class. An autoloader can make the class available on a later object in the graph.
+- On 32-bit PHP, decode now rejects wire integers outside the `zend_long` range instead of narrowing scalar values, packed runs, table columns, or array keys. Negative array keys are encoded from signed `zend_long` values so their canonical wire form still round-trips under the stricter decoder.
 
 ### Changed
 
 - `TAG_TABLE` decode streams each column straight into the row arrays instead of materializing the full columnar matrix first, roughly halving peak memory on large tables with no decode-speed change.
+- `TAG_OBJECT_SLOTS` now accepts an older prefix of the current effective slot table. Properties appended at the end keep their class defaults; payloads with more slots than the current class still fail.
+
+### For contributors
+
+- `bench.php` now rotates serializer order between timed repetitions and includes a distinct-allocation rowset, removing the fixed-order confound and exposing pointer-identity-sensitive string interning.
+- Malformed-input tests now require every curated invalid frame and every strict prefix of a valid non-null frame to decode as `null`; the legacy and magic-hook cases now reach the failure branches they name.
 
 ## [0.4.0] - 2026-07-10
 
@@ -162,11 +175,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   HashTable, the way native `serialize()` does — faster one-shot (fresh
   object) encode. PHP 8.4 lazy objects fall back to `get_properties()` so
   their initializer runs before serialization.
-- `phpser_unserialize_signed()` decodes associative arrays with `add_new`
-  instead of `update`: the HMAC proves the payload came from this
-  extension's encoder (unique keys), so the per-key duplicate check is
-  skipped. The unsigned path keeps last-write-wins collapse for untrusted
-  input.
+- `phpser_unserialize_signed()` began decoding associative arrays with
+  `add_new` instead of `update`, based on the assumption that signed bodies
+  came from this extension's encoder. The unsigned path kept
+  last-write-wins collapse. The Unreleased security fixes remove that
+  provenance assumption and validate key invariants on signed frames too.
 
 ## [0.1.1] - 2026-06-01
 
@@ -176,8 +189,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exception when the value nests deeper than the recursion cap (512)
   instead of silently emitting a truncated payload that
   `phpser_unserialize()` could not decode (it returned `null`, losing all
-  data). The session serialize handler degrades to an `E_WARNING` and skips
-  the write rather than throwing during request shutdown.
+  data). The session serialize handler emits an `E_WARNING` and returns
+  failure instead of handing PHP a partial frame; PHP's session core may
+  replace the previous stored payload with empty bytes on that failure.
 
 ### Fixed
 

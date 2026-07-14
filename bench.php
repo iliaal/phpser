@@ -1,5 +1,5 @@
 <?php
-// bench.php — phpser vs igbinary, native serialize(), and msgpack on the
+// bench.php: phpser vs igbinary, native serialize(), and msgpack on the
 // shapes that actually show up in cache. igbinary is the reference column;
 // deltas are reported against it.
 //
@@ -27,6 +27,23 @@ function mk_rowset(int $rows): array {
             'tags' => ['a', 'b', 'c'],
         ];
     }
+    return $out;
+}
+
+function distinct_string(string $value): string {
+    return substr($value . "\0", 0, strlen($value));
+}
+
+function mk_rowset_distinct(int $rows): array {
+    $out = mk_rowset($rows);
+    foreach ($out as &$row) {
+        $row['created_at'] = distinct_string($row['created_at']);
+        foreach ($row['tags'] as &$tag) {
+            $tag = distinct_string($tag);
+        }
+        unset($tag);
+    }
+    unset($row);
     return $out;
 }
 
@@ -90,7 +107,7 @@ function mk_dto_users(int $n): array {
     return $out;
 }
 
-// Mixed object payload: typical "job with relations" shape — a UserDto
+// Mixed object payload: a typical "job with relations" shape with a UserDto
 // containing references to OrderDto array. Exercises class-entry lookup
 // for two distinct classes interleaved.
 function mk_dto_mixed(int $users): array {
@@ -151,7 +168,12 @@ $REFERENCE = isset($SERIALIZERS['igbinary']) ? 'igbinary' : 'phpser';
 
 $ITERS = (int) (getenv('BENCH_ITERS') ?: 1000);
 $REPS  = max(1, (int) (getenv('BENCH_REPS') ?: 7));
-$FORMAT = (in_array('--html', $argv, true) || in_array('--format=html', $argv, true)) ? 'html' : 'text';
+$FORMAT = match (true) {
+    in_array('--html', $argv, true),
+    in_array('--format=html', $argv, true) => 'html',
+    in_array('--format=json', $argv, true) => 'json',
+    default => 'text',
+};
 
 function median(array $xs): float {
     sort($xs);
@@ -160,21 +182,23 @@ function median(array $xs): float {
     return ($n % 2) ? $xs[$m] : ($xs[$m - 1] + $xs[$m]) / 2.0;
 }
 
-// Median per-op nanoseconds over REPS timed runs of ITERS calls each.
-function time_op(callable $fn, $arg, int $iters, int $reps): float {
-    $samples = [];
-    for ($r = 0; $r < $reps; $r++) {
-        $t = hrtime(true);
-        for ($i = 0; $i < $iters; $i++) {
-            $fn($arg);
-        }
-        $samples[] = (hrtime(true) - $t) / $iters;
+function time_op_sample(callable $fn, $arg, int $iters): float {
+    $t = hrtime(true);
+    for ($i = 0; $i < $iters; $i++) {
+        $fn($arg);
     }
-    return median($samples);
+    return (hrtime(true) - $t) / $iters;
+}
+
+function serializer_order(array $names, int $rep): array {
+    $count = count($names);
+    if ($count < 2) return $names;
+    $offset = $rep % $count;
+    return array_merge(array_slice($names, $offset), array_slice($names, 0, $offset));
 }
 
 // ---------------------------------------------------------------------------
-// Correctness gate — phpser must round-trip every shape before we time it.
+// Correctness gate: phpser must round-trip every shape before we time it.
 // ---------------------------------------------------------------------------
 $cases = [
     'null'        => null,
@@ -184,6 +208,7 @@ $cases = [
     'string'      => "hello \x00 binary",
     'rowset_100'  => mk_rowset(100),
     'rowset_1000' => mk_rowset(1000),
+    'rowset_distinct_1000' => mk_rowset_distinct(1000),
     'packed_1k'   => mk_numeric_packed(1000),
     'packed_10k'  => mk_numeric_packed(10000),
     'deep_50'     => mk_deep_nested(50),
@@ -212,21 +237,49 @@ $timed = array_filter(
 // ---------------------------------------------------------------------------
 $results = [];
 foreach ($timed as $label => $data) {
+    $prepared = [];
     foreach ($SERIALIZERS as $name => [$enc, $dec]) {
         try {
             $blob = $enc($data);
             if (!is_string($blob) || $blob === '') {
                 throw new RuntimeException('empty payload');
             }
-            $dec($blob); // smoke test — a throw drops this cell to n/a
+            $dec($blob); // smoke test; a throw drops this cell to n/a
+            $prepared[$name] = [$enc, $dec, $blob];
             $results[$label][$name] = [
                 'size' => strlen($blob),
-                'enc'  => time_op($enc, $data, $ITERS, $REPS),
-                'dec'  => time_op($dec, $blob, $ITERS, $REPS),
+                'enc_samples' => [],
+                'dec_samples' => [],
             ];
         } catch (\Throwable $e) {
             $results[$label][$name] = ['err' => $e->getMessage()];
         }
+    }
+
+    $names = array_keys($prepared);
+    for ($rep = 0; $rep < $REPS; $rep++) {
+        $order = serializer_order($names, $rep);
+        foreach ($order as $name) {
+            [$enc, , $blob] = $prepared[$name];
+            $results[$label][$name]['enc_samples'][] =
+                time_op_sample($enc, $data, $ITERS);
+        }
+        foreach (array_reverse($order) as $name) {
+            [, $dec, $blob] = $prepared[$name];
+            $results[$label][$name]['dec_samples'][] =
+                time_op_sample($dec, $blob, $ITERS);
+        }
+    }
+
+    foreach ($names as $name) {
+        $results[$label][$name]['enc'] = median(
+            $results[$label][$name]['enc_samples']);
+        $results[$label][$name]['dec'] = median(
+            $results[$label][$name]['dec_samples']);
+        unset(
+            $results[$label][$name]['enc_samples'],
+            $results[$label][$name]['dec_samples']
+        );
     }
 }
 
@@ -244,6 +297,11 @@ $meta = [
 
 if ($FORMAT === 'html') {
     render_html($results, array_keys($SERIALIZERS), $REFERENCE, $meta);
+} elseif ($FORMAT === 'json') {
+    echo json_encode(
+        ['meta' => $meta, 'reference' => $REFERENCE, 'results' => $results],
+        JSON_PRETTY_PRINT | JSON_THROW_ON_ERROR
+    ), "\n";
 } else {
     render_text($results, array_keys($SERIALIZERS), $REFERENCE, $meta);
 }
@@ -257,7 +315,7 @@ function fmt_ns(float $ns): string {
 }
 
 function render_text(array $results, array $serializers, string $ref, array $meta): void {
-    printf("phpser bench — PHP %s %s, %d iters, median of %d\n",
+    printf("phpser bench: PHP %s %s, %d iters, median of %d\n",
         $meta['php'], $meta['arch'], $meta['iters'], $meta['reps']);
     echo "serializers: " . implode(', ', $serializers) . " (reference: $ref)\n";
     echo "round-trip OK\n\n";
@@ -366,7 +424,7 @@ function render_html(array $results, array $serializers, string $ref, array $met
     workloads, measured against <b>igbinary</b> (the reference), PHP's native
     <b>serialize()</b>, and <b>msgpack</b> across cache-shaped payloads. Lower is
     better on every metric. igbinary is the baseline; each percentage is that
-    column's delta vs. igbinary — green beats igbinary, red loses to it.</p>
+    column's delta vs. igbinary: green beats igbinary, red loses to it.</p>
 
   <div class="env">
     <span><b>PHP</b> <?=$h($meta['php'])?></span>
@@ -386,7 +444,7 @@ function render_html(array $results, array $serializers, string $ref, array $met
 
 <?php foreach ($metrics as $metric => [$title, $unit, $isTime]): ?>
   <section>
-    <h2><?=$h($title)?><small><?=$h($unit)?> — lower is better</small></h2>
+    <h2><?=$h($title)?><small><?=$h($unit)?>; lower is better</small></h2>
     <table>
       <thead>
         <tr>
