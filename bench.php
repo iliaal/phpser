@@ -36,14 +36,14 @@ function distinct_string(string $value): string {
 
 function mk_rowset_distinct(int $rows): array {
     $out = mk_rowset($rows);
-    foreach ($out as &$row) {
-        $row['created_at'] = distinct_string($row['created_at']);
-        foreach ($row['tags'] as &$tag) {
-            $tag = distinct_string($tag);
+    $rowCount = count($out);
+    for ($i = 0; $i < $rowCount; $i++) {
+        $out[$i]['created_at'] = distinct_string($out[$i]['created_at']);
+        $tagCount = count($out[$i]['tags']);
+        for ($j = 0; $j < $tagCount; $j++) {
+            $out[$i]['tags'][$j] = distinct_string($out[$i]['tags'][$j]);
         }
-        unset($tag);
     }
-    unset($row);
     return $out;
 }
 
@@ -221,6 +221,14 @@ foreach ($cases as $k => $v) {
     $rt = phpser_unserialize(phpser_serialize($v));
     if (serialize($rt) !== serialize($v)) {
         fwrite(STDERR, "ROUND-TRIP MISMATCH: $k\n");
+        exit(1);
+    }
+}
+
+$distinctRowCount = count($cases['rowset_distinct_1000']);
+for ($i = 0; $i < $distinctRowCount; $i++) {
+    if (ReflectionReference::fromArrayElement($cases['rowset_distinct_1000'], $i) !== null) {
+        fwrite(STDERR, "ROWSET DISTINCT FIXTURE CONTAINS REFERENCES\n");
         exit(1);
     }
 }

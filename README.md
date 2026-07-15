@@ -12,11 +12,11 @@ where decode time matters more than encode time or payload size.
 
 ## Why phpser?
 
-PHP cache workloads pay decode cost on every read. Encode happens once per write. The default `igbinary` was the right answer for over a decade, but lags on three shapes that show up everywhere: packed numeric arrays, deep-nested structures, and same-class DTO batches (Laravel queue payloads, cached models).
+PHP cache workloads pay decode cost on every read. Encode happens once per write. The default `igbinary` was the right answer for over a decade, but leaves performance on the table for common cache shapes: database rowsets, packed numeric arrays, deep-nested structures, and same-class DTO batches (Laravel queue payloads, cached models).
 
-phpser is decoder-optimized. It uses pointer-equality dict interning, reuses decoded zend_strings by refcount, pre-sizes hash tables, writes straight into packed zval storage, and emits tagged scalar runs. On the current ARM benchmark, phpser beats igbinary on encode and decode in eight of nine cases. Packed numeric arrays decode 77-79% faster, deep nesting decodes 24% faster, and DTO batches decode 46-57% faster.
+phpser is decoder-optimized. It uses pointer-equality dict interning with a bounded content fallback, reuses decoded zend_strings by refcount, pre-sizes hash tables, writes straight into packed zval storage, and emits tagged scalar runs. On the current ARM benchmark, phpser beats igbinary on encode and decode in all nine cases. Packed numeric arrays decode 77-79% faster, deep nesting decodes 24% faster, and DTO batches decode 46-56% faster.
 
-String allocation identity controls the rowset result. Literal-backed rowsets decode 21-31% faster than igbinary, while `rowset_distinct_1000`, where equal repeated strings have separate allocations, is 16% larger, 19% slower to encode, and 43% slower to decode. Use the case that matches how your application obtains row values.
+Rowsets keep the pointer-equality fast path for shared strings, while columnar encoding also deduplicates low-cardinality strings and equal packed-string vectors by content. In `rowset_distinct_1000`, where equal repeated strings have separate allocations, phpser is 53% smaller, 63% faster to encode, and 44% faster to decode than igbinary.
 
 📖 **The design writeup:** [phpser: a fast, secure binary serializer for PHP cache workloads](https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads), on what the decoder does differently and why decode time is the metric to optimize. The [interactive benchmark page](https://iliaal.github.io/phpser/) compares phpser against igbinary, native `serialize()`, and msgpack across every cache shape.
 
@@ -120,31 +120,30 @@ model.
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → **2727** (**-40%**) | 17.9k → **11.2k** ns (**-37%**) | 21.8k → **15.0k** ns (**-31%**) |
-| rowset_1000 | 47K → **28K** (**-41%**) | 255.7k → **126.0k** ns (**-51%**) | 223.6k → **177.1k** ns (**-21%**) |
-| rowset_distinct_1000 | **59K** → 69K (**+16%**) | **337.5k** → 402.1k ns (**+19%**) | **314.1k** → 450.1k ns (**+43%**) |
-| packed_1k | 5495 → **1941** (**-65%**) | 9.7k → **2.4k** ns (**-75%**) | 16.2k → **3.5k** ns (**-79%**) |
-| packed_10k | 60K → **22K** (**-63%**) | 93.1k → **24.6k** ns (**-74%**) | 161.5k → **37.4k** ns (**-77%**) |
-| deep_50 | 419 → 424 (parity) | 2.8k → **2.1k** ns (**-25%**) | 3.7k → **2.8k** ns (**-24%**) |
-| dto_100 | 7083 → **5506** (**-22%**) | 28.0k → **27.0k** ns (**-3%**) | 56.1k → **30.3k** ns (**-46%**) |
-| dto_1000 | 73K → **57K** (**-23%**) | 318.6k → **301.5k** ns (**-5%**) | 627.2k → **313.2k** ns (**-50%**) |
-| dto_mixed | 22K → **14K** (**-34%**) | 107.2k → **96.6k** ns (**-10%**) | 238.9k → **102.6k** ns (**-57%**) |
+| rowset_100 | 4570 → **2727** (**-40%**) | 17.8k → **11.2k** ns (**-37%**) | 21.8k → **15.0k** ns (**-31%**) |
+| rowset_1000 | 47K → **28K** (**-41%**) | 254.9k → **113.0k** ns (**-56%**) | 224.4k → **177.5k** ns (**-21%**) |
+| rowset_distinct_1000 | 59K → **28K** (**-53%**) | 329.4k → **122.5k** ns (**-63%**) | 308.3k → **173.8k** ns (**-44%**) |
+| packed_1k | 5495 → **1941** (**-65%**) | 9.7k → **2.4k** ns (**-76%**) | 16.2k → **3.5k** ns (**-79%**) |
+| packed_10k | 59K → **22K** (**-63%**) | 93.3k → **24.6k** ns (**-74%**) | 161.6k → **36.6k** ns (**-77%**) |
+| deep_50 | **419** → 424 (**+1%**) | 2.7k → **1.9k** ns (**-31%**) | 3.6k → **2.7k** ns (**-24%**) |
+| dto_100 | 7083 → **5506** (**-22%**) | 27.9k → **27.2k** ns (**-2%**) | 56.5k → **30.2k** ns (**-46%**) |
+| dto_1000 | 73K → **57K** (**-23%**) | 316.2k → **302.9k** ns (**-4%**) | 629.0k → **307.5k** ns (**-51%**) |
+| dto_mixed | 22K → **14K** (**-34%**) | 108.2k → **88.9k** ns (**-18%**) | 234.2k → **103.2k** ns (**-56%**) |
 
-phpser encodes 3-75% faster and decodes 21-79% faster than igbinary across
-eight cases. Packed numerics are about 64% smaller, 74-75% faster to encode,
-and 77-79% faster to decode. Deep nesting is 25% faster to encode and 24%
-faster to decode at parity size.
+phpser encodes 2-76% faster and decodes 21-79% faster than igbinary across
+all nine cases. Packed numerics are about 64% smaller, 74-76% faster to encode,
+and 77-79% faster to decode. Deep nesting is 31% faster to encode and 24%
+faster to decode with a five-byte size difference.
 
-Rowsets are sensitive to string allocation identity. The table's
-`rowset_100` and `rowset_1000` reuse PHP literal strings, so pointer-equality
-interning is effective and columnar `TAG_TABLE` makes them **40-41%
-smaller**, **37-51% faster to encode**, and **21-31% faster to decode** than
-igbinary. Equal strings with separate allocations do not take that fast path. In
-the distinct-allocation case, phpser is **16% larger, 19% slower to encode,
-and 43% slower to decode**.
+The table's `rowset_100` and `rowset_1000` reuse PHP literal strings, so the
+pointer-equality intern path remains the cheapest case. Columnar `TAG_TABLE`
+also performs a bounded content-cardinality scan for separately allocated
+strings and equal packed-string vectors. That makes `rowset_distinct_1000`
+the same 27,928-byte payload as `rowset_1000`; against igbinary it is **53%
+smaller, 63% faster to encode, and 44% faster to decode**.
 
 DTO workloads (Laravel-queue-style payloads, single-class arrays) are now
-**22-34% smaller, 46-57% faster to decode, 3-10% faster to encode** than
+**22-34% smaller, 46-56% faster to decode, 2-18% faster to encode** than
 igbinary. Wire-v2 `TAG_OBJECT_SLOTS` drops the per-property key indices and
 installs declared values straight into property slots; the dict dedups prop
 names once, and the class-entry lookup cache amortizes `zend_lookup_class_ex`
@@ -164,7 +163,9 @@ The core ideas that drive the perf wins above:
 - **Pointer-equality dict intern.** Encoding hits a `*zend_string == *zend_string`
   check first; only on miss do we hash the bytes. Cuts intern cost to
   near-zero for rowset-shaped data where PHP literals share interned
-  zend_strings.
+  zend_strings. Columnar rowsets additionally scan for at most eight distinct
+  string values and prebind equal packed-string vectors, preserving dictionary
+  reuse when database drivers return separate allocations for equal content.
 - **Front-loaded string dictionary.** Same shape as igbinary's
   `compact_strings`, except we emit the table once at the head and
   reference by varint index from values. Trade-off: not streamable.
@@ -192,11 +193,12 @@ measurable perf to take, and that this project targets, are:
    varint)` pairs. Decode is one tight loop with no per-element tag
    dispatch. **Shipped.**
 3. **O(1) pointer-hash intern.** Open-addressed `zend_string* → slot`
-   hash, grown without eviction. Hit rate near 100% on rowset shapes (PHP
+   hash, grown without eviction. Hit rate near 100% on literal rowset shapes (PHP
    interns literals; the same `"id"` zend_string pointer flows through
    every row), and unique value strings (names, emails) hit a single-probe
-   miss instead of a linear scan, the change that put encode ahead of
-   igbinary on every shape. Skips the byte-hash entirely on hits.
+   miss instead of a linear scan. Separately allocated low-cardinality table
+   columns use a bounded content scan, which puts encode ahead of igbinary on
+   every measured shape. Skips the byte-hash entirely on pointer hits.
    **Shipped.**
 4. **Eager dict materialization with warm hashes.** All dict slots are
    resolved up front during header parse, against the engine's

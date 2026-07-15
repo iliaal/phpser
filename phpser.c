@@ -709,7 +709,9 @@ static zend_always_inline void enc_seed_dict_on_hit(
  * for those slots). */
 /* Return 1 when `zs` is already in the dict (cache or content map); writes the
  * index to *out_idx. Used by TAG_ASSOC_DICT / PACKED_STRINGS eligibility. */
-static int enc_str_dict_idx(encode_ctx *e, zend_string *zs, uint32_t *out_idx) {
+static zend_always_inline int enc_str_dict_idx(
+    encode_ctx *e, zend_string *zs, uint32_t *out_idx)
+{
     intern_slot *s = enc_cache_find(e, zs);
     if (s && SLOT_IS_DICT(*s)) {
         *out_idx = SLOT_DICT_IDX(*s);
@@ -1552,12 +1554,72 @@ static void enc_write_key_idx_run(smart_str *body, uint32_t *key_idx, uint32_t n
     ZSTR_LEN(body->s) = pos;
 }
 
+static void enc_prebind_equal_packed_string_arrays(
+    encode_ctx *e, zval **cells, uint32_t nrows)
+{
+    HashTable *first = Z_ARRVAL_P(cells[0]);
+    if (!HT_IS_PACKED(first)
+        || first->nNumUsed != first->nNumOfElements
+        || first->nNumOfElements == 0) {
+        return;
+    }
+
+    uint32_t count = first->nNumOfElements;
+    zval *values = first->arPacked;
+    for (uint32_t i = 0; i < count; i++) {
+        if (Z_TYPE(values[i]) != IS_STRING) return;
+    }
+
+    HashTable *second = Z_ARRVAL_P(cells[1]);
+    if (!HT_IS_PACKED(second)
+        || second->nNumUsed != count
+        || second->nNumOfElements != count) {
+        return;
+    }
+    zval *second_values = second->arPacked;
+    int same_ptrs = 1;
+    for (uint32_t i = 0; i < count; i++) {
+        if (Z_TYPE(second_values[i]) != IS_STRING
+            || !zend_string_equals(Z_STR(values[i]), Z_STR(second_values[i]))) {
+            return;
+        }
+        if (Z_STR(values[i]) != Z_STR(second_values[i])) same_ptrs = 0;
+    }
+    if (same_ptrs) return;
+
+    for (uint32_t r = 2; r < nrows; r++) {
+        HashTable *row = Z_ARRVAL_P(cells[r]);
+        if (!HT_IS_PACKED(row)
+            || row->nNumUsed != count
+            || row->nNumOfElements != count) {
+            return;
+        }
+        zval *row_values = row->arPacked;
+        for (uint32_t i = 0; i < count; i++) {
+            if (Z_TYPE(row_values[i]) != IS_STRING
+                || !zend_string_equals(Z_STR(values[i]), Z_STR(row_values[i]))) {
+                return;
+            }
+        }
+    }
+
+    for (uint32_t i = 0; i < count; i++) {
+        enc_intern_zstr(e, Z_STR(values[i]));
+    }
+}
+
+#define TABLE_STRING_CARDINALITY_MAX 8
+
 /* Choose the wire tag for a gathered column. For a string column that resolves
- * to TAG_PACKED_STRINGS, *out_same_ptr records whether every cell is the same
- * interned pointer, so the emit pass can skip re-deriving it (and take the
- * single-intern shortcut) rather than walking the column a second time. */
-static uint8_t enc_detect_column_tag(encode_ctx *e, zval **cells, uint32_t nrows, int *out_same_ptr) {
-    *out_same_ptr = 0;
+ * to TAG_PACKED_STRINGS, *out_same_value records whether every cell has equal
+ * bytes, while *out_string_idx carries per-row indices for low-cardinality
+ * content. Unique columns stop content comparison after nine values. */
+static uint8_t enc_detect_column_tag(
+    encode_ctx *e, zval **cells, uint32_t nrows, int *out_same_value,
+    uint32_t **out_string_idx)
+{
+    *out_same_value = 0;
+    *out_string_idx = NULL;
     uint8_t t0 = Z_TYPE_P(cells[0]);
     for (uint32_t r = 1; r < nrows; r++) {
         if (Z_TYPE_P(cells[r]) != t0) {
@@ -1571,30 +1633,75 @@ static uint8_t enc_detect_column_tag(encode_ctx *e, zval **cells, uint32_t nrows
         return TAG_PACKED_DOUBLES;
     }
     if (t0 == IS_STRING) {
-        zend_string *s0 = Z_STR_P(cells[0]);
-        int all_same_ptr = 1;
+        zend_string *unique[TABLE_STRING_CARDINALITY_MAX];
+        uint32_t unique_idx[TABLE_STRING_CARDINALITY_MAX];
+        uint32_t n_unique = 0;
         int all_dict = 1;
+        int cardinality_overflow = 0;
         for (uint32_t r = 0; r < nrows; r++) {
             zend_string *sr = Z_STR_P(cells[r]);
-            if (sr != s0) {
-                all_same_ptr = 0;
+            if (!cardinality_overflow) {
+                uint32_t u = 0;
+                for (; u < n_unique; u++) {
+                    if (sr == unique[u] || zend_string_equals(sr, unique[u])) break;
+                }
+                if (u == n_unique) {
+                    if (n_unique == TABLE_STRING_CARDINALITY_MAX) {
+                        cardinality_overflow = 1;
+                    } else {
+                        unique[n_unique++] = sr;
+                    }
+                }
             }
             intern_slot *s = enc_cache_find(e, sr);
             if (!s || !SLOT_IS_DICT(*s)) {
                 all_dict = 0;
             }
+            if (cardinality_overflow && !all_dict) return TAG_PACKED_MIXED;
         }
-        if (all_dict || all_same_ptr) {
-            *out_same_ptr = all_same_ptr;
+        if (all_dict) {
             return TAG_PACKED_STRINGS;
         }
+        if (!cardinality_overflow && n_unique < nrows) {
+            for (uint32_t u = 0; u < n_unique; u++) {
+                unique_idx[u] = enc_intern_zstr(e, unique[u]);
+            }
+            if (n_unique == 1) {
+                *out_same_value = 1;
+                return TAG_PACKED_STRINGS;
+            }
+
+            uint32_t *indices = (uint32_t *)safe_emalloc(
+                (size_t)nrows, sizeof(uint32_t), 0);
+            for (uint32_t r = 0; r < nrows; r++) {
+                zend_string *sr = Z_STR_P(cells[r]);
+                uint32_t u = 0;
+                for (; u < n_unique; u++) {
+                    if (sr == unique[u] || zend_string_equals(sr, unique[u])) {
+                        break;
+                    }
+                }
+                if (UNEXPECTED(u == n_unique)) {
+                    efree(indices);
+                    return TAG_PACKED_MIXED;
+                }
+                indices[r] = unique_idx[u];
+            }
+            *out_string_idx = indices;
+            return TAG_PACKED_STRINGS;
+        }
+    } else if (t0 == IS_ARRAY) {
+        /* Equal nested string vectors repeat by value in DB/cache rows even
+         * when every driver result owns separate zend_strings. Prebinding one
+         * vector lets the existing packed-string wire path reuse it. */
+        enc_prebind_equal_packed_string_arrays(e, cells, nrows);
     }
     return TAG_PACKED_MIXED;
 }
 
 static void enc_emit_table_column(
     smart_str *body, encode_ctx *e, zval **cells, uint32_t nrows, uint8_t col_tag,
-    int same_ptr)
+    int same_value, uint32_t *string_idx)
 {
     smart_str_appendc(body, col_tag);
     if (col_tag == TAG_PACKED_LONGS) {
@@ -1617,12 +1724,15 @@ static void enc_emit_table_column(
         smart_str_alloc(body, (size_t)nrows * VARINT_MAX_BYTES, 0);
         char *base = ZSTR_VAL(body->s);
         size_t pos = ZSTR_LEN(body->s);
-        /* same_ptr computed once by enc_detect_column_tag — no second walk. */
+        /* same_value computed once by enc_detect_column_tag — no second walk. */
         zend_string *s0 = Z_STR_P(cells[0]);
+        uint64_t same_idx = same_value ? enc_intern_zstr(e, s0) : 0;
         for (uint32_t r = 0; r < nrows; r++) {
             uint64_t v;
-            if (same_ptr) {
-                v = enc_intern_zstr(e, s0);
+            if (same_value) {
+                v = same_idx;
+            } else if (string_idx) {
+                v = string_idx[r];
             } else {
                 intern_slot *sl = enc_cache_find(e, Z_STR_P(cells[r]));
                 v = SLOT_DICT_IDX(*sl);
@@ -1637,7 +1747,9 @@ static void enc_emit_table_column(
     }
 }
 
-static int enc_try_table(smart_str *body, encode_ctx *e, zval *zp, uint32_t n_used) {
+static zend_never_inline int enc_try_table(
+    smart_str *body, encode_ctx *e, zval *zp, uint32_t n_used)
+{
     uint32_t ncols, *key_idx;
     if (!enc_match_rowset_schema(e, zp, n_used, &key_idx, &ncols)) {
         return 0;
@@ -1688,9 +1800,14 @@ static int enc_try_table(smart_str *body, encode_ctx *e, zval *zp, uint32_t n_us
     efree(key_idx);
 
     for (uint32_t c = 0; c < ncols; c++) {
-        int same_ptr;
-        uint8_t col_tag = enc_detect_column_tag(e, &col_cells[c * n_used], n_used, &same_ptr);
-        enc_emit_table_column(body, e, &col_cells[c * n_used], n_used, col_tag, same_ptr);
+        int same_value;
+        uint32_t *string_idx;
+        uint8_t col_tag = enc_detect_column_tag(
+            e, &col_cells[c * n_used], n_used, &same_value, &string_idx);
+        enc_emit_table_column(
+            body, e, &col_cells[c * n_used], n_used, col_tag, same_value,
+            string_idx);
+        if (string_idx) efree(string_idx);
     }
     efree(col_cells);
     return 1;
@@ -1745,10 +1862,9 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
             size_t pos = ZSTR_LEN(body->s);
             const size_t run_start = pos;
             for (uint32_t i = 0; i < n_used; i++) {
-                intern_slot *s;
+                uint32_t idx;
                 if (Z_TYPE(zp[i]) != IS_STRING
-                    || (s = enc_cache_find(e, Z_STR(zp[i]))) == NULL
-                    || !SLOT_IS_DICT(*s)) {
+                    || !enc_str_dict_idx(e, Z_STR(zp[i]), &idx)) {
                     ZSTR_VAL(body->s)[tag_off] = (char)TAG_PACKED_MIXED;
                     ZSTR_LEN(body->s) = run_start;
                     for (uint32_t j = 0; j < n_used; j++) {
@@ -1756,7 +1872,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
                     }
                     return;
                 }
-                pos = varint_put(base, pos, SLOT_DICT_IDX(*s));
+                pos = varint_put(base, pos, idx);
             }
             ZSTR_LEN(body->s) = pos;
             return;
@@ -1840,7 +1956,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
             b = ht->arData;
             for (; b < end; b++) {
                 if (Z_TYPE(b->val) == IS_UNDEF) continue;
-                uint32_t kidx;
+                uint32_t kidx = 0;
                 (void)enc_str_dict_idx(e, b->key, &kidx);
                 pos = varint_put(base, pos, kidx);
             }

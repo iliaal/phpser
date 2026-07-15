@@ -29,12 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `TAG_TABLE` now deduplicates low-cardinality strings and equal packed-string vectors by content, making distinct-allocation rowsets 53% smaller and 44% faster to decode than igbinary on ARM.
 - `TAG_TABLE` decode streams each column straight into the row arrays instead of materializing the full columnar matrix first, roughly halving peak memory on large tables with no decode-speed change.
 - `TAG_OBJECT_SLOTS` now accepts an older prefix of the current effective slot table. Properties appended at the end keep their class defaults; payloads with more slots than the current class still fail.
 
 ### For contributors
 
-- `bench.php` now rotates serializer order between timed repetitions and includes a distinct-allocation rowset, removing the fixed-order confound and exposing pointer-identity-sensitive string interning.
+- `bench.php` rotates serializer order and rejects reference-contaminated distinct-allocation fixtures before timing.
 - Malformed-input tests now require every curated invalid frame and every strict prefix of a valid non-null frame to decode as `null`; the legacy and magic-hook cases now reach the failure branches they name.
 
 ## [0.4.0] - 2026-07-10
