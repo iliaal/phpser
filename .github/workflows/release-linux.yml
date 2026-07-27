@@ -22,14 +22,28 @@ name: Release Linux & macOS binaries
 # so PIE prefers the prebuilt asset and falls back to source-build when
 # no asset matches.
 
+# workflow_dispatch compiles the same matrix and asserts the module loads,
+# without uploading -- php/pie-ext-binary-builder builds and uploads in one
+# step and requires a release tag, so the dispatch path runs a plain
+# phpize/configure/make instead. That exercises each runner's toolchain and
+# glibc/macOS baseline on a candidate commit before the tag exists.
+
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions: {}
 
+env:
+  # Shared by the dispatch build below and the release upload action, so the
+  # two paths cannot drift into configuring the extension differently.
+  CONFIGURE_FLAGS: '--enable-phpser'
+
 concurrency:
-  group: release-linux-${{ github.event.release.tag_name }}
+  # tag_name is empty on a dispatch run; fall back to the ref so two
+  # dispatches on different branches do not serialize behind each other.
+  group: release-linux-${{ github.event.release.tag_name || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -62,9 +76,21 @@ jobs:
           php-version: ${{ matrix.php }}
           coverage: none
 
+      # Dispatch path: prove the toolchain builds a loadable module. No
+      # release exists yet, so there is nothing to upload into.
+      - name: Build and verify (no upload)
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -eux
+          phpize
+          ./configure $CONFIGURE_FLAGS
+          make -j"$(getconf _NPROCESSORS_ONLN)"
+          php -n -d extension="$PWD/modules/phpser.so" --ri phpser
+
       - name: Build and upload prebuilt binary
+        if: github.event_name == 'release'
         uses: php/pie-ext-binary-builder@5298761950f63c7e9565ed7004e922b346e4386c # 0.0.3
         with:
           release-tag: ${{ github.event.release.tag_name }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          configure-flags: '--enable-phpser'
+          configure-flags: ${{ env.CONFIGURE_FLAGS }}

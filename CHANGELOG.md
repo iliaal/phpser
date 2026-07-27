@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### For contributors
+
+- The Windows and Linux/macOS binary workflows accept `workflow_dispatch` and skip publication on it, so the release runners can be exercised on a candidate commit before the tag exists.
+
 ## [0.5.0] - 2026-07-27
 
 ### Security

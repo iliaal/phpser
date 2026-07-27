@@ -8,15 +8,25 @@ name: Release Windows binaries
 #
 # Tests are off in this lane -- the test workflow already validated the
 # same arch/ts/php combinations on master.
+#
+# workflow_dispatch runs the build matrix without the upload job, so the
+# release toolsets can be exercised on a candidate commit BEFORE the tag
+# exists. A break that only shows up on the release runners (an MSVC
+# toolset the push-CI matrix does not cover, say) then fails here instead
+# of after the tag is live, where the all-or-nothing upload job would ship
+# the release with zero Windows assets.
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions: {}
 
 concurrency:
-  group: release-windows-${{ github.event.release.tag_name }}
+  # tag_name is empty on a dispatch run; fall back to the ref so two
+  # dispatches on different branches do not serialize behind each other.
+  group: release-windows-${{ github.event.release.tag_name || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -60,6 +70,10 @@ jobs:
     name: Upload binaries to the release
     runs-on: ubuntu-latest
     needs: build
+    # Only the real release event has a tag to upload into. A dispatch run
+    # stops after `build`, which is the point: it validates the toolsets
+    # and publishes nothing.
+    if: github.event_name == 'release'
     # GITHUB_TOKEN defaults to read-only for `contents:` on newer repos.
     # The release/asset-upload API needs write access; without this block
     # `gh release upload` returns HTTP 403 "Resource not accessible by
