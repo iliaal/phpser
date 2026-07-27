@@ -58,7 +58,7 @@ echo 'extension=phpser.so' | sudo tee /etc/php/conf.d/phpser.ini
 
 ### Pre-built binaries
 
-Pre-built `.dll`s for Windows (PHP 8.2-8.5, TS/NTS, x64) and `.so`s for
+Pre-built `.dll`s for Windows (PHP 8.2-8.5, TS/NTS, x86 and x64) and `.so`s for
 Linux glibc (x86_64, arm64) and macOS arm64 (PHP 8.4-8.5) are attached
 to each [GitHub release](https://github.com/iliaal/phpser/releases). PIE
 fetches the matching binary automatically; falls back to source-build
