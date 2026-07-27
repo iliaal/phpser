@@ -3549,11 +3549,8 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
 
     efree(colbuf);
     efree(keys);
-    if (UNEXPECTED(outer == NULL)) {
-        /* ncols >= 1 is enforced above, so the loop always ran at least once
-         * and materialized `outer`; keep the branch for future-proofing. */
-        outer = zend_new_array(0);
-    }
+    /* ncols >= 1 is checked above and the loop's only early exit is the failure
+     * goto, so column 0 always materialized `outer` by the time we get here. */
     ZVAL_ARR(out, outer);
     return 0;
 

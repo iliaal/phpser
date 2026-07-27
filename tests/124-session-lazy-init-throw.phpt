@@ -23,9 +23,7 @@ session.use_cookies=0
 session.cache_limiter=
 --FILE--
 <?php
-$dir = sys_get_temp_dir() . '/phpser124_' . getmypid();
-@mkdir($dir);
-session_save_path($dir);
+session_save_path(sys_get_temp_dir());
 session_id('probe124');
 session_start();
 
@@ -47,14 +45,12 @@ try {
 
 // Nothing may reach the store: a frame here would silently drop the object's
 // state and read back as an empty object on the next request.
-$file = $dir . '/sess_probe124';
+$file = sys_get_temp_dir() . '/sess_probe124';
 echo file_exists($file) ? "bytes=" . filesize($file) . "\n" : "no file\n";
 ?>
 --CLEAN--
 <?php
-$dir = sys_get_temp_dir() . '/phpser124_' . getmypid();
-@unlink($dir . '/sess_probe124');
-@rmdir($dir);
+@unlink(sys_get_temp_dir() . '/sess_probe124');
 ?>
 --EXPECTF--
 Warning: session_write_close(): phpser: $_SESSION not serialized — a serialization hook threw in %s on line %d
