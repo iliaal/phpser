@@ -36,6 +36,14 @@ the decoder's bounded work budget. This prevents deterministic collisions in
 Zend's stable string hash from turning a bounded payload into quadratic decode
 CPU while leaving ordinary large arrays unrestricted by a global element cap.
 
+Class resolution is *not* memoized on a miss, so a payload naming an unknown
+class once per object triggers one autoloader invocation per object rather
+than one per payload. This matches native `unserialize()` exactly (which also
+calls `zend_lookup_class` per object), and phpser's own per-miss cost is lower
+than native's — but the total is bounded by your autoloader, not by phpser. If
+you decode untrusted bytes through an expensive autoloader chain, prefer
+`allowed_classes` (an allowlist or `false` short-circuits before resolution).
+
 **Session handler.** When built against the session extension, phpser
 registers `session.serialize_handler = phpser`. This handler restores
 `$_SESSION` through the **unsigned, all-classes-allowed** decode path —

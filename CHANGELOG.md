@@ -24,19 +24,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ZTS dynamically-loaded builds now refresh the thread-local storage cache in `RINIT`, not only `MINIT`, so worker threads under a threaded ZTS SAPI don't touch engine globals through an unpopulated cache. NTS builds register no `RINIT` and pay no per-request cost.
 - Encode now discards a completed frame if releasing its temporary hook snapshots throws, so the userland and session entry points never return or persist bytes under a pending exception.
 - Scalar `__sleep()` member names now raise PHP's native warning and coerce to strings instead of being dropped without a warning.
-- A failed class lookup no longer poisons later lookups for the same wire class. An autoloader can make the class available on a later object in the graph.
+- A failed class lookup no longer poisons later lookups for the same wire class. An autoloader can make the class available on a later object in the graph. Autoloader cost therefore scales with object count rather than with distinct class names, matching native `unserialize()`; `SECURITY.md` documents the trade-off.
+- Encoding an object no longer probes the class function table for `__sleep` before the back-reference check, so a repeated object reference emits `TAG_REF` without a hash lookup (35% faster encode on a back-reference-dominated payload, ~3% on a typical shared-object graph).
 - On 32-bit PHP, decode now rejects wire integers outside the `zend_long` range instead of narrowing scalar values, packed runs, table columns, or array keys. Negative array keys are encoded from signed `zend_long` values so their canonical wire form still round-trips under the stricter decoder.
 
 ### Changed
 
 - `TAG_TABLE` now deduplicates low-cardinality strings and equal packed-string vectors by content, making distinct-allocation rowsets 53% smaller and 44% faster to decode than igbinary on ARM.
-- `TAG_TABLE` decode streams each column straight into the row arrays instead of materializing the full columnar matrix first, roughly halving peak memory on large tables with no decode-speed change.
-- `TAG_OBJECT_SLOTS` now accepts an older prefix of the current effective slot table. Properties appended at the end keep their class defaults; payloads with more slots than the current class still fail.
+- `TAG_TABLE` decode streams each column into the row arrays instead of materializing the columnar matrix first, dropping peak memory about 12% on large tables (60k x 4: 34.0 MB to 30.0 MB) with no speed change. Rows are materialized only after the first column decodes, so a rejected frame never pays for the rows it claims.
+- `TAG_OBJECT_SLOTS` now accepts an older prefix of the current effective slot table; appended properties keep their class defaults and payloads with more slots than the current class still fail. Only append-at-end evolution is safe, since the decoder cannot tell an append from an insertion (README has the detail).
 
 ### For contributors
 
 - `bench.php` rotates serializer order and rejects reference-contaminated distinct-allocation fixtures before timing.
 - Malformed-input tests now require every curated invalid frame and every strict prefix of a valid non-null frame to decode as `null`; the legacy and magic-hook cases now reach the failure branches they name.
+- `tests/123` pins the table reject path against allocating its claimed rows; `tests/124` pins the throwing-lazy-initializer abort on the session handler, which `tests/099` cannot observe because the userland path masks it behind the propagating exception.
 
 ## [0.4.0] - 2026-07-10
 

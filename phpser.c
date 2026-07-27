@@ -1104,18 +1104,28 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
              * this exact zend_object before, emit a back-ref. Otherwise
              * claim a new id and let the chosen container tag below take
              * it implicitly via encounter order. */
-            zval *sleep_fn_zv = zend_hash_find_known_hash(
-                &obj->ce->function_table, ZSTR_KNOWN(ZEND_STR_SLEEP));
+            /* Cheap disjuncts first: a repeat visit of an already-tracked
+             * object returns below without paying the __sleep function_table
+             * lookup, which otherwise runs on every back-reference. */
             bool identity_tracked = in_rcn_array
                 || GC_REFCOUNT(obj) > 1
                 || (obj->properties && GC_REFCOUNT(obj->properties) > 1)
-                || obj->ce->__serialize != NULL
-                || sleep_fn_zv != NULL;
+                || obj->ce->__serialize != NULL;
+            zval *sleep_fn_zv = NULL;
+            if (!identity_tracked) {
+                sleep_fn_zv = zend_hash_find_known_hash(
+                    &obj->ce->function_table, ZSTR_KNOWN(ZEND_STR_SLEEP));
+                identity_tracked = sleep_fn_zv != NULL;
+            }
             if (identity_tracked) {
                 uint32_t id;
                 if (!enc_visit(e, obj, ENC_ID_OBJECT, &id)) {
                     emit_tag_and_varint(body, TAG_REF, id);
                     return;
+                }
+                if (sleep_fn_zv == NULL) {
+                    sleep_fn_zv = zend_hash_find_known_hash(
+                        &obj->ce->function_table, ZSTR_KNOWN(ZEND_STR_SLEEP));
                 }
             } else {
                 e->next_id++;
@@ -1472,9 +1482,13 @@ static int enc_match_rowset_schema(
 
     /* Collect row-0's keys (pointers only) and require they're all string
      * keys. Interning into the dict is DEFERRED until every row is confirmed
-     * to match: a near-miss rowset (row 0 has the shape but a later row
-     * diverges) must not leave row-0's field names as wasted dict entries
-     * (CR-020). */
+     * to match, so a near-miss rowset leaves the dict untouched (CR-020).
+     * Note this is not a size win for row-shaped data: the field names recur
+     * in the rows anyway, so the deferral just moves row 0 onto the inline-key
+     * path and costs ~1 row of inline keys (measured +5.4% on a 50-row
+     * near-miss). It is kept because the encoder should not mutate shared
+     * state on behalf of a branch it then abandons; a payload where row 0's
+     * keys genuinely occur nowhere else does save the entries. */
     zend_string **k0 = (zend_string **)safe_emalloc((size_t)ncols, sizeof(zend_string *), 0);
     uint32_t col = 0;
     for (Bucket *b = b0; b < end0; b++) {
@@ -3490,16 +3504,12 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
      * two-phase build materialized (CR-014). Cells are MOVED into the rows
      * (add_new / symtable_update take ownership), which also drops the per-cell
      * ZVAL_COPY the matrix build's non-add_new path needed. */
-    zend_array *outer = zend_new_array((uint32_t)nrows);
-    zend_hash_real_init_packed(outer);
-    for (uint64_t r = 0; r < nrows; r++) {
-        ZVAL_ARR(&outer->arPacked[r], zend_new_array((uint32_t)ncols));
-    }
-    /* Make outer well-formed now so a mid-decode failure can destroy it
-     * (rows + any already-scattered cells) with one zend_array_destroy. */
-    outer->nNumUsed = (uint32_t)nrows;
-    outer->nNumOfElements = (uint32_t)nrows;
-    outer->nNextFreeElement = (zend_long)nrows;
+    /* Rows are materialized only after the FIRST column decodes. A malformed
+     * frame that fails on column 0 must not pay nrows row-HT allocations: the
+     * nrows bound is one wire byte per cell, so eager row allocation turns a
+     * rejected payload into a ~70x memory amplification (OOM-fatal, which is
+     * uncatchable and stricter than the decoder's return-NULL contract). */
+    zend_array *outer = NULL;
 
     zval *colbuf = (zval *)safe_emalloc((size_t)nrows, sizeof(zval), 0);
     for (uint64_t c = 0; c < ncols; c++) {
@@ -3511,6 +3521,18 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
              * (Reached only here; the goto below must NOT re-dtor colbuf.) */
             for (uint64_t r = 0; r < nrows; r++) zval_ptr_dtor(&colbuf[r]);
             goto table_fail;
+        }
+        if (outer == NULL) {
+            outer = zend_new_array((uint32_t)nrows);
+            zend_hash_real_init_packed(outer);
+            for (uint64_t r = 0; r < nrows; r++) {
+                ZVAL_ARR(&outer->arPacked[r], zend_new_array((uint32_t)ncols));
+            }
+            /* Well-formed now so a later failure destroys rows + scattered
+             * cells with one zend_array_destroy. */
+            outer->nNumUsed = (uint32_t)nrows;
+            outer->nNumOfElements = (uint32_t)nrows;
+            outer->nNextFreeElement = (zend_long)nrows;
         }
         zend_string *zs = keys[c];
         for (uint64_t r = 0; r < nrows; r++) {
@@ -3527,6 +3549,11 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
 
     efree(colbuf);
     efree(keys);
+    if (UNEXPECTED(outer == NULL)) {
+        /* ncols >= 1 is enforced above, so the loop always ran at least once
+         * and materialized `outer`; keep the branch for future-proofing. */
+        outer = zend_new_array(0);
+    }
     ZVAL_ARR(out, outer);
     return 0;
 
@@ -3536,7 +3563,7 @@ table_fail:
      * before the jump, so colbuf is only freed here, never re-dtored. */
     efree(colbuf);
     efree(keys);
-    zend_array_destroy(outer);
+    if (outer) zend_array_destroy(outer);
     return -1;
 }
 

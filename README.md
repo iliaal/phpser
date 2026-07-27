@@ -299,9 +299,13 @@ as a `session.serialize_handler` when available.
   order with no per-property names; decode installs them back in that order.
   An older payload carrying a prefix of the current effective slot table is
   accepted and appended properties retain their class defaults. A
-  payload with more slots than the current class is rejected. A same-count
-  reorder is not detectable, so values can land in the wrong slots; removing,
-  reordering, or changing a slot to an incompatible type breaks compatibility.
+  payload with more slots than the current class is rejected. **Nothing else
+  is detectable.** The decoder cannot tell an append-at-end from an insertion
+  or a reorder, so any other schema change silently lands values in the wrong
+  slots, including a change that alters the slot count. Inserting `$mid`
+  between `$a` and `$b`, for example, decodes an old two-slot payload as
+  `a=1, mid=2, b=<default>` with no error. Type declarations catch only the
+  subset of mismatches that fail a coercion.
   For payloads that outlive a deploy, append properties only at the end of the
   effective `properties_info_table` order. Adding a parent property can insert
   before child slots and break append-only order.
