@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-27
+
 ### Security
 
 - Fixed a use-after-free in signed (`phpser_unserialize_signed`) decode: a forged-but-validly-signed frame carrying a duplicate object-property, assoc, or rowset/table schema key could free an id-registered object on overwrite while a later back-reference still pointed at it. Objects are now pinned unconditionally for the decode pass (the signed fast path previously skipped the pin), and the trusted assoc/schema paths use uniqueness-gated inserts. A valid HMAC proves key possession, not honest-encoder provenance, so the decoder no longer trusts key uniqueness.
@@ -251,7 +253,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.4.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.5.0...HEAD
+[0.5.0]: https://github.com/iliaal/phpser/releases/tag/0.5.0
 [0.4.0]: https://github.com/iliaal/phpser/releases/tag/0.4.0
 [0.3.0]: https://github.com/iliaal/phpser/releases/tag/0.3.0
 [0.2.0]: https://github.com/iliaal/phpser/releases/tag/0.2.0

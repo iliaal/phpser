@@ -113,7 +113,7 @@ model.
 ## ✨ Features
 
 - **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder. An empty key is rejected on both sides. A keyless HMAC is forgeable, so callers must supply real key material.
-- **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode (encode throws, decode returns `null`), and assoc decode uses bounded update semantics so duplicate-key payloads collapse to last-write-wins rather than phantom buckets.
+- **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode (encode throws, decode returns `null`), and assoc decode uses bounded update semantics so duplicate-key payloads collapse to last-write-wins rather than phantom buckets. Wire-controlled keys run against a bounded collision budget, so a payload built around Zend's stable string hash cannot turn an array, property table, or rowset schema into quadratic decode work; a chain that exhausts the budget rejects the payload rather than grinding through it.
 - **PHP 8.2+ (8.3, 8.4, 8.5, master).** BSD 3-Clause.
 
 ## Bench (PHP 8.4.22 aarch64, idle box, 1000 iters, median of 35)
@@ -290,10 +290,22 @@ as a `session.serialize_handler` when available.
   disallowed and its class is not already loaded, phpser does not autoload it
   for the sole purpose of recovering property names. The incomplete object
   keeps its original class marker but discards its unnamed slot values.
+- **Enum cases are filtered by `allowed_classes`.** Native `unserialize()` does
+  not consult the allowlist on its enum path, so a serialized enum is always
+  resurrected there. phpser applies the filter: a disallowed enum decodes to
+  `__PHP_Incomplete_Class`. Enum cases are inert singletons, so the security
+  delta is small, but list their class names in the allowlist if you rely on
+  enums round-tripping through a filtered decode.
 - **Strings and blobs are capped at 4 GiB (`UINT32_MAX`) on the wire.**
   Encoding a longer value fails loud (throws for the userland API, an
   `E_WARNING` for the session handler) rather than emitting bytes the decoder
   would reject. No single cache value realistically approaches this.
+- **Wire integers outside the target `zend_long` range are rejected on 32-bit
+  builds.** A payload written by a 64-bit process can carry values a 32-bit
+  `zend_long` cannot hold. Decode returns `null` instead of narrowing them, so
+  a cache shared between 32-bit and 64-bit processes has to stay inside the
+  32-bit range. This covers scalars, packed runs, table columns, and array
+  keys; encoding is unaffected.
 - **`TAG_OBJECT_SLOTS` is positional.** Eligible typed objects encode their
   declared properties as values in `properties_info_table` (declaration)
   order with no per-property names; decode installs them back in that order.
