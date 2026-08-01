@@ -378,6 +378,10 @@ typedef struct {
      * table entry holds a reference (enc_unvisit_last / enc_ctx_destroy
      * release iff the flag is set). */
     uint8_t pins_active;
+    /* First-allocation capacity for icache (power of 2; 0 = default 32).
+     * Seeded from the top-level element count so a large payload skips the
+     * per-doubling ecalloc + rehash cascade on its way up from 32 slots. */
+    uint32_t icache_init_cap;
     zend_string **dict;
     uint32_t dict_len;
     uint32_t dict_cap;
@@ -424,6 +428,7 @@ static void enc_ctx_init(encode_ctx *e) {
     e->failed = 0;
     e->wire_v2 = 0;
     e->pins_active = 0;
+    e->icache_init_cap = 0;
 }
 
 /* Live declared-property slots in properties_info_table order (NULL entries
@@ -617,7 +622,8 @@ static inline intern_slot *enc_cache_find(encode_ctx *e, zend_string *zs) {
 }
 
 static void enc_icache_grow(encode_ctx *e) {
-    uint32_t new_cap = e->icache_mask ? (e->icache_mask + 1) * 2 : 32;
+    uint32_t new_cap = e->icache_mask ? (e->icache_mask + 1) * 2
+        : (e->icache_init_cap ? e->icache_init_cap : 32);
     intern_slot *nb = ecalloc(new_cap, sizeof(intern_slot));  /* ptr==NULL = empty */
     uint32_t nm = new_cap - 1;
     if (e->icache) {
@@ -3913,6 +3919,19 @@ static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
         if (n > 16) {
             size_t est = (size_t)n * 16;
             body_estimate = est > (256 * 1024) ? (256 * 1024) : est;
+        }
+        /* Pre-size the intern cache from the same top-level hint: every
+         * distinct string in the payload occupies a slot, and rebuilding the
+         * cache from 32 slots pays an ecalloc + full rehash per doubling.
+         * n*4 covers ~2 distinct strings per element at the <=50% load
+         * factor; the clamp bounds the upfront zeroing for huge arrays,
+         * where geometric growth takes over past the initial allocation.
+         * Wire bytes are unaffected — this is allocation strategy only. */
+        if (n > 64) {
+            uint32_t want = n < 8192 ? n * 4 : 32768;
+            uint32_t cap = 128;
+            while (cap < want) cap <<= 1;
+            ctx.icache_init_cap = cap;
         }
     }
     smart_str_alloc(&body, body_estimate, 0);

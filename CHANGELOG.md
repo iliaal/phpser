@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Decode installs a typed property without the engine verify call when the value's type already matches the declared type exactly; same-class DTO batches decode ~13% faster (aarch64).
 - `TAG_TABLE` decode builds row hashtables from a bucket template computed once per table instead of paying a hash insert per cell; rowsets decode ~15% faster (aarch64).
+- Encode pre-sizes the string-intern cache from the top-level element count, skipping the per-doubling grow and rehash cascade; object and rowset encode 3-9% faster (aarch64) with identical wire bytes.
 
 ### For contributors
 
