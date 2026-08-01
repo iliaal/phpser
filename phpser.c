@@ -2272,7 +2272,16 @@ static int dec_install_declared_slot(zend_object *obj, zend_property_info *info,
                                      zval *tmp) {
     zval *slot = OBJ_PROP(obj, info->offset);
     if (ZEND_TYPE_IS_SET(info->type)) {
-        if (!zend_verify_prop_assignable_by_ref(info, tmp, /*strict*/ 1)) {
+        /* Exact-type accept, replicating the first test the engine's own
+         * i_zend_check_property_type performs. The full verify call is
+         * cross-DSO (PLT) and its call overhead alone is ~10% of dto decode
+         * instructions; a non-reference value whose type code is already in
+         * the property's mask is trivially assignable, so only references,
+         * coercions (int→float, numeric strings), and class-typed slots need
+         * the engine. Verify semantics are unchanged for those. */
+        if (!(!Z_ISREF_P(tmp)
+                && EXPECTED(ZEND_TYPE_CONTAINS_CODE(info->type, Z_TYPE_P(tmp))))
+            && !zend_verify_prop_assignable_by_ref(info, tmp, /*strict*/ 1)) {
             zval_ptr_dtor(tmp);
             return -1;
         }
