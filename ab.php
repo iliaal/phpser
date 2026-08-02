@@ -17,6 +17,12 @@ function mk_rowset(int $rows): array {
     return $out;
 }
 function mk_numeric_packed(int $n): array { return range(0, $n - 1); }
+function mk_numeric_rand(int $n): array {
+    mt_srand(42);
+    $out = [];
+    for ($i = 0; $i < $n; $i++) $out[] = mt_rand(0, 1000000);
+    return $out;
+}
 function mk_deep_nested(int $depth): array {
     $cur = ['leaf' => 42];
     for ($i = 0; $i < $depth; $i++) $cur = ['next' => $cur, 'i' => $i];
@@ -85,6 +91,7 @@ $shapes = [
     'rowset_1000' => mk_rowset(1000),
     'packed_1k'   => mk_numeric_packed(1000),
     'packed_10k'  => mk_numeric_packed(10000),
+    'packed_rand_10k' => mk_numeric_rand(10000),
     'deep_50'     => mk_deep_nested(50),
     'dto_100'     => mk_dto_users(100),
     'dto_1000'    => mk_dto_users(1000),
