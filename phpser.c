@@ -73,8 +73,9 @@
 #endif
 
 /* Wire format version. Bump on any incompatible change. v2 adds optional
- * container tags (0x12-0x15: TAG_OBJECT_SLOTS, TAG_ASSOC_DICT, TAG_ROWSET,
- * TAG_TABLE); decoders accept both bytes. */
+ * container tags (0x12-0x17: TAG_OBJECT_SLOTS, TAG_ASSOC_DICT, TAG_ROWSET,
+ * TAG_TABLE, TAG_PACKED_DELTA, TAG_PACKED_AFFINE); decoders accept both
+ * bytes. */
 #define PHPSER_VERSION   0x01
 #define PHPSER_VERSION_V2 0x02
 
@@ -119,8 +120,23 @@
                                       v2). Emits the column schema once; each row is values only. */
 #define TAG_TABLE           0x15   /* varint(nrows), varint(ncols), N×varint(dict_key_idx),
                                       ncols×(col_tag, col_payload) — columnar rowset (wire v2).
-                                      col_tag is PACKED_LONGS/DOUBLES/STRINGS/MIXED; row count is
-                                      implicit in the table header (no per-column len varint). */
+                                      col_tag is PACKED_LONGS/DOUBLES/STRINGS/MIXED/DELTA; row
+                                      count is implicit in the table header (no per-column len
+                                      varint). */
+#define TAG_PACKED_DELTA    0x16   /* varint(len), zigzag(v0), (len-1)×zigzag(delta) — integer run
+                                      stored as consecutive differences (wire v2). Arithmetic is
+                                      wrapping mod 2^64 on both sides, so any int64 sequence
+                                      reconstructs exactly and no overflow checks are needed.
+                                      Standalone or as a TAG_TABLE column (column form omits the
+                                      len varint like every other column tag). */
+#define TAG_PACKED_AFFINE   0x17   /* varint(len), zigzag(base), zigzag(step) — integer run where
+                                      v[i] = base + i*step, mod 2^64 (wire v2). Constant runs are
+                                      step 0. O(1) wire bytes for O(len) decoded data, which
+                                      breaks the decoder's bytes-bound-memory invariant, so both
+                                      sides enforce the shared PHPSER_SUBLINEAR_MAX_ELEMS budget
+                                      and the tag is valid ONLY standalone: as a table column it
+                                      would defeat the nrows<=remaining/ncols row-allocation
+                                      bound (a few wire bytes claiming millions of row HTs). */
 
 /* Assoc key tags (one byte before the key's payload). */
 #define KEY_LONG        0x00
@@ -222,6 +238,15 @@ static inline int varint_read_u64(const uint8_t *buf, size_t buflen, size_t *pos
 
 static inline uint64_t zigzag_encode64(int64_t v) {
     return ((uint64_t)v << 1) ^ ((uint64_t)(v >> 63));
+}
+
+/* Wire length of an unsigned varint. Loop instead of clz builtins so the
+ * MSVC (config.w32) build needs no intrinsic shims; the sizing passes that
+ * call this are cold relative to the emit loops. */
+static zend_always_inline uint32_t varint_len_u64(uint64_t v) {
+    uint32_t n = 1;
+    while (v >= 0x80) { v >>= 7; n++; }
+    return n;
 }
 
 static inline int64_t zigzag_decode64(uint64_t v) {
@@ -333,6 +358,15 @@ typedef struct {
  * cache payload. */
 #define MAX_DEPTH 512
 
+/* Cumulative element budget for sub-linear tags (TAG_PACKED_AFFINE), shared
+ * by encoder and decoder like MAX_DEPTH. A sub-linear tag materializes O(n)
+ * zvals from O(1) wire bytes, so without a budget a few dozen bytes could
+ * demand gigabytes and die on an uncatchable OOM E_ERROR instead of the
+ * decoder's return-NULL contract. The cap bounds that to ~16 MB of packed
+ * zvals per decode. The encoder enforces the same budget and falls back to
+ * linear tags beyond it, so it can never emit a payload the decoder rejects. */
+#define PHPSER_SUBLINEAR_MAX_ELEMS (1u << 20)
+
 /* Flat open-addressed identity table: (ptr → id). Once the encoder crosses
  * its first user-code boundary (pins_active), tracked entries pin the GC
  * entity until encode teardown, so a hook cannot destroy an object and
@@ -382,6 +416,9 @@ typedef struct {
      * Seeded from the top-level element count so a large payload skips the
      * per-doubling ecalloc + rehash cascade on its way up from 32 slots. */
     uint32_t icache_init_cap;
+    /* Elements already emitted under sub-linear tags; see
+     * PHPSER_SUBLINEAR_MAX_ELEMS. */
+    uint32_t sublinear_elems;
     zend_string **dict;
     uint32_t dict_len;
     uint32_t dict_cap;
@@ -429,6 +466,7 @@ static void enc_ctx_init(encode_ctx *e) {
     e->wire_v2 = 0;
     e->pins_active = 0;
     e->icache_init_cap = 0;
+    e->sublinear_elems = 0;
 }
 
 /* Live declared-property slots in properties_info_table order (NULL entries
@@ -1634,7 +1672,21 @@ static uint8_t enc_detect_column_tag(
         }
     }
     if (t0 == IS_LONG) {
-        return TAG_PACKED_LONGS;
+        /* Delta only: an affine column would break the table's
+         * one-wire-byte-per-cell nrows bound (see the TAG_PACKED_AFFINE
+         * definition). Constant-delta columns still land near one byte per
+         * cell under DELTA. */
+        if (nrows < 4) return TAG_PACKED_LONGS;
+        uint64_t prev = (uint64_t)Z_LVAL_P(cells[0]);
+        uint32_t plain_bytes = varint_len_u64(zigzag_encode64((int64_t)prev));
+        uint32_t delta_bytes = plain_bytes;
+        for (uint32_t r = 1; r < nrows; r++) {
+            uint64_t cur = (uint64_t)Z_LVAL_P(cells[r]);
+            plain_bytes += varint_len_u64(zigzag_encode64((int64_t)cur));
+            delta_bytes += varint_len_u64(zigzag_encode64((int64_t)(cur - prev)));
+            prev = cur;
+        }
+        return delta_bytes < plain_bytes ? TAG_PACKED_DELTA : TAG_PACKED_LONGS;
     }
     if (t0 == IS_DOUBLE) {
         return TAG_PACKED_DOUBLES;
@@ -1717,6 +1769,18 @@ static void enc_emit_table_column(
         size_t pos = ZSTR_LEN(body->s);
         for (uint32_t r = 0; r < nrows; r++) {
             pos = varint_put(base, pos, zigzag_encode64(Z_LVAL_P(cells[r])));
+        }
+        ZSTR_LEN(body->s) = pos;
+    } else if (col_tag == TAG_PACKED_DELTA) {
+        smart_str_alloc(body, (size_t)nrows * VARINT_MAX_BYTES, 0);
+        char *base = ZSTR_VAL(body->s);
+        size_t pos = ZSTR_LEN(body->s);
+        uint64_t prev = (uint64_t)Z_LVAL_P(cells[0]);
+        pos = varint_put(base, pos, zigzag_encode64((int64_t)prev));
+        for (uint32_t r = 1; r < nrows; r++) {
+            uint64_t cur = (uint64_t)Z_LVAL_P(cells[r]);
+            pos = varint_put(base, pos, zigzag_encode64((int64_t)(cur - prev)));
+            prev = cur;
         }
         ZSTR_LEN(body->s) = pos;
     } else if (col_tag == TAG_PACKED_DOUBLES) {
@@ -1820,14 +1884,57 @@ static zend_never_inline int enc_try_table(
     return 1;
 }
 
-static uint8_t detect_packed_run(HashTable *ht, uint32_t n_used) {
+/* Pick the wire tag for an all-long run. AFFINE when every wrapping delta is
+ * equal and the sub-linear budget allows (constant runs are step 0), DELTA
+ * when the deltas encode strictly smaller than the values, else PACKED_LONGS.
+ * All difference arithmetic wraps mod 2^64, mirroring the decoder, so any
+ * int64 sequence is representable without overflow checks. Runs under 4
+ * elements are not worth the sizing pass. */
+static uint8_t enc_pick_long_run_tag(encode_ctx *e, const zval *zp,
+                                     uint32_t n, int64_t *out_step) {
+    if (n < 4) return TAG_PACKED_LONGS;
+    uint64_t prev = (uint64_t)Z_LVAL(zp[0]);
+    uint64_t step0 = (uint64_t)Z_LVAL(zp[1]) - prev;
+    /* Affine probe first — one subtract and compare per element, with an
+     * early break. The byte-sizing pass below costs more than the varint
+     * emission an affine run saves, so it runs only once affine is off the
+     * table (non-affine data breaks out of this loop within a few
+     * elements). */
+    int affine = 1;
+    for (uint32_t i = 1; i < n; i++) {
+        uint64_t cur = (uint64_t)Z_LVAL(zp[i]);
+        if (cur - prev != step0) { affine = 0; break; }
+        prev = cur;
+    }
+    if (affine
+        && n <= PHPSER_SUBLINEAR_MAX_ELEMS
+        && e->sublinear_elems <= PHPSER_SUBLINEAR_MAX_ELEMS - n) {
+        e->sublinear_elems += n;
+        *out_step = (int64_t)step0;
+        return TAG_PACKED_AFFINE;
+    }
+    prev = (uint64_t)Z_LVAL(zp[0]);
+    uint32_t plain_bytes = varint_len_u64(zigzag_encode64((int64_t)prev));
+    uint32_t delta_bytes = plain_bytes;
+    for (uint32_t i = 1; i < n; i++) {
+        uint64_t cur = (uint64_t)Z_LVAL(zp[i]);
+        plain_bytes += varint_len_u64(zigzag_encode64((int64_t)cur));
+        delta_bytes += varint_len_u64(zigzag_encode64((int64_t)(cur - prev)));
+        prev = cur;
+    }
+    if (delta_bytes < plain_bytes) return TAG_PACKED_DELTA;
+    return TAG_PACKED_LONGS;
+}
+
+static uint8_t detect_packed_run(encode_ctx *e, HashTable *ht, uint32_t n_used,
+                                 int64_t *out_step) {
     zval *zp = ht->arPacked;
     switch (Z_TYPE(zp[0])) {
         case IS_LONG:
             for (uint32_t i = 1; i < n_used; i++) {
                 if (Z_TYPE(zp[i]) != IS_LONG) return TAG_PACKED_MIXED;
             }
-            return TAG_PACKED_LONGS;
+            return enc_pick_long_run_tag(e, zp, n_used, out_step);
         case IS_DOUBLE:
             for (uint32_t i = 1; i < n_used; i++) {
                 if (Z_TYPE(zp[i]) != IS_DOUBLE) return TAG_PACKED_MIXED;
@@ -1885,7 +1992,8 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
             return;
         }
         /* Dense packed, non-string lead — try a numeric typed-run tag. */
-        uint8_t tag = detect_packed_run(ht, n_used);
+        int64_t affine_step = 0;
+        uint8_t tag = detect_packed_run(e, ht, n_used, &affine_step);
         /* enc_try_table emits TAG_TABLE on any homogeneous string-keyed rowset,
          * including all-MIXED columns (each such column falls back to per-cell
          * encode_value). It therefore supersedes the row-major TAG_ROWSET encode
@@ -1894,9 +2002,27 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
         if (tag == TAG_PACKED_MIXED && enc_try_table(body, e, zp, n_used)) {
             return;
         }
+        if (tag == TAG_PACKED_AFFINE || tag == TAG_PACKED_DELTA) {
+            e->wire_v2 = 1;
+        }
         smart_str_appendc(body, tag);
         varint_write_u64(body, n_elems);
-        if (tag == TAG_PACKED_LONGS) {
+        if (tag == TAG_PACKED_AFFINE) {
+            varint_write_i64(body, Z_LVAL(zp[0]));
+            varint_write_i64(body, affine_step);
+        } else if (tag == TAG_PACKED_DELTA) {
+            smart_str_alloc(body, (size_t)n_used * VARINT_MAX_BYTES, 0);
+            char *base = ZSTR_VAL(body->s);
+            size_t pos = ZSTR_LEN(body->s);
+            uint64_t prev = (uint64_t)Z_LVAL(zp[0]);
+            pos = varint_put(base, pos, zigzag_encode64((int64_t)prev));
+            for (uint32_t i = 1; i < n_used; i++) {
+                uint64_t cur = (uint64_t)Z_LVAL(zp[i]);
+                pos = varint_put(base, pos, zigzag_encode64((int64_t)(cur - prev)));
+                prev = cur;
+            }
+            ZSTR_LEN(body->s) = pos;
+        } else if (tag == TAG_PACKED_LONGS) {
             /* Reserve the whole run's worst case once, then write raw —
              * collapses n_used per-element capacity checks to one. Nothing
              * else appends to body inside the loop, so the cached base stays
@@ -2076,6 +2202,9 @@ typedef struct {
      * stack at ~100K nested frames. Bracket decode_value with ++/-- and
      * reject when >= MAX_DEPTH. */
     uint32_t depth;
+    /* Elements already materialized under sub-linear tags; see
+     * PHPSER_SUBLINEAR_MAX_ELEMS. */
+    uint32_t sublinear_elems;
 } decode_ctx;
 
 enum { ALLOWED_ALL = 0, ALLOWED_NONE, ALLOWED_SET };
@@ -2847,6 +2976,17 @@ static int dec_table_column(decode_ctx *d, zval *col, uint64_t nrows, uint8_t co
                 ZVAL_STR_COPY(&col[i], zs);
             }
             return 0;
+        case TAG_PACKED_DELTA: {
+            uint64_t acc = 0;
+            for (; i < nrows; i++) {
+                int64_t dv;
+                if (varint_read_i64(d->buf, d->len, &d->pos, &dv) < 0) goto fail;
+                acc += (uint64_t)dv;
+                if (UNEXPECTED(!dec_i64_fits_zend_long((int64_t)acc))) goto fail;
+                ZVAL_LONG(&col[i], (zend_long)(int64_t)acc);
+            }
+            return 0;
+        }
         case TAG_PACKED_MIXED:
             for (; i < nrows; i++) {
                 if (decode_value_hot(d, &col[i]) < 0) goto fail;
@@ -3000,6 +3140,60 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                     zend_array_destroy(arr);
                     return -1;
                 }
+            }
+            dec_finish_packed(arr, n, out);
+            return 0;
+        }
+        case TAG_PACKED_DELTA: {
+            uint64_t n;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
+            /* v0 plus n-1 deltas is at least n wire bytes — the same linear
+             * bound as PACKED_LONGS. */
+            if (n > UINT32_MAX || n > d->len - d->pos) return -1;
+            zend_array *arr = zend_new_array((uint32_t)n);
+            zend_hash_real_init_packed(arr);
+            /* First varint is v0, the rest are deltas; acc starts at zero so
+             * one wrapping add covers both. Long cells own nothing, so the
+             * failure destroy needs no nNumUsed bookkeeping. */
+            uint64_t acc = 0;
+            for (uint64_t i = 0; i < n; i++) {
+                int64_t dv;
+                if (varint_read_i64(d->buf, d->len, &d->pos, &dv) < 0) {
+                    zend_array_destroy(arr);
+                    return -1;
+                }
+                acc += (uint64_t)dv;
+                if (UNEXPECTED(!dec_i64_fits_zend_long((int64_t)acc))) {
+                    zend_array_destroy(arr);
+                    return -1;
+                }
+                ZVAL_LONG(&arr->arPacked[i], (zend_long)(int64_t)acc);
+            }
+            dec_finish_packed(arr, n, out);
+            return 0;
+        }
+        case TAG_PACKED_AFFINE: {
+            uint64_t n;
+            if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
+            /* Sub-linear tag: wire bytes do not bound n here, the shared
+             * budget does (see PHPSER_SUBLINEAR_MAX_ELEMS). */
+            if (n > PHPSER_SUBLINEAR_MAX_ELEMS
+                || d->sublinear_elems > PHPSER_SUBLINEAR_MAX_ELEMS - (uint32_t)n) {
+                return -1;
+            }
+            d->sublinear_elems += (uint32_t)n;
+            int64_t base_v, step;
+            if (varint_read_i64(d->buf, d->len, &d->pos, &base_v) < 0) return -1;
+            if (varint_read_i64(d->buf, d->len, &d->pos, &step) < 0) return -1;
+            zend_array *arr = zend_new_array((uint32_t)n);
+            zend_hash_real_init_packed(arr);
+            uint64_t acc = (uint64_t)base_v;
+            for (uint64_t i = 0; i < n; i++, acc += (uint64_t)step) {
+                if (UNEXPECTED(!dec_i64_fits_zend_long((int64_t)acc))) {
+                    zend_array_destroy(arr);
+                    return -1;
+                }
+                ZVAL_LONG(&arr->arPacked[i], (zend_long)(int64_t)acc);
             }
             dec_finish_packed(arr, n, out);
             return 0;

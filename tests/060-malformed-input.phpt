@@ -56,6 +56,8 @@ $valid_payloads = [
     phpser_serialize((object) ["x" => 1, "y" => "q"]),
     phpser_serialize([1.1, 2.2, 3.3, -0.0, INF]),          // TAG_PACKED_DOUBLES
     phpser_serialize([["a", "b", "c"], ["a", "b", "c"]]),  // row 2 -> TAG_PACKED_STRINGS
+    phpser_serialize(range(0, 50)),                        // TAG_PACKED_AFFINE
+    phpser_serialize([100, 160, 221, 283, 346, 410]),      // TAG_PACKED_DELTA
 ];
 
 $truncate_fail = 0;
@@ -287,6 +289,42 @@ echo ($dres === ['k' => 2] && count($dres) === 1) ? "signed_assoc_dict_dup OK\n"
 $bad_class = "\x01\x01\x09\\stdClass\x0a\x00\x00";
 echo (phpser_unserialize($bad_class) === null) ? "invalid_class_name OK\n" : "invalid_class_name FAIL\n";
 
+// 15. TAG_PACKED_DELTA (0x16) / TAG_PACKED_AFFINE (0x17) adversarial wire.
+//     DELTA keeps the linear n<=remaining bound; AFFINE is sub-linear and is
+//     bounded by the shared element budget instead. AFFINE is never valid as
+//     a table column (it would defeat the table's per-cell allocation bound).
+$da_bad = [
+    "\x01\x00\x16",                          // DELTA, no n
+    "\x01\x00\x16\xff\xff\xff\xff\xff",      // DELTA len overflow varint
+    "\x01\x00\x16\x03\x02",                  // DELTA n=3, deltas truncated after v0
+    "\x01\x00\x16\x05\x02\x02\x02\x02",      // DELTA n=5 but only 4 varints
+    "\x01\x00\x17",                          // AFFINE, no n
+    "\x01\x00\x17\x04\x02",                  // AFFINE n=4, missing step varint
+    "\x01\x00\x17\x81\x80\x40\x00\x00",      // AFFINE n=2^20+1 over the element budget
+    "\x01\x00\x17\xff\xff\xff\xff\xff\xff\xff\xff\xff\x01\x00\x00", // AFFINE n=2^63
+    // Two 550k AFFINE runs in one payload: each fits, the pair must exceed
+    // the cumulative budget and reject.
+    "\x01\x00\x07\x02" . "\x17\xf0\xc8\x21\x00\x00" . "\x17\xf0\xc8\x21\x00\x00",
+    // AFFINE as a TAG_TABLE column tag: padded so the nrows bound passes and
+    // the column-tag dispatch itself must reject 0x17.
+    "\x01\x01\x01k" . "\x15\x04\x01\x00" . "\x17\x00\x00\x00\x00",
+];
+$da_fail = 0;
+foreach ($da_bad as $i => $bytes) {
+    $rt = phpser_unserialize($bytes);
+    if ($rt !== null) {
+        echo "delta_affine case $i expected NULL, got " . get_debug_type($rt) . "\n";
+        $da_fail++;
+    }
+}
+// A single 550k AFFINE run inside the budget is valid and must decode.
+$one_big = phpser_unserialize("\x01\x00\x17\xf0\xc8\x21\x00\x00");
+if (!is_array($one_big) || count($one_big) !== 550000 || $one_big[549999] !== 0) {
+    echo "delta_affine single-under-budget FAIL\n";
+    $da_fail++;
+}
+echo $da_fail ? "delta_affine FAIL $da_fail\n" : "delta_affine OK\n";
+
 ?>
 --EXPECT--
 static OK
@@ -312,3 +350,4 @@ rowset_nrows_dos OK
 enum_nonenum OK
 signed_assoc_dict_dup OK
 invalid_class_name OK
+delta_affine OK

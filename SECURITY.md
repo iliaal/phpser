@@ -36,6 +36,15 @@ the decoder's bounded work budget. This prevents deterministic collisions in
 Zend's stable string hash from turning a bounded payload into quadratic decode
 CPU while leaving ordinary large arrays unrestricted by a global element cap.
 
+Sub-linear wire is budgeted. `TAG_PACKED_AFFINE` reconstructs an integer run
+from a constant number of wire bytes, so payload length alone no longer bounds
+decoded memory on that tag. Both sides enforce the same cumulative one-million
+element budget (~16 MB of packed values per decode): the encoder falls back to
+linear tags past it and the decoder rejects past it, so a legitimate encoder
+can never emit a frame the decoder refuses. The tag is also rejected as a
+table column, where the per-cell wire-byte bound is what limits row-table
+allocations.
+
 Class resolution is *not* memoized on a miss, so a payload naming an unknown
 class once per object triggers one autoloader invocation per object rather
 than one per payload. This matches native `unserialize()` exactly (which also

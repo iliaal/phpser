@@ -376,7 +376,14 @@ value tags:
                        rows (rowset shape). Schema once, values row-major.
   0x15 TABLE           varint(nrows), varint(ncols), N×varint(dict_key_idx),
                        ncols×(col_tag, payload)  // wire v2 only; columnar rowset.
-                       col_tag is PACKED_LONGS/DOUBLES/STRINGS/MIXED; nrows implicit.
+                       col_tag is PACKED_LONGS/DOUBLES/STRINGS/MIXED/DELTA; nrows implicit.
+  0x16 PACKED_DELTA    varint(len), zigzag(v0), (len-1)×zigzag(delta)  // wire v2 only;
+                       integer run as consecutive differences, wrapping mod 2^64.
+                       Also a TABLE col_tag (column form has no len varint).
+  0x17 PACKED_AFFINE   varint(len), zigzag(base), zigzag(step)  // wire v2 only;
+                       v[i] = base + i*step mod 2^64 (ranges, constant fills).
+                       Standalone only, never a TABLE column; both sides enforce
+                       a shared 1M-element budget (see SECURITY.md).
 
 key tags:
   0x00 LONG            varint(zigzag)
@@ -390,7 +397,7 @@ order, so the decoder reconstructs back-refs by counting
 container tags as it parses.
 
 The version byte is emitted as `0x02` only when the body actually uses a
-v2-only tag (`0x12`–`0x15`); otherwise it stays `0x01`. On decode it is a
+v2-only tag (`0x12`–`0x17`); otherwise it stays `0x01`. On decode it is a
 *minimum-reader* signal, not a gate: the tag dispatch is version-agnostic,
 so a hand-built frame carrying a v2 tag under a `0x01` header still decodes.
 This tolerance keeps the version byte additive. Don't rely on it alone to

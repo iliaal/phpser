@@ -12,6 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Decode installs a typed property without the engine verify call when the value's type already matches the declared type exactly; same-class DTO batches decode ~13% faster (aarch64).
 - `TAG_TABLE` decode builds row hashtables from a bucket template computed once per table instead of paying a hash insert per cell; rowsets decode ~15% faster (aarch64).
 - Encode pre-sizes the string-intern cache from the top-level element count, skipping the per-doubling grow and rehash cascade; object and rowset encode 3-9% faster (aarch64) with identical wire bytes.
+- Constant-stride integer arrays (ranges, constant fills) encode as a base-plus-step affine run: `range(0, 9999)` is a 7-byte payload that encodes 57% and decodes 66% faster (aarch64).
+- Integer runs and rowset integer columns switch to delta encoding when the differences encode smaller than the values; rowset payloads shrink ~7% at a 2-4% rowset encode cost, decode unchanged.
+
+### Changed
+
+- New wire-v2 tags `TAG_PACKED_DELTA` (0x16) and `TAG_PACKED_AFFINE` (0x17). Payloads containing them decode to `null` on phpser 0.5.x and older, the same rollout contract as `TAG_TABLE`; payloads without integer runs remain byte-identical. Affine runs are capped by a one-million-element budget enforced identically at encode and decode.
 
 ### For contributors
 
