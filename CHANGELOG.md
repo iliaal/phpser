@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### For contributors
+
+- `config.m4` and `config.w32` no longer define `HAVE_PHP_SESSION`; php-src's own session extension already provides it, and the header probe gating the duplicate never matched, so the session dependency was declared in a branch that never ran.
+
 ## [0.6.0] - 2026-08-04
 
 ### Performance
