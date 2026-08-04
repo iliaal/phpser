@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-04
+
 ### Performance
 
 - Decode installs a typed property without the engine verify call when the value's type already matches the declared type exactly; same-class DTO batches decode ~13% faster (aarch64).
@@ -269,7 +271,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.5.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.6.0...HEAD
+[0.6.0]: https://github.com/iliaal/phpser/releases/tag/0.6.0
 [0.5.0]: https://github.com/iliaal/phpser/releases/tag/0.5.0
 [0.4.0]: https://github.com/iliaal/phpser/releases/tag/0.4.0
 [0.3.0]: https://github.com/iliaal/phpser/releases/tag/0.3.0
