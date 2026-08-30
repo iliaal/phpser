@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-30
+
 ### Security
 
 - Decode rejects `TAG_ASSOC_DICT`/`TAG_ROWSET`/`TAG_TABLE` frames with numeric-string or duplicate schema keys, which no real array produces; the old fallback routed them through an unbudgeted integer-key hash chain for quadratic decode from a bounded frame (CWE-400).
@@ -280,7 +282,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.6.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.6.1...HEAD
+[0.6.1]: https://github.com/iliaal/phpser/releases/tag/0.6.1
 [0.6.0]: https://github.com/iliaal/phpser/releases/tag/0.6.0
 [0.5.0]: https://github.com/iliaal/phpser/releases/tag/0.5.0
 [0.4.0]: https://github.com/iliaal/phpser/releases/tag/0.4.0
