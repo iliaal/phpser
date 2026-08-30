@@ -186,23 +186,28 @@ ini_set('memory_limit', '64M');
 $dos = "{$H}\x15\x80\x80\x80\x80\x01\x01\x00\x08\x00"; // nrows=2^28, ncols=1, idx=0, LONGS
 echo (phpser_unserialize($dos) === null) ? "table_nrows_dos OK\n" : "table_nrows_dos FAIL\n";
 
-// 6b. Duplicate rowset/table schema keys on the unsigned path must keep
-//     last-write-wins semantics. The optimized unique-schema path may use
-//     add_new only after proving these are not duplicate keys.
+// 6b. Duplicate rowset/table schema keys must be REJECTED (BUG-R2-C2-A1-H1).
+//     An honest array never carries a duplicate schema key, so this shape is
+//     handcrafted wire only; the old symtable_update collapse walked an
+//     unbudgeted integer-domain hash chain (quadratic decode, CWE-400).
+//     dec_read_schema_keys rejects at schema-parse time, before any cell decode.
 $HD = "\x02\x02\x01a\x01a";
-$dup_rowset = "{$HD}\x14\x01\x02\x00\x01\x03\x02\x03\x04"; // [['a'=>1, 'a'=>2]]
+$dup_rowset = "{$HD}\x14\x01\x02\x00\x01\x03\x02\x03\x04"; // forged [['a'=>1, 'a'=>2]]
 $dup_table  = "{$HD}\x15\x01\x02\x00\x01\x08\x02\x08\x04"; // same, columnar
-echo (phpser_unserialize($dup_rowset) === [['a' => 2]]) ? "rowset_dup_schema OK\n" : "rowset_dup_schema FAIL\n";
-echo (phpser_unserialize($dup_table) === [['a' => 2]]) ? "table_dup_schema OK\n" : "table_dup_schema FAIL\n";
+echo (phpser_unserialize($dup_rowset) === null) ? "rowset_dup_schema OK\n" : "rowset_dup_schema FAIL\n";
+echo (phpser_unserialize($dup_table) === null) ? "table_dup_schema OK\n" : "table_dup_schema FAIL\n";
 
-// 6b'. Unique-schema rowset/table with a canonical integer-string key must
-//      coerce it to an int key (PHP array semantics) even on the add_new fast
-//      path — zend_hash_add_new would otherwise store "5" as a string bucket.
+// 6b'. A canonical integer-string schema key must be REJECTED (BUG-R2-C2-A1-H1).
+//      The engine coerces a numeric string to an int array key at insert, so a
+//      real string-keyed bucket is never canonical-numeric and the encoder never
+//      emits "5" as a schema key. A crafted numeric schema key would coerce
+//      through zend_symtable_update to an integer key whose bucket slot is
+//      h & (T-1) with no hash budget — the quadratic-decode DoS. Reject it.
 $HN = "\x02\x01\x015"; // dict ["5"]
-$num_rowset = "{$HN}\x14\x01\x01\x00\x03\x02"; // [['5'=>1]] -> [[5=>1]]
+$num_rowset = "{$HN}\x14\x01\x01\x00\x03\x02"; // forged [['5'=>...]]
 $num_table  = "{$HN}\x15\x01\x01\x00\x08\x02"; // same, columnar LONGS
-echo (phpser_unserialize($num_rowset) === [[5 => 1]]) ? "rowset_num_schema OK\n" : "rowset_num_schema FAIL\n";
-echo (phpser_unserialize($num_table) === [[5 => 1]]) ? "table_num_schema OK\n" : "table_num_schema FAIL\n";
+echo (phpser_unserialize($num_rowset) === null) ? "rowset_num_schema OK\n" : "rowset_num_schema FAIL\n";
+echo (phpser_unserialize($num_table) === null) ? "table_num_schema OK\n" : "table_num_schema FAIL\n";
 
 // 6b''. A TAG_TABLE column truncated mid-run must fail cleanly, not crash. The
 //       partial column leaves later cells uninitialized; the error path blanks
@@ -271,17 +276,23 @@ echo (phpser_unserialize($rowset_dos) === null) ? "rowset_nrows_dos OK\n" : "row
 $enum_nonenum = "\x02\x02\x08stdClass\x01x\x0d\x00\x01"; // ENUM class_idx=0, case_idx=1
 echo (phpser_unserialize($enum_nonenum) === null) ? "enum_nonenum OK\n" : "enum_nonenum FAIL\n";
 
-// 9. Trusted (signed) TAG_ASSOC_DICT with a crafted duplicate key (CR-014). The
-//    trusted path uses add_new (unique-key assumption); a forged dup must not
-//    leak the decoded value (ASAN/LSAN canary): a dup drops off the add_new
-//    fast path to symtable_update (last-write-wins), never a phantom bucket.
+// 9. Trusted (signed) TAG_ASSOC_DICT with a crafted duplicate key
+//    (CR-014 / BUG-R2-C2-A1-H1). A valid HMAC does not prove the schema keys
+//    are distinct; a duplicate schema key is handcrafted-wire only and the
+//    old symtable_update collapse was an unbudgeted integer-domain hash walk
+//    (quadratic decode, CWE-400). The frame is now rejected at schema-parse
+//    time (before the values are decoded, so nothing is leaked) and the signed
+//    decoder throws (CR-008).
 $dkey = "phpser-060-adk";
 $dbody = "\x02\x01\x01k\x13\x02\x00\x00\x03\x02\x03\x04"; // ASSOC_DICT n=2 keys[0,0] vals 1,2
 $dframe = $dbody . hash_hmac('sha256', $dbody, $dkey, true);
-// Duplicate key on a forged-signed frame falls off the add_new fast path to
-// last-write-wins (no phantom bucket), matching the unsigned dup semantics.
-$dres = phpser_unserialize_signed($dframe, $dkey);
-echo ($dres === ['k' => 2] && count($dres) === 1) ? "signed_assoc_dict_dup OK\n" : "signed_assoc_dict_dup FAIL " . var_export($dres, true) . "\n";
+try {
+    phpser_unserialize_signed($dframe, $dkey);
+    echo "signed_assoc_dict_dup FAIL (no throw)\n";
+} catch (\Exception $e) {
+    echo (strpos($e->getMessage(), "failed to decode") !== false)
+        ? "signed_assoc_dict_dup OK\n" : "signed_assoc_dict_dup FAIL (" . $e->getMessage() . ")\n";
+}
 
 // 10. Class names in the dictionary must use canonical PHP syntax. A leading
 //     namespace separator is accepted by lookup APIs but is not valid in a

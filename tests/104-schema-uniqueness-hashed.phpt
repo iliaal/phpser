@@ -1,5 +1,5 @@
 --TEST--
-phpser: schema uniqueness on the hashed branch (ncols > 32) — unique round-trips, forged dup collapses without a phantom bucket
+phpser: schema uniqueness on the hashed branch (ncols > 32) — unique round-trips, forged dup rejected
 --EXTENSIONS--
 phpser
 --FILE--
@@ -9,8 +9,10 @@ phpser
 // check unconditionally (CR-004), so both branches must be exercised. Part A: a
 // legit 40-column rowset (unique -> hashed set returns true -> add_new). Part B:
 // a forged-but-signed 33-column TABLE whose schema repeats one key (hashed set
-// returns false -> symtable_update fallback -> last-write-wins, no phantom
-// bucket, count == unique-key count).
+// returns false). A duplicate schema key exists only in handcrafted wire and
+// routing it through zend_symtable_update walks an unbudgeted integer-domain
+// hash chain (quadratic decode, BUG-R2-C2-A1-H1 / CWE-400), so the frame is
+// now REJECTED at schema-parse time and the signed decoder throws (CR-008).
 $key = str_repeat("k", 32);
 function v($n){ $o=""; while($n>=0x80){ $o.=chr(($n&0x7f)|0x80); $n>>=7;} return $o.chr($n); }
 function sign($b,$k){ return $b . hash_hmac('sha256',$b,$k,true); }
@@ -41,18 +43,17 @@ for ($i = 0; $i < $ncols; $i++) {
     $cols .= "\x08" . v($val << 1);
 }
 $body = "\x02" . v(32) . $dict . "\x15" . v(1) . v($ncols) . $schema . $cols;
-$t = phpser_unserialize_signed(sign($body, $key), $key);
-var_dump(count($t) === 1);                 // one row
-var_dump(count($t[0]) === 32);             // 32 unique keys, no phantom 33rd bucket
-var_dump($t[0]['c0'] === 320);             // last column (idx 32, value 320) wins on the dup
-var_dump($t[0]['c31'] === 310);            // other columns intact
+try {
+    phpser_unserialize_signed(sign($body, $key), $key);
+    echo "dup_reject FAIL (no throw)\n";
+} catch (\Exception $e) {
+    echo (strpos($e->getMessage(), "failed to decode") !== false)
+        ? "dup_reject OK\n" : "dup_reject FAIL (" . $e->getMessage() . ")\n";
+}
 echo "ok\n";
 ?>
 --EXPECT--
 bool(true)
 bool(true)
-bool(true)
-bool(true)
-bool(true)
-bool(true)
+dup_reject OK
 ok

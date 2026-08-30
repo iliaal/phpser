@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Decode rejects `TAG_ASSOC_DICT`/`TAG_ROWSET`/`TAG_TABLE` frames with numeric-string or duplicate schema keys, which no real array produces; the old fallback routed them through an unbudgeted integer-key hash chain for quadratic decode from a bounded frame (CWE-400).
+- Encode no longer reads freed heap when a `__serialize` hook mutates a live `ArrayObject`/`ArrayIterator` storage array it is walking; the generic walk copies a shared nested table and the columnar path pins each row before running hooks (CWE-416).
+
 ### For contributors
 
 - `config.m4` and `config.w32` no longer define `HAVE_PHP_SESSION`; php-src's own session extension already provides it, and the header probe gating the duplicate never matched, so the session dependency was declared in a branch that never ran.

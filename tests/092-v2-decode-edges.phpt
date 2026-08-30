@@ -60,23 +60,27 @@ try {
     echo "typed_reject OK\n";
 }
 
-// --- CR-010.3a: ASSOC_DICT with duplicate dict-key indices must collapse to
-// last-write-wins on the untrusted path (zend_symtable_update), not create a
-// phantom bucket. ---
+// --- CR-010.3a / BUG-R2-C2-A1-H1: ASSOC_DICT with duplicate dict-key indices
+// must be REJECTED. An honest array can never carry a duplicate schema key, so
+// this shape exists only in handcrafted wire; the old symtable_update fallback
+// walked an unbudgeted integer-domain hash chain (quadratic decode, CWE-400).
+// dec_read_schema_keys rejects at schema-parse time, before any cell decode. ---
 // [0x02][ndict=1][len=1]"k"[0x13 ASSOC_DICT][n=2][idx=0][idx=0][0x03 zz(1)=2][0x03 zz(2)=4]
 $dup = "\x02\x01\x01k\x13\x02\x00\x00\x03\x02\x03\x04";
 $rd = phpser_unserialize($dup);
-echo (is_array($rd) && count($rd) === 1 && $rd['k'] === 2) ? "assocdict_dup OK\n"
+echo ($rd === null) ? "assocdict_dup OK\n"
     : "assocdict_dup FAIL " . var_export($rd, true) . "\n";
 
-// --- CR-010.3b: ASSOC_DICT with a numeric-string dict key must coerce to an
-// integer array key, matching PHP array semantics. ---
+// --- CR-010.3b / BUG-R2-C2-A1-H1: ASSOC_DICT with a numeric-string dict key
+// must be REJECTED. A canonical numeric string can never be a real array
+// string key (the engine coerces it to an int key at insert), so the encoder
+// never emits it as a schema key; routing crafted numeric keys through
+// zend_symtable_update coerces them to integer keys whose bucket assignment is
+// h & (T-1) with no hash budget — the quadratic-decode DoS. ---
 // [0x02][ndict=1][len=1]"7"[0x13][n=1][idx=0][0x03 zz(99)=198 → 0xC6 0x01]
 $num = "\x02\x01\x017\x13\x01\x00\x03\xc6\x01";
 $rn = phpser_unserialize($num);
-$keys = is_array($rn) ? array_keys($rn) : [];
-echo (is_array($rn) && count($keys) === 1 && $keys[0] === 7 && $rn[7] === 99)
-    ? "assocdict_numkey OK\n"
+echo ($rn === null) ? "assocdict_numkey OK\n"
     : "assocdict_numkey FAIL " . var_export($rn, true) . "\n";
 
 // --- CR-010.2a residual: an eligible typed DTO must actually take the SLOTS

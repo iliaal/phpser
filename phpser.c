@@ -896,7 +896,7 @@ static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
 static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                                bool in_rcn_array);
 static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
-                             bool in_rcn_array);
+                             bool in_rcn_array, bool ht_shared);
 
 /* Live-property predicate shared by the plain-object count and emit passes.
  * get_properties surfaces declared props as IS_INDIRECT (deref to the real
@@ -1093,8 +1093,15 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             /* Shared-ness propagates transitively: an RC1 array reached from a
              * shared (RC>1) ancestor is still walked once per ancestor visit,
              * so its object children need identity tracking too. */
-            bool children_in_rcn_array = in_rcn_array
-                || (!(GC_FLAGS(ht) & GC_IMMUTABLE) && GC_REFCOUNT(ht) > 1);
+            /* Computed BEFORE the GC_TRY_ADDREF below: that addref inflates
+             * the refcount by 1 for the duration of the walk, so a check made
+             * inside encode_hashtable can no longer tell a genuinely shared
+             * array (external owner) from one we merely pinned. ht_shared is
+             * the pre-addref answer — true only when a second owner really
+             * holds this table. */
+            bool ht_shared =
+                !(GC_FLAGS(ht) & GC_IMMUTABLE) && GC_REFCOUNT(ht) > 1;
+            bool children_in_rcn_array = in_rcn_array || ht_shared;
             /* Hold a ref across the walk. encode_hashtable caches raw
              * arData/arPacked base pointers across encode_value calls that run
              * user hooks (__serialize/__sleep). A hook can grow THIS array
@@ -1107,9 +1114,19 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
              * it and faults on the same shape. Release after; if COW separation
              * orphaned our copy, our ref is the last one and we destroy it.
              * GC_TRY_ADDREF skips immutable arrays, so mirror the guard on the
-             * release. */
+             * release.
+             * This addref forces zval-level writers to COW-separate, but it
+             * cannot stop an internal write handler: an ArrayObject/
+             * ArrayIterator whose __serialize handed its LIVE storage array
+             * into this graph (or that array extracted from a manual
+             * __serialize() call) is mutated in place by the refcount-blind
+             * engine C-API. That hazard is closed at the two sites that hold
+             * raw pointers across user code — encode_hashtable's generic
+             * per-element loops (enc_pin_walk duplicates a shared table before
+             * dispatching) and enc_try_table's columnar gather (per-row pins) —
+             * not here, so this dispatch keeps the zero-copy addref. */
             GC_TRY_ADDREF(ht);
-            encode_hashtable(body, e, ht, children_in_rcn_array);
+            encode_hashtable(body, e, ht, children_in_rcn_array, ht_shared);
             if (!(GC_FLAGS(ht) & GC_IMMUTABLE) && !GC_DELREF(ht)) {
                 zend_array_destroy(ht);
             }
@@ -1818,6 +1835,20 @@ static void enc_emit_table_column(
     }
 }
 
+/* Release the per-row pins taken by enc_try_table's gather. Each non-NULL slot
+ * is either a private duplicate (zend_array_dup -> refcount 1) or the original
+ * row we addref'd; a single GC_DELREF balances both, destroying the table only
+ * when our reference was the last (a duplicate always, or an original whose
+ * owning slot a hook deleted). NULL slots are immutable rows, never pinned. */
+static void enc_free_row_pins(HashTable **row_pin, uint32_t n_used) {
+    for (uint32_t r = 0; r < n_used; r++) {
+        if (row_pin[r] && !GC_DELREF(row_pin[r])) {
+            zend_array_destroy(row_pin[r]);
+        }
+    }
+    efree(row_pin);
+}
+
 static zend_never_inline int enc_try_table(
     smart_str *body, encode_ctx *e, zval *zp, uint32_t n_used)
 {
@@ -1846,8 +1877,49 @@ static zend_never_inline int enc_try_table(
      * reference rows), this becomes a live use-after-free — see
      * tests/098-encode-rowset-reentrancy.phpt. */
     zval **col_cells = (zval **)safe_emalloc((size_t)ncols * n_used, sizeof(zval *), 0);
+    /* The safety comment above assumes the ONLY way to invalidate the gathered
+     * &b->val pointers is a write to a row through a second zval handle, which
+     * COW-separates. That is false when the rowset is a second owner's LIVE
+     * internal storage: an ArrayObject/ArrayIterator whose own __serialize
+     * handed its storage array into this graph (directly, or extracted from a
+     * manual __serialize() call). A MIXED column's per-cell emit runs a hook
+     * that can reach that owner and, through the refcount-blind engine C-API
+     * (HT_ASSERT_RC1 is ZEND_DEBUG-only), either offsetUnset a row (freeing an
+     * RC-1 row HashTable) or offsetSet on a row that is itself a second
+     * ArrayObject's storage (reallocating that row's bucket array) — both
+     * dangle the &b->val pointers gathered here. The gather runs before any
+     * emission, so the outer zp is read only while no user code is live and
+     * needs no protection; the rows do.
+     *   - A shared (refcount > 1) row can be reallocated in place by its other
+     *     owner, so gather from a private duplicate at any depth.
+     *   - An RC-1 row can only be freed by an in-place delete on the rowset's
+     *     own owner, which requires that owner to be a live ArrayObject that
+     *     handed this storage into the walk — reachable only at depth > 1 (a
+     *     __serialize retval or deeper). A top-level rowset is a plain arg
+     *     whose RC-1 rows no hook can free, so it takes no pin and pays
+     *     nothing (the flagship path). Addref an RC-1 row only when nested.
+     * row_pin is allocated lazily: a rowset with no shared or nested-and-owned
+     * row never touches it. row_pin[r] holds whichever table we gathered from
+     * and must release. */
+    HashTable **row_pin = NULL;
     for (uint32_t r = 0; r < n_used; r++) {
         HashTable *ht = Z_ARRVAL(zp[r]);
+        HashTable *pinned = NULL;
+        if (!(GC_FLAGS(ht) & GC_IMMUTABLE)) {
+            if (GC_REFCOUNT(ht) > 1) {
+                pinned = zend_array_dup(ht);   /* private copy, refcount 1 */
+                ht = pinned;
+            } else if (e->depth > 1) {
+                GC_ADDREF(ht);                 /* pin a nested RC-1 row against free */
+                pinned = ht;
+            }
+        }
+        if (pinned) {
+            if (!row_pin) {
+                row_pin = (HashTable **)ecalloc(n_used, sizeof(HashTable *));
+            }
+            row_pin[r] = pinned;
+        }
         Bucket *b = ht->arData;
         Bucket *end = b + ht->nNumUsed;
         uint32_t c = 0;
@@ -1858,6 +1930,7 @@ static zend_never_inline int enc_try_table(
         }
         if (UNEXPECTED(c != ncols)) {
             efree(col_cells);
+            if (row_pin) enc_free_row_pins(row_pin, n_used);
             efree(key_idx);
             return 0;
         }
@@ -1881,6 +1954,7 @@ static zend_never_inline int enc_try_table(
         if (string_idx) efree(string_idx);
     }
     efree(col_cells);
+    if (row_pin) enc_free_row_pins(row_pin, n_used);
     return 1;
 }
 
@@ -1945,8 +2019,42 @@ static uint8_t detect_packed_run(encode_ctx *e, HashTable *ht, uint32_t n_used,
     }
 }
 
+/* A per-element generic walk dispatches each value through encode_value_ex,
+ * which runs user hooks (__serialize/__sleep). If the walked table is shared
+ * (refcount > 1) it may be a second owner's LIVE internal storage — an
+ * ArrayObject/ArrayIterator that handed its storage array into this graph, or
+ * that same array extracted from a manual __serialize() call and passed in
+ * directly. A hook can offsetSet/offsetUnset that container in place through
+ * the refcount-blind engine C-API (HT_ASSERT_RC1 is ZEND_DEBUG-only),
+ * reallocating arData/arPacked under the base pointer the walk caches. Walk a
+ * private duplicate instead: it is owned solely by us, so no external in-place
+ * write can reach it. Only the hook-dispatching generic loops call this; the
+ * scalar-run and columnar fast paths never run user code (or self-protect their
+ * rows), so they keep walking the original and pay nothing. A refcount-1 table
+ * is ours alone and only a COW-separating zval write can touch it, so it too
+ * needs no copy — this returns the original and leaves *dup NULL.
+ * ht_shared is the caller's PRE-addref verdict (a second owner really holds
+ * this table); the dispatch's GC_TRY_ADDREF makes an in-function refcount check
+ * useless, so we cannot recompute it here. The dup is further confined to
+ * NESTED arrays (e->depth > 1): the top-level value is always shared from
+ * ordinary by-value argument passing, and duplicating it would perturb object
+ * lifetime / identity (the ABA and by-ref-alias reentrancy tests depend on the
+ * original being walked) and copy every payload for nothing. A live-storage
+ * array reached through a __serialize retval or nested in the graph is always
+ * at depth > 1; only a value handed to the API AS the top-level array skips
+ * this, and that shape has no legitimate producer. */
+static zend_always_inline HashTable *enc_pin_walk(encode_ctx *e, HashTable *ht,
+                                                  bool ht_shared, HashTable **dup) {
+    if (ht_shared && e->depth > 1) {
+        *dup = zend_array_dup(ht);
+        return *dup;
+    }
+    *dup = NULL;
+    return ht;
+}
+
 static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
-                             bool in_rcn_array) {
+                             bool in_rcn_array, bool ht_shared) {
     uint32_t n_used = ht->nNumUsed;
     uint32_t n_elems = ht->nNumOfElements;
     int is_packed = HT_IS_PACKED(ht);
@@ -1981,9 +2089,12 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
                     || !enc_str_dict_idx(e, Z_STR(zp[i]), &idx)) {
                     ZSTR_VAL(body->s)[tag_off] = (char)TAG_PACKED_MIXED;
                     ZSTR_LEN(body->s) = run_start;
+                    HashTable *dup;
+                    zval *wzp = enc_pin_walk(e, ht, ht_shared, &dup)->arPacked;
                     for (uint32_t j = 0; j < n_used; j++) {
-                        encode_value_ex(body, e, &zp[j], in_rcn_array);
+                        encode_value_ex(body, e, &wzp[j], in_rcn_array);
                     }
+                    if (dup) zend_array_destroy(dup);
                     return;
                 }
                 pos = varint_put(base, pos, idx);
@@ -2043,9 +2154,12 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
             }
             ZSTR_LEN(body->s) = pos;
         } else {
+            HashTable *dup;
+            zval *wzp = enc_pin_walk(e, ht, ht_shared, &dup)->arPacked;
             for (uint32_t i = 0; i < n_used; i++) {
-                encode_value_ex(body, e, &zp[i], in_rcn_array);
+                encode_value_ex(body, e, &wzp[i], in_rcn_array);
             }
+            if (dup) zend_array_destroy(dup);
         }
         return;
     }
@@ -2054,13 +2168,15 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
         /* Sparse packed (post-unset). Preserve original int keys. */
         smart_str_appendc(body, TAG_ASSOC);
         varint_write_u64(body, n_elems);
-        zval *zp = ht->arPacked;
+        HashTable *dup;
+        zval *zp = enc_pin_walk(e, ht, ht_shared, &dup)->arPacked;
         for (uint32_t i = 0; i < n_used; i++) {
             if (Z_TYPE(zp[i]) == IS_UNDEF) continue;
             smart_str_appendc(body, KEY_LONG);
             varint_write_i64(body, (int64_t)i);
             encode_value_ex(body, e, &zp[i], in_rcn_array);
         }
+        if (dup) zend_array_destroy(dup);
         return;
     }
 
@@ -2094,17 +2210,33 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
                 pos = varint_put(base, pos, kidx);
             }
             ZSTR_LEN(body->s) = pos;
-            b = ht->arData;
-            for (; b < end; b++) {
-                if (Z_TYPE(b->val) == IS_UNDEF) continue;
-                encode_value_ex(body, e, &b->val, in_rcn_array);
+            /* Key run emitted from the original (no user code ran); the value
+             * run dispatches hooks, so walk a private duplicate when shared.
+             * zend_array_dup preserves bucket order (values stay aligned with
+             * the keys already written) but COMPACTS an assoc table's holes, so
+             * bound the value walk by the walked table's own nNumUsed, not the
+             * original's — the dup has fewer buckets when the source had UNDEF
+             * slots. */
+            HashTable *dup;
+            HashTable *vwht = enc_pin_walk(e, ht, ht_shared, &dup);
+            Bucket *vb = vwht->arData;
+            Bucket *vend = vb + vwht->nNumUsed;
+            for (; vb < vend; vb++) {
+                if (Z_TYPE(vb->val) == IS_UNDEF) continue;
+                encode_value_ex(body, e, &vb->val, in_rcn_array);
             }
+            if (dup) zend_array_destroy(dup);
             return;
         }
         smart_str_appendc(body, TAG_ASSOC);
         varint_write_u64(body, n_elems);
-        b = ht->arData;
-        for (; b < end; b++) {
+        /* zend_array_dup compacts an assoc table's UNDEF holes, so iterate the
+         * walked table's own nNumUsed rather than the original's. */
+        HashTable *dup;
+        HashTable *awht = enc_pin_walk(e, ht, ht_shared, &dup);
+        b = awht->arData;
+        Bucket *wend = b + awht->nNumUsed;
+        for (; b < wend; b++) {
             if (Z_TYPE(b->val) == IS_UNDEF) continue;
             if (b->key) {
                 enc_emit_str_key(body, e, b->key);
@@ -2115,6 +2247,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
             }
             encode_value_ex(body, e, &b->val, in_rcn_array);
         }
+        if (dup) zend_array_destroy(dup);
     }
 }
 
@@ -3958,18 +4091,30 @@ static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *us
     /* zend_hash_add_new stores the key verbatim; a canonical integer-string
      * schema key ("5") would land as a string bucket instead of the int key
      * PHP guarantees. Only take the add_new fast path when every key is
-     * non-numeric (so no coercion is owed) and distinct; otherwise fall back
-     * to zend_symtable_update, which coerces and collapses like the engine.
+     * non-numeric (so no coercion is owed) and distinct; any numeric or
+     * duplicate schema key is rejected below — it exists only in handcrafted
+     * wire and routing it through zend_symtable_update walks an unbudgeted
+     * integer-domain hash chain (CWE-400 quadratic decode: keys congruent
+     * modulo the destination pre-size pile into one slot at Theta(n^2), or
+     * nrows*ncols^2/2 for TABLE/ROWSET row replay, and the decode still
+     * SUCCEEDS — the 0.5.0 MAX_HASH_CHAIN_LENGTH budget only covers the
+     * string-hash domain phpser walks itself, not the engine's integer
+     * bucket assignment).
+     * Round-trip safe by construction: the encoder derives schema keys from
+     * real PHP array buckets, which are distinct non-numeric string keys
+     * (enc_match_rowset_schema and the TAG_ASSOC_DICT eligibility both
+     * require b->key; the engine coerces canonical numeric strings to int
+     * keys at insert, so no honest array can produce either shape).
      * Uniqueness is evaluated on every path: a valid HMAC does not prove the
      * schema keys are distinct (a forged frame can repeat one), and skipping
      * the scan produced per-row phantom buckets and — via the numeric-forced
      * update path with an unpinned cell — the CR-001 UAF class (CR-004). */
     int unique = dec_schema_keys_are_unique(keys, nkeys);
-    if (UNEXPECTED(unique < 0)) {
+    if (UNEXPECTED(unique <= 0) || UNEXPECTED(has_numeric)) {
         efree(keys);
         return NULL;
     }
-    *use_add_new = !has_numeric && unique;
+    *use_add_new = 1;
     return keys;
 }
 
