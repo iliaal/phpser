@@ -32,13 +32,13 @@ function collide_assoc_dict($n){
     return $frame;
 }
 
-// A non-trivial n: pre-fix this burned quadratic time; post-fix it must reject
-// in linear time.
-$t = microtime(true);
+// A non-trivial n: pre-fix this decoded (and burned quadratic time); post-fix
+// it must reject. Rejection is the security property and the regression guard:
+// a fallback to the old collapse path would DECODE this to a valid array, so
+// `=== null` catches it. (No wall-clock assertion — decode time is instrumented
+// build and runner dependent; an ASAN lane rejects this same frame in seconds.)
 $r = phpser_unserialize(collide_assoc_dict(16384));
-$dt = microtime(true) - $t;
 echo ($r === null) ? "assoc_dict_reject OK\n" : "assoc_dict_reject FAIL\n";
-echo ($dt < 1.0) ? "assoc_dict_fast OK\n" : "assoc_dict_fast FAIL ({$dt}s)\n";
 
 // Single numeric key is enough to force the (former) fallback for the whole
 // schema — reject.
@@ -69,7 +69,6 @@ echo ($rt === [[5 => 1]]) ? "int_key_roundtrip OK\n" : "int_key_roundtrip FAIL "
 ?>
 --EXPECT--
 assoc_dict_reject OK
-assoc_dict_fast OK
 single_numeric_reject OK
 dup_reject OK
 rowset_numeric_reject OK

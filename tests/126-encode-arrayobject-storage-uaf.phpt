@@ -26,11 +26,18 @@ pointers across user code:
     a shared (refcount>1) row and addrefs a sole-owned row, so a hook can
     neither realloc a shared row nor free an RC-1 row under the gather.
 
-Under the ASAN/valgrind lane each turns a UAF into an invalid-read abort;
+On a release build each turns into a freed-heap read that valgrind/ASAN flags;
 without instrumentation the assertions still hold (encode completes, output
-round-trips).
---EXTENSIONS--
-phpser
+round-trips). The scenario cannot run on a debug build: the misbehaving SPL
+write to the refcount>1 storage trips the engine's own HT_ASSERT_RC1 (active
+only under ZEND_DEBUG) and aborts before the walk continues, so the test skips
+there. The duplicate-path correctness that a debug/ASAN lane CAN exercise (no
+in-place SPL write) lives in test 128.
+--SKIPIF--
+<?php
+if (!extension_loaded("phpser")) die("skip phpser not loaded");
+if (PHP_DEBUG) die("skip debug build aborts on HT_ASSERT_RC1 before the walk; release/valgrind only");
+?>
 --FILE--
 <?php
 
@@ -129,31 +136,6 @@ $s5 = phpser_serialize([$nstore]);              // storage nested at depth 2 -> 
 NestMut::$ao = null;
 echo (is_string($s5) && strlen($s5) > 0) ? "nested_extracted_no_uaf OK\n" : "nested_extracted_no_uaf FAIL\n";
 
-// --- A shared NESTED assoc array with UNDEF holes takes the duplicate path;
-//     zend_array_dup compacts an assoc table's holes, so the value walk must be
-//     bounded by the dup's own (smaller) nNumUsed, not the original's, or it
-//     reads uninitialized trailing buckets. Round-trip must be exact.
-$holey = ['a' => 1, 'b' => 2, 'c' => 3, 'd' => 4, 'e' => 5];
-unset($holey['b'], $holey['d']);                 // nNumUsed 5, nNumOfElements 3
-$hx = ['w' => $holey, 'w2' => $holey];           // $holey shared (refcount>1), depth 2
-$hrt = phpser_unserialize(phpser_serialize($hx));
-echo ($hrt === ['w' => ['a' => 1, 'c' => 3, 'e' => 5], 'w2' => ['a' => 1, 'c' => 3, 'e' => 5]])
-    ? "shared_holey_assoc OK\n" : "shared_holey_assoc FAIL\n";
-
-// Sparse packed with holes stays index-keyed through the duplicate path.
-$sp = [10, 11, 12, 13, 14];
-unset($sp[1], $sp[3]);
-$spx = ['p' => $sp, 'p2' => $sp];
-$sprt = phpser_unserialize(phpser_serialize($spx));
-echo ($sprt === ['p' => [0 => 10, 2 => 12, 4 => 14], 'p2' => [0 => 10, 2 => 12, 4 => 14]])
-    ? "shared_holey_packed OK\n" : "shared_holey_packed FAIL\n";
-
-// --- Non-mutating ArrayObject must still round-trip through the duplicate path.
-$plain = new ArrayObject(['a' => 1, 'b' => [1, 2, 3], 'c' => 'hi']);
-$rt = phpser_unserialize(phpser_serialize($plain));
-echo ($rt instanceof ArrayObject && $rt->getArrayCopy() === ['a' => 1, 'b' => [1, 2, 3], 'c' => 'hi'])
-    ? "plain_roundtrip OK\n" : "plain_roundtrip FAIL\n";
-
 ?>
 --EXPECT--
 insert_no_uaf OK
@@ -162,6 +144,3 @@ delete_no_uaf OK
 iterator_delete_no_uaf OK
 shared_row_no_uaf OK
 nested_extracted_no_uaf OK
-shared_holey_assoc OK
-shared_holey_packed OK
-plain_roundtrip OK
