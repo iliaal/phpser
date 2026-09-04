@@ -75,9 +75,10 @@ echo (phpser_unserialize($legacy)->n === 1) ? "unserialize_class_rt OK\n"
 $v1 = "\x01\x00\x03\x54";
 echo (phpser_unserialize($v1) === 42) ? "v1_compat OK\n" : "v1_compat FAIL\n";
 
-// Crafted TAG_OBJECT_SLOTS with wrong nprops rejects cleanly.
-$crafted = $blob;
-$crafted[9] = "\x09"; // bump nprops byte if single-byte varint — fragile; build minimal:
+// Crafted TAG_OBJECT_SLOTS with wrong nprops rejects cleanly. (An earlier
+// revision poked a byte of the live frame here; the poke offset was never
+// anchored to the header parse, so it is deleted — the minimal frame below
+// is the assertion.)
 $bad = "\x02\x01UserDto\x02\x01\x03\xff"; // v2, dict UserDto, slots nprops=1, truncated
 echo (phpser_unserialize($bad) === null) ? "bad_slots_reject OK\n" : "bad_slots_reject FAIL\n";
 ?>

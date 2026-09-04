@@ -23,7 +23,7 @@
  */
 #include "php.h"
 #include "php_phpser.h"
-#include "ext/standard/info.h"
+#include "phpser_int.h"
 #include "Zend/zend_API.h"
 #include "Zend/zend_smart_str.h"
 #include "Zend/zend_hash.h"
@@ -33,16 +33,9 @@
 #include "Zend/zend_execute.h"          /* zend_verify_prop_assignable_by_ref */
 #include "Zend/zend_objects_API.h"      /* zend_get_typed_property_info_for_slot */
 #include "ext/standard/php_incomplete_class.h"
-#include "ext/hash/php_hash.h"
 #if PHP_VERSION_ID >= 80400
 # include "Zend/zend_lazy_objects.h"     /* zend_object_is_lazy — guards the property-slot fast path */
 #endif
-
-#ifdef HAVE_PHP_SESSION
-# include "ext/session/php_session.h"
-#endif
-
-#define PHPSER_HMAC_TAG_LEN 32  /* SHA256 output size */
 
 #include <stdint.h>
 #include <string.h>
@@ -355,8 +348,7 @@ typedef struct {
  * (vs ~150 B for opt-NTS), so the cap must hold within a single 8 MB
  * stack worst-case. 512 leaves ~2x headroom under ASAN and ~50x under
  * opt-NTS, and is still many orders of magnitude past any legitimate
- * cache payload. */
-#define MAX_DEPTH 512
+ * cache payload. (Value in phpser_int.h, shared with the session TU.) */
 
 /* Cumulative element budget for sub-linear tags (TAG_PACKED_AFFINE), shared
  * by encoder and decoder like MAX_DEPTH. A sub-linear tag materializes O(n)
@@ -811,7 +803,7 @@ static uint32_t enc_intern_zstr(encode_ctx *e, zend_string *zs) {
  * Values pass (TAG_STR_DICT, TAG_STR_INLINE); assoc keys pass
  * (KEY_STR, KEY_STR_INLINE). The logic is identical; only the tag bytes
  * differ, so both entry points are thin wrappers around this. */
-static zend_always_inline void enc_emit_str_tagged(
+static zend_always_inline int enc_emit_str_tagged(
     smart_str *body, encode_ctx *e, zend_string *zs,
     uint8_t dict_tag, uint8_t inline_tag)
 {
@@ -819,12 +811,12 @@ static zend_always_inline void enc_emit_str_tagged(
     if (s) {
         if (SLOT_IS_DICT(*s)) {
             emit_tag_and_varint(body, dict_tag, SLOT_DICT_IDX(*s));
-            return;
+            return 0;
         }
         /* INLINE_EMITTED — upgrade in place. */
         s->idx = enc_dict_append(e, zs);  /* writes into low 31 bits; high bit cleared */
         emit_tag_and_varint(body, dict_tag, s->idx);
-        return;
+        return 0;
     }
     /* Cache miss above HASH_MAP_THRESHOLD: content dedup might still hit. */
     if (e->dict_len >= HASH_MAP_THRESHOLD) {
@@ -833,31 +825,34 @@ static zend_always_inline void enc_emit_str_tagged(
             uint32_t idx = (uint32_t)Z_LVAL_P(hit);
             enc_seed_dict_on_hit(e, s, zs, idx);  /* s==NULL here; interned-only */
             emit_tag_and_varint(body, dict_tag, idx);
-            return;
+            return 0;
         }
     }
     /* First encounter: emit inline, mark in cache as INLINE_EMITTED so the
-     * next occurrence triggers the upgrade above. */
+     * next occurrence triggers the upgrade above. Returns 0, or -1 when the
+     * string exceeds the decoder's per-string cap (size_exceeded is set;
+     * the caller decides the placeholder). */
     if (UNEXPECTED(ZSTR_LEN(zs) > UINT32_MAX)) {
         /* Over the decoder's per-string cap: flag and skip the copy. Appending
          * the >4 GiB body first (then freeing it in phpser_encode_zval) would
-         * spike peak RSS by the string's full size for a frame we discard. No
-         * placeholder is emitted here (unlike the value-slot abort paths): this
-         * helper is shared between key and value emission, so a TAG_NULL would
-         * be structurally wrong in a key slot. A >4 GiB string is an encode-side
-         * impossibility that always sets size_exceeded and discards the frame,
-         * so this one path stays discard-dependent by design. */
+         * spike peak RSS by the string's full size for a frame we discard. */
         e->size_exceeded = 1;
-        return;
+        return -1;
     }
     smart_str_appendc(body, inline_tag);
     varint_write_u64(body, ZSTR_LEN(zs));
     smart_str_appendl(body, ZSTR_VAL(zs), ZSTR_LEN(zs));
     enc_cache_alloc_slot(e, zs)->idx = SLOT_INLINE_MARK;
+    return 0;
 }
 
 static void enc_emit_str_value(smart_str *body, encode_ctx *e, zend_string *zs) {
-    enc_emit_str_tagged(body, e, zs, TAG_STR_DICT, TAG_STR_INLINE);
+    if (enc_emit_str_tagged(body, e, zs, TAG_STR_DICT, TAG_STR_INLINE) < 0) {
+        /* The frame is discarded via size_exceeded, but keep the body
+         * structurally valid until then with a NULL placeholder so no
+         * downstream pass ever walks a short buffer. */
+        smart_str_appendc(body, TAG_NULL);
+    }
 }
 
 /* Patch a one-byte nprops placeholder at `off` with the final count, written
@@ -883,7 +878,10 @@ static void enc_patch_nprops(smart_str *body, size_t off, uint32_t nprops) {
 }
 
 static void enc_emit_str_key(smart_str *body, encode_ctx *e, zend_string *zs) {
-    enc_emit_str_tagged(body, e, zs, KEY_STR, KEY_STR_INLINE);
+    /* Keys have no placeholder kind — a TAG_NULL would be structurally wrong
+     * in a key slot — so the >4GiB key path stays discard-dependent by
+     * design: size_exceeded is set and the whole frame is dropped. */
+    (void)enc_emit_str_tagged(body, e, zs, KEY_STR, KEY_STR_INLINE);
 }
 
 /* -------------------------------------------------------------------------
@@ -1619,6 +1617,10 @@ static void enc_write_key_idx_run(smart_str *body, uint32_t *key_idx, uint32_t n
 static void enc_prebind_equal_packed_string_arrays(
     encode_ctx *e, zval **cells, uint32_t nrows)
 {
+    /* cells[1] is read below; a single-row (or empty) column has nothing to
+     * prebind. Callers only reach here with nrows>=2 today — belt and
+     * braces against a future caller passing a degenerate column. */
+    if (nrows < 2) return;
     HashTable *first = Z_ARRVAL_P(cells[0]);
     if (!HT_IS_PACKED(first)
         || first->nNumUsed != first->nNumOfElements
@@ -2340,7 +2342,7 @@ typedef struct {
     uint32_t sublinear_elems;
 } decode_ctx;
 
-enum { ALLOWED_ALL = 0, ALLOWED_NONE, ALLOWED_SET };
+/* Filter modes (ALLOWED_*) live in phpser_int.h, shared with the module TU. */
 
 /* Zend's string hash is deliberately stable and therefore craftable. Bound
  * every wire-controlled bucket walk before it becomes quadratic. Normal
@@ -2544,10 +2546,16 @@ static int dec_install_declared_slot(zend_object *obj, zend_property_info *info,
          * i_zend_check_property_type performs. The full verify call is
          * cross-DSO (PLT) and its call overhead alone is ~10% of dto decode
          * instructions; a non-reference value whose type code is already in
-         * the property's mask is trivially assignable, so only references,
-         * coercions (int→float, numeric strings), and class-typed slots need
-         * the engine. Verify semantics are unchanged for those. */
+         * the property's mask is trivially assignable — EXCEPT objects, so
+         * every IS_OBJECT value takes the full verify path. A mask hit on
+         * IS_OBJECT proves nothing about the class (Foo, ?Foo, int|Foo,
+         * Foo&Bar, enums, ...), which is exactly the hole this gates: any
+         * object into a class-typed slot always verifies. One integer
+         * compare on the hot path, predicted-taken for scalar DTO shapes,
+         * and cheaper than a type-side class test (which would also slow
+         * union-scalar slots like int|string that need no verification). */
         if (!(!Z_ISREF_P(tmp)
+                && Z_TYPE_P(tmp) != IS_OBJECT
                 && EXPECTED(ZEND_TYPE_CONTAINS_CODE(info->type, Z_TYPE_P(tmp))))
             && !zend_verify_prop_assignable_by_ref(info, tmp, /*strict*/ 1)) {
             zval_ptr_dtor(tmp);
@@ -2804,7 +2812,7 @@ static int decode_header(decode_ctx *d) {
     for (uint32_t i = 0; i < d->dict_len; i++) {
         uint64_t slen;
         if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
-        if (slen > UINT32_MAX || d->pos + slen > d->len) return -1;
+        if (slen > UINT32_MAX || slen > d->len - d->pos) return -1;
         /* Resolve against the engine's interned-string tables first. Dict
          * entries are dominated by property names, class names, and hot
          * literals — all interned in any compiled-code process. A hit means:
@@ -2901,7 +2909,7 @@ static int decode_key(decode_ctx *d, key_val *out_key) {
     if (tag == KEY_STR_INLINE) {
         uint64_t slen;
         if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
-        if (slen > UINT32_MAX || d->pos + slen > d->len) return -1;
+        if (slen > UINT32_MAX || slen > d->len - d->pos) return -1;
         out_key->kind = KV_OWNED_STR;
         out_key->str = zend_string_init(
             (const char *)d->buf + d->pos, (size_t)slen, 0);
@@ -2953,7 +2961,7 @@ static int decode_scalar_tag(decode_ctx *d, zval *out, uint8_t tag) {
         case TAG_STR_INLINE: {
             uint64_t slen;
             if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
-            if (slen > UINT32_MAX || d->pos + slen > d->len) return -1;
+            if (slen > UINT32_MAX || slen > d->len - d->pos) return -1;
             zend_string *zs = zend_string_init(
                 (const char *)d->buf + d->pos, (size_t)slen, 0);
             d->pos += slen;
@@ -3335,7 +3343,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             uint64_t class_idx, blen;
             if (varint_read_u64(d->buf, d->len, &d->pos, &class_idx) < 0) return -1;
             if (varint_read_u64(d->buf, d->len, &d->pos, &blen) < 0) return -1;
-            if (blen > UINT32_MAX || d->pos + blen > d->len) return -1;
+            if (blen > UINT32_MAX || blen > d->len - d->pos) return -1;
 
             zend_string *class_name = dec_get_class_name(d, class_idx);
             if (!class_name) return -1;
@@ -3388,7 +3396,13 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             int allowed = dec_class_allowed(d, class_idx, class_name);
             zend_class_entry *ce = allowed
                 ? dec_class_resolve(d, class_idx, class_name) : NULL;
-            if (!ce) ce = allowed ? zend_standard_class_def : PHP_IC_ENTRY;
+            /* Unknown class: decode to __PHP_Incomplete_Class with the
+             * original name preserved, exactly like a denied class — never
+             * a live stdClass with the name lost (which also silently
+             * dropped the re-encode recovery path). Uniform across OBJECT,
+             * MAGIC, and SLOTS. */
+            int known = (ce != NULL);
+            if (!ce) ce = PHP_IC_ENTRY;
 
             if (dec_ce_uninstantiable(ce)) {
                 return -1;
@@ -3398,7 +3412,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 ZVAL_NULL(out);
                 return -1;
             }
-            if (!allowed) php_store_class_name(out, class_name);
+            if (!allowed || !known) php_store_class_name(out, class_name);
             /* Register the empty object NOW, before decoding the data array.
              * A back-ref inside the data array can then resolve to this very
              * object (cycles through __serialize-class payloads). __unserialize
@@ -3539,9 +3553,22 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 return 0;
             }
 
-            /* Allowed: the layout must come from the real class. */
+            /* Allowed: the layout must come from the real class. An unknown
+             * class has no layout; consume the values into a property-less
+             * incomplete instead of hard-failing — the same hollow-SUCCESS
+             * contract as the denied+unloaded path above, so the id still
+             * claims a slot and later TAG_REFs resolve. */
             zend_class_entry *ce = dec_class_resolve(d, class_idx, class_name);
-            if (!ce) return -1;
+            if (!ce) {
+                if (dec_make_incomplete(out, class_name) < 0) return -1;
+                dec_register(d, out);
+                for (uint64_t i = 0; i < nprops; i++) {
+                    zval tmp;
+                    if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
+                    zval_ptr_dtor(&tmp);
+                }
+                return 0;
+            }
             uint32_t current_nprops = ce_table_slot_count(ce);
             if (nprops > current_nprops) return -1;
             if (dec_ce_uninstantiable(ce)) {
@@ -3615,11 +3642,14 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * normal IS_INDIRECT / dynamic-prop write path. */
             int allowed = dec_class_allowed(d, class_idx, class_name);
             zend_class_entry *ce = allowed
-                ? dec_class_resolve(d, class_idx, class_name) : PHP_IC_ENTRY;
-            /* Resolve the class. If autoloading fails or the class doesn't
-             * exist, fall back to stdClass — refusing would break round-trips
-             * of payloads written before a class was registered. */
-            if (!ce) ce = zend_standard_class_def;
+                ? dec_class_resolve(d, class_idx, class_name) : NULL;
+            /* Unknown class: __PHP_Incomplete_Class with the original name
+             * preserved (uniform with MAGIC/SLOTS). The old stdClass
+             * fallback lost the name, so a later re-encode could never
+             * recover the real class — and it diverged from SLOTS, which
+             * hard-failed the same input. */
+            int known = (ce != NULL);
+            if (!ce) ce = PHP_IC_ENTRY;
 
             if (dec_ce_uninstantiable(ce)) {
                 return -1;
@@ -3630,10 +3660,10 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * TAG_OBJECT — so a TAG_OBJECT naming such a class is adversarial
              * wire. Instantiating it and writing raw properties would bypass
              * the class's Serializable::unserialize() invariant rebuild.
-             * Native unserialize refuses this exact shape (var_unserializer.re:
-             * "if (ce->serialize != NULL && !has_unserialize) ... return 0").
-             * Only real resolved classes carry ce->serialize; incomplete /
-             * stdClass fallbacks do not, so gate on `allowed`. */
+            * Native unserialize refuses this exact shape (var_unserializer.re:
+            * "if (ce->serialize != NULL && !has_unserialize) ... return 0").
+            * Only real resolved classes carry ce->serialize; the incomplete
+            * fallback does not, so gate on `allowed`. */
             if (allowed && ce->serialize != NULL && ce->__unserialize == NULL) {
                 return -1;
             }
@@ -3642,7 +3672,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 ZVAL_NULL(out);
                 return -1;
             }
-            if (!allowed) php_store_class_name(out, class_name);
+            if (!allowed || !known) php_store_class_name(out, class_name);
             zend_object *obj = Z_OBJ_P(out);
             /* Register before decoding properties so a back-ref inside a
              * property value (cycles, shared subobjects) can resolve to this
@@ -4119,80 +4149,6 @@ static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *us
 }
 
 /* -------------------------------------------------------------------------
- * HMAC-SHA256 over framed payloads. Used by phpser_serialize_signed /
- * phpser_unserialize_signed to detect tampered cache entries when the
- * storage layer is untrusted (e.g. shared Memcached).
- *
- * Wire format for signed payloads: [raw frame bytes][32-byte HMAC tag].
- * The tag is computed over the raw frame only. Separate function names
- * (vs. a flag in unserialize) mean the caller's intent is explicit at the
- * call site — no magic-byte detection, no chance of accidentally accepting
- * an unsigned payload through the signed path.
- * ------------------------------------------------------------------------- */
-
-/* Cached at MINIT. ext/hash is mandatory since PHP 7.4 and lookup never
- * fails for a builtin algo; we still null-check defensively. */
-static const php_hash_ops *phpser_sha256_ops = NULL;
-
-/* HMAC-SHA256 of `data` under `key`. Writes a 32-byte tag to `out`.
- * Returns 0 on success, -1 if SHA256 ops aren't available. */
-static int phpser_hmac_sha256(
-    const unsigned char *key, size_t key_len,
-    const unsigned char *data, size_t data_len,
-    unsigned char out[PHPSER_HMAC_TAG_LEN])
-{
-    const php_hash_ops *ops = phpser_sha256_ops;
-    if (UNEXPECTED(!ops)) return -1;
-    size_t bs = ops->block_size;
-    /* SHA256 block size is 64 — small enough for a stack buffer. */
-    unsigned char K[64];
-    if (UNEXPECTED(bs > sizeof(K))) return -1;
-
-    void *ctx = emalloc(ops->context_size);
-    if (key_len > bs) {
-        ops->hash_init(ctx, NULL);
-        ops->hash_update(ctx, key, key_len);
-        ops->hash_final(K, ctx);
-        memset(K + ops->digest_size, 0, bs - ops->digest_size);
-    } else {
-        memcpy(K, key, key_len);
-        if (key_len < bs) memset(K + key_len, 0, bs - key_len);
-    }
-    /* Inner: H((K^ipad) || data) */
-    for (size_t i = 0; i < bs; i++) K[i] ^= 0x36;
-    ops->hash_init(ctx, NULL);
-    ops->hash_update(ctx, K, bs);
-    ops->hash_update(ctx, data, data_len);
-    ops->hash_final(out, ctx);
-    /* Outer: H((K^opad) || inner) */
-    for (size_t i = 0; i < bs; i++) K[i] ^= (0x36 ^ 0x5c);
-    ops->hash_init(ctx, NULL);
-    ops->hash_update(ctx, K, bs);
-    ops->hash_update(ctx, out, ops->digest_size);
-    ops->hash_final(out, ctx);
-    /* Wipe key material before returning. After the outer XOR pass K
-     * still holds K^opad — XOR with 0x5c…5c recovers K. A separate
-     * stack-read primitive elsewhere in the process would otherwise
-     * leak the signing key. Also wipe the hash context (SHA256 internal
-     * state derived from the key) before freeing. ZEND_SECURE_ZERO ==
-     * explicit_bzero on glibc / RtlSecureZeroMemory on Windows — the
-     * compiler cannot optimize it away. */
-    ZEND_SECURE_ZERO(K, sizeof(K));
-    ZEND_SECURE_ZERO(ctx, ops->context_size);
-    efree(ctx);
-    return 0;
-}
-
-/* Constant-time byte compare. Returns 1 if all `n` bytes are equal.
- * Mirrors the pattern PHP's hash_equals() uses internally — avoids the
- * early-exit timing leak that memcmp would have. */
-static int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n) {
-    unsigned char r = 0;
-    for (size_t i = 0; i < n; i++) r |= (unsigned char)(a[i] ^ b[i]);
-    return r == 0;
-}
-
-/* -------------------------------------------------------------------------
  * Public functions.
  * ------------------------------------------------------------------------- */
 
@@ -4205,12 +4161,6 @@ static int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n
  *
  * phpser_enc_status explains a NULL return so the session encoder does not
  * blame "depth" for a size or exception abort. */
-typedef enum {
-    PHPSER_ENC_OK = 0,
-    PHPSER_ENC_DEPTH,
-    PHPSER_ENC_SIZE,
-    PHPSER_ENC_EXCEPTION,
-} phpser_enc_status;
 
 /* Shared cleanup for depth/size rejects: free body, destroy ctx (which can
  * run destructors), reclassify as EXCEPTION if cleanup threw, optionally
@@ -4239,7 +4189,7 @@ static zend_string *enc_finish_overflow(
     return NULL;
 }
 
-static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
+zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
                                           phpser_enc_status *status) {
     encode_ctx ctx;
     enc_ctx_init(&ctx);
@@ -4266,6 +4216,22 @@ static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
          * factor; the clamp bounds the upfront zeroing for huge arrays,
          * where geometric growth takes over past the initial allocation.
          * Wire bytes are unaffected — this is allocation strategy only. */
+        if (n > 64) {
+            uint32_t want = n < 8192 ? n * 4 : 32768;
+            uint32_t cap = 128;
+            while (cap < want) cap <<= 1;
+            ctx.icache_init_cap = cap;
+        }
+    } else if (Z_TYPE_P(value) == IS_OBJECT) {
+        /* Same intern-cache seeding for a top-level object: every distinct
+         * property name (and class name) occupies a slot. Count declared
+         * slots without materializing plus any dynamic table — an
+         * over-estimate only costs zeroed bytes, wire output is unaffected. */
+        zend_class_entry *sce = Z_OBJCE_P(value);
+        uint32_t n = sce->default_properties_count;
+        if (Z_OBJ_P(value)->properties) {
+            n += zend_hash_num_elements(Z_OBJ_P(value)->properties);
+        }
         if (n > 64) {
             uint32_t want = n < 8192 ? n * 4 : 32768;
             uint32_t cap = 128;
@@ -4345,7 +4311,7 @@ static zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
     return out.s;
 }
 
-static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
+zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
     return phpser_encode_zval_ex(value, throw_on_overflow, NULL);
 }
 
@@ -4353,10 +4319,12 @@ static zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
  * -1 on any framing/buffer error. On error, `out` is set to NULL.
  *
  * allowed_mode + allowed_set control which classes can decode normally; the
- * rest land in __PHP_Incomplete_Class. NULL/ALLOWED_ALL means no filter. */
-static int phpser_decode_buf_opts(
+ * rest land in __PHP_Incomplete_Class. NULL/ALLOWED_ALL means no filter.
+ * require_exact rejects trailing bytes after a complete value; the unsigned
+ * entry point leaves it off (historical leniency), signed + session pass it. */
+int phpser_decode_buf_opts(
     const char *str, size_t str_len, zval *out,
-    int allowed_mode, HashTable *allowed_set)
+    int allowed_mode, HashTable *allowed_set, bool require_exact)
 {
     decode_ctx d = {0};
     d.buf = (const uint8_t *)str;
@@ -4370,6 +4338,18 @@ static int phpser_decode_buf_opts(
         return -1;
     }
     if (decode_value(&d, out) < 0) {
+        zval_ptr_dtor(out);
+        ZVAL_NULL(out);
+        decode_destroy(&d);
+        return -1;
+    }
+    /* Trailing garbage after a complete value: the unsigned path stays
+     * lenient (historical behavior, pinned by tests), but signed and
+     * session decodes require exact consumption — otherwise the HMAC (or
+     * the store framing) covers bytes the decoder never looked at. Fail
+     * before any hook runs so a suffixed payload can't smuggle values
+     * past verification into __wakeup/__unserialize. */
+    if (require_exact && UNEXPECTED(d.pos != d.len)) {
         zval_ptr_dtor(out);
         ZVAL_NULL(out);
         decode_destroy(&d);
@@ -4431,434 +4411,3 @@ done:
     return 0;
 }
 
-#ifdef HAVE_PHP_SESSION
-/* Back-compat wrapper for the session handler, which doesn't take options. */
-static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
-    return phpser_decode_buf_opts(str, str_len, out, ALLOWED_ALL, NULL);
-}
-#endif
-
-PHP_FUNCTION(phpser_serialize) {
-    zval *value;
-    ZEND_PARSE_PARAMETERS_START(1, 1)
-        Z_PARAM_ZVAL(value)
-    ZEND_PARSE_PARAMETERS_END();
-    zend_string *out = phpser_encode_zval(value, /* throw_on_overflow */ true);
-    if (UNEXPECTED(!out)) {
-        RETURN_THROWS();  /* depth-cap exception already pending */
-    }
-    RETVAL_STR(out);
-}
-
-/* -------------------------------------------------------------------------
- * Session serializer integration. Gated on HAVE_PHP_SESSION (set by config.m4
- * when phpize detects the session extension). Compiled out under the local
- * dev Makefile, which doesn't define the macro.
- * ------------------------------------------------------------------------- */
-
-#ifdef HAVE_PHP_SESSION
-PS_SERIALIZER_ENCODE_FUNC(phpser) {
-    /* PS(http_session_vars) is the $_SESSION zval reference. Deref before
-     * encoding so the wire format stores a plain array, not IS_REFERENCE. */
-    zval *session_vars = &PS(http_session_vars);
-    if (Z_TYPE_P(session_vars) == IS_REFERENCE) {
-        session_vars = Z_REFVAL_P(session_vars);
-    }
-    /* throw_on_overflow=false: the session auto-save runs at request
-     * shutdown with no execution frame, where a thrown exception surfaces as
-     * an uncaught fatal the hook can't intercept. So encode returns NULL
-     * without throwing on over-depth; we degrade to the E_WARNING that
-     * session.c itself uses for write failures. php_session_save_current_state
-     * writes ZSTR_EMPTY_ALLOC() on a NULL result (the empty write is
-     * unavoidable through the serializer-hook contract, and a >MAX_DEPTH
-     * $_SESSION can't round-trip regardless). */
-    phpser_enc_status status = PHPSER_ENC_OK;
-    zend_string *out = phpser_encode_zval_ex(session_vars,
-                                             /* throw_on_overflow */ false, &status);
-    if (UNEXPECTED(!out)) {
-        switch (status) {
-        case PHPSER_ENC_SIZE:
-            php_error_docref(NULL, E_WARNING,
-                "phpser: $_SESSION not serialized — a value exceeds the 4 GiB "
-                "wire-format limit");
-            break;
-        case PHPSER_ENC_EXCEPTION:
-            /* A __serialize/__sleep hook in the session graph threw. The
-             * exception is pending; don't overwrite it, just decline to
-             * persist a partial graph. */
-            php_error_docref(NULL, E_WARNING,
-                "phpser: $_SESSION not serialized — a serialization hook threw");
-            break;
-        case PHPSER_ENC_DEPTH:
-        default:
-            php_error_docref(NULL, E_WARNING,
-                "phpser: $_SESSION not serialized — nesting depth exceeds %d",
-                MAX_DEPTH);
-            break;
-        }
-        return NULL;
-    }
-    return out;
-}
-
-PS_SERIALIZER_DECODE_FUNC(phpser) {
-    zval decoded;
-    if (vallen == 0) {
-        /* A brand-new session reads back as an empty string from storage.
-         * PHP's native serializers treat that as an empty session; feeding
-         * it to the decoder fails the version-byte check (FAILURE), which
-         * makes the engine emit "Failed to decode session object" and
-         * destroy the session on every first request. Start empty instead. */
-        array_init(&decoded);
-    } else if (phpser_decode_buf(val, vallen, &decoded) < 0) {
-        return FAILURE;
-    } else if (Z_TYPE(decoded) != IS_ARRAY) {
-        /* Sessions expect an array on the way back; if the payload decoded
-         * to something else, swap in an empty array so PS(http_session_vars)
-         * stays sane for $_SESSION. */
-        zval_ptr_dtor(&decoded);
-        array_init(&decoded);
-    }
-    if (!Z_ISUNDEF(PS(http_session_vars))) {
-        zval_ptr_dtor(&PS(http_session_vars));
-    }
-    ZVAL_NEW_REF(&PS(http_session_vars), &decoded);
-    Z_ADDREF_P(&PS(http_session_vars));
-    /* Re-bind the userland $_SESSION symbol to the new reference. Without
-     * this, user code reads the previous request's array via the stale
-     * symbol-table entry — the PS(http_session_vars) slot is updated but
-     * $_SESSION still aliases the old one. PHP's own session decoders
-     * (php_serialize, php) do this. See session.c:986 (PS_SERIALIZER_
-     * DECODE_FUNC(php_serialize)). */
-    zend_string *var_name = ZSTR_INIT_LITERAL("_SESSION", 0);
-    zend_hash_update_ind(&EG(symbol_table), var_name, &PS(http_session_vars));
-    zend_string_release_ex(var_name, 0);
-    return SUCCESS;
-}
-#endif /* HAVE_PHP_SESSION */
-
-/* Parse a phpser_unserialize options array. On success, *out_set may be
- * non-NULL and the caller must free it. Returns -1 on type error (an
- * exception is already thrown). param_idx is the arg position for the
- * error message (2 for unserialize, 3 for unserialize_signed); fname is
- * the calling function's name for the TypeError text. */
-static int parse_unserialize_options(
-    HashTable *options_ht, int param_idx, const char *fname,
-    int *out_mode, HashTable **out_set)
-{
-    *out_mode = ALLOWED_ALL;
-    *out_set = NULL;
-    if (!options_ht) return 0;
-    zval *ac = zend_hash_str_find_deref(options_ht, "allowed_classes",
-                                         sizeof("allowed_classes") - 1);
-    if (!ac) return 0;
-    if (Z_TYPE_P(ac) == IS_FALSE) { *out_mode = ALLOWED_NONE; return 0; }
-    if (Z_TYPE_P(ac) == IS_TRUE)  { *out_mode = ALLOWED_ALL;  return 0; }
-    if (Z_TYPE_P(ac) == IS_ARRAY) {
-        /* Build a lowercased-name lookup set. PHP class names are
-         * case-insensitive; storing pre-lowered keeps the per-object
-         * filter check to one zend_hash_exists. */
-        *out_mode = ALLOWED_SET;
-        *out_set = emalloc(sizeof(HashTable));
-        zend_hash_init(*out_set, zend_hash_num_elements(Z_ARRVAL_P(ac)),
-                       NULL, NULL, 0);
-        zval *cn;
-        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ac), cn) {
-            ZVAL_DEREF(cn);
-            if (Z_TYPE_P(cn) != IS_STRING) {
-                /* Match PHP's native unserialize: non-string entry in
-                 * the allowed_classes array is a TypeError. Silently
-                 * skipping would let a misconfigured allowlist pass
-                 * unflagged. */
-                zend_hash_destroy(*out_set);
-                efree(*out_set);
-                *out_set = NULL;
-                zend_type_error(
-                    "%s(): allowed_classes option must "
-                    "be an array of class names, %s given",
-                    fname,
-#if PHP_VERSION_ID >= 80300
-                    zend_zval_value_name(cn));
-#else
-                    zend_zval_type_name(cn));
-#endif
-                return -1;
-            }
-            zend_string *lc = zend_string_tolower(Z_STR_P(cn));
-            zval one; ZVAL_TRUE(&one);
-            zend_hash_add(*out_set, lc, &one);
-            zend_string_release(lc);
-        } ZEND_HASH_FOREACH_END();
-        return 0;
-    }
-    zend_argument_value_error(param_idx,
-        "allowed_classes option must be array or bool");
-    return -1;
-}
-
-PHP_FUNCTION(phpser_unserialize) {
-    char *str;
-    size_t str_len;
-    HashTable *options_ht = NULL;
-    ZEND_PARSE_PARAMETERS_START(1, 2)
-        Z_PARAM_STRING(str, str_len)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_ARRAY_HT(options_ht)
-    ZEND_PARSE_PARAMETERS_END();
-
-    int allowed_mode;
-    HashTable *allowed_set;
-    if (parse_unserialize_options(options_ht, 2, "phpser_unserialize",
-                                  &allowed_mode, &allowed_set) < 0) {
-        RETURN_THROWS();
-    }
-
-    phpser_decode_buf_opts(str, str_len, return_value, allowed_mode, allowed_set);
-
-    if (allowed_set) {
-        zend_hash_destroy(allowed_set);
-        efree(allowed_set);
-    }
-}
-
-PHP_FUNCTION(phpser_serialize_signed) {
-    zval *value;
-    char *key;
-    size_t key_len;
-    ZEND_PARSE_PARAMETERS_START(2, 2)
-        Z_PARAM_ZVAL(value)
-        Z_PARAM_STRING(key, key_len)
-    ZEND_PARSE_PARAMETERS_END();
-
-    /* An empty key reduces HMAC to a fixed, keyless tag anyone can compute,
-     * silently downgrading the signed path to forgeable. Reject loudly rather
-     * than emit an unprotected payload. */
-    if (key_len == 0) {
-        zend_throw_exception(zend_ce_exception,
-            "phpser: signing key must not be empty", 0);
-        RETURN_THROWS();
-    }
-
-    zend_string *frame = phpser_encode_zval(value, /* throw_on_overflow */ true);
-    if (UNEXPECTED(!frame)) {
-        RETURN_THROWS();  /* depth-cap exception already pending */
-    }
-    /* Reallocate to add tag space. zend_string_extend grows the underlying
-     * allocation and bumps ZSTR_LEN. The 32 trailing bytes become the HMAC. */
-    size_t frame_len = ZSTR_LEN(frame);
-    zend_string *signed_str = zend_string_extend(frame, frame_len + PHPSER_HMAC_TAG_LEN, 0);
-    unsigned char *tag = (unsigned char *)ZSTR_VAL(signed_str) + frame_len;
-    if (phpser_hmac_sha256(
-            (const unsigned char *)key, key_len,
-            (const unsigned char *)ZSTR_VAL(signed_str), frame_len,
-            tag) < 0) {
-        zend_string_release(signed_str);
-        zend_throw_exception(zend_ce_exception,
-            "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
-        RETURN_THROWS();
-    }
-    ZSTR_VAL(signed_str)[frame_len + PHPSER_HMAC_TAG_LEN] = '\0';
-    RETURN_STR(signed_str);
-}
-
-PHP_FUNCTION(phpser_unserialize_signed) {
-    char *payload;
-    size_t payload_len;
-    char *key;
-    size_t key_len;
-    HashTable *options_ht = NULL;
-    ZEND_PARSE_PARAMETERS_START(2, 3)
-        Z_PARAM_STRING(payload, payload_len)
-        Z_PARAM_STRING(key, key_len)
-        Z_PARAM_OPTIONAL
-        Z_PARAM_ARRAY_HT(options_ht)
-    ZEND_PARSE_PARAMETERS_END();
-
-    /* An empty key makes the HMAC keyless and forgeable; reject before any
-     * verify work so a misconfigured caller fails loud instead of accepting
-     * attacker-signed bytes. Matches the serialize_signed guard. */
-    if (key_len == 0) {
-        zend_throw_exception(zend_ce_exception,
-            "phpser: signing key must not be empty", 0);
-        RETURN_THROWS();
-    }
-
-    /* Payload must include at least the 32-byte tag. Anything shorter is
-     * either truncated or never signed — reject without leaking which. */
-    if (payload_len < PHPSER_HMAC_TAG_LEN) {
-        zend_throw_exception(zend_ce_exception,
-            "phpser: signed payload too short", 0);
-        RETURN_THROWS();
-    }
-    size_t frame_len = payload_len - PHPSER_HMAC_TAG_LEN;
-    unsigned char expected[PHPSER_HMAC_TAG_LEN];
-    if (phpser_hmac_sha256(
-            (const unsigned char *)key, key_len,
-            (const unsigned char *)payload, frame_len,
-            expected) < 0) {
-        zend_throw_exception(zend_ce_exception,
-            "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
-        RETURN_THROWS();
-    }
-    if (!phpser_ct_eq(expected,
-                      (const unsigned char *)payload + frame_len,
-                      PHPSER_HMAC_TAG_LEN)) {
-        zend_throw_exception(zend_ce_exception,
-            "phpser: signature verification failed", 0);
-        RETURN_THROWS();
-    }
-
-    int allowed_mode;
-    HashTable *allowed_set;
-    if (parse_unserialize_options(options_ht, 3, "phpser_unserialize_signed",
-                                  &allowed_mode, &allowed_set) < 0) {
-        RETURN_THROWS();
-    }
-
-    int rc = phpser_decode_buf_opts(payload, frame_len, return_value, allowed_mode,
-                                    allowed_set);
-
-    if (allowed_set) {
-        zend_hash_destroy(allowed_set);
-        efree(allowed_set);
-    }
-
-    /* A valid HMAC over a body that then fails to decode (corruption, or a
-     * class the payload needs was removed since it was signed) is an error,
-     * not data — throw rather than return a silent null the caller can't
-     * distinguish from a legitimately-signed null (which decodes as rc==0).
-     * Mirrors the signature-failure throw above. If the decode already left an
-     * exception pending (e.g. a __wakeup hook threw), let that propagate. */
-    if (rc < 0) {
-        if (!EG(exception)) {
-            zend_throw_exception(zend_ce_exception,
-                "phpser: signed payload failed to decode", 0);
-        }
-        RETURN_THROWS();
-    }
-}
-
-/* -------------------------------------------------------------------------
- * Module plumbing.
- * ------------------------------------------------------------------------- */
-
-#include "phpser_arginfo.h"
-
-static PHP_MINIT_FUNCTION(phpser) {
-#if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
-    /* Populate our TLS slot from the host PHP's thread-local state pointer.
-     * Required for dynamically-loaded extensions under ZTS — otherwise
-     * macros that touch CG/EG via the TSRMLS cache crash on lookup.
-     *
-     * The OR covers both build paths: phpize-generated config.m4 defines
-     * COMPILE_DL_<EXTNAME>; the hand-rolled Makefile defines the generic
-     * ZEND_COMPILE_DL_EXT. Without this widening, a ZTS build via the
-     * Makefile path would compile but crash on first CG/EG access. */
-    ZEND_TSRMLS_CACHE_UPDATE();
-#endif
-#ifdef HAVE_PHP_SESSION
-    /* Register session.serialize_handler = phpser. Best-effort: the session
-     * extension may not be loaded (rare in shared-build setups), and we
-     * tolerate that case silently. */
-    php_session_register_serializer(
-        PHP_PHPSER_EXTNAME,
-        PS_SERIALIZER_ENCODE_NAME(phpser),
-        PS_SERIALIZER_DECODE_NAME(phpser));
-#endif
-    /* Cache SHA256 ops for HMAC signing. ext/hash is mandatory since PHP
-     * 7.4 so this never fails in normal builds; we still null-check at
-     * call time. php_hash_fetch_ops only reads the algo name for the table
-     * lookup — it doesn't retain the pointer — so the lookup zend_string is
-     * a transient stack-local released immediately, not a module global. */
-    zend_string *algo = zend_string_init("sha256", sizeof("sha256") - 1, 0);
-    phpser_sha256_ops = php_hash_fetch_ops(algo);
-    zend_string_release(algo);
-    return SUCCESS;
-}
-
-static PHP_MSHUTDOWN_FUNCTION(phpser) {
-    phpser_sha256_ops = NULL;
-    return SUCCESS;
-}
-
-#if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
-/* Refresh this thread's TLS-cache slot every request. MINIT's
- * ZEND_TSRMLS_CACHE_UPDATE() only populates the cache on the thread that
- * loaded the module; under a threaded ZTS SAPI (Windows ships TS builds)
- * worker threads run RINIT, not MINIT, and would otherwise touch CG/EG
- * through an unpopulated cache and crash. Mirrors the canonical ext_skel
- * skeleton and the widened DL guard used in MINIT / get_module().
- *
- * The whole function — and its module-entry slot below — is compiled out on
- * NTS builds (php-fpm and friends), so those register no RINIT and pay zero
- * per-request cost. Only threaded ZTS DL builds, which actually need the
- * per-thread refresh, carry it. */
-static PHP_RINIT_FUNCTION(phpser) {
-    ZEND_TSRMLS_CACHE_UPDATE();
-    return SUCCESS;
-}
-#endif
-
-static PHP_MINFO_FUNCTION(phpser) {
-    php_info_print_table_start();
-    php_info_print_table_row(2, "phpser support", "enabled");
-    php_info_print_table_row(2, "version", PHP_PHPSER_VERSION);
-#ifdef HAVE_PHP_SESSION
-    php_info_print_table_row(2, "session.serialize_handler", "available");
-#else
-    php_info_print_table_row(2, "session.serialize_handler", "disabled (compiled without session)");
-#endif
-    php_info_print_table_end();
-}
-
-/* Declare session as an OPTIONAL dependency. The runtime declaration
- * (vs. only config.m4's PHP_ADD_EXTENSION_DEP) is what controls MINIT
- * ordering — without it, alphabetical conf.d load order can put our
- * MINIT before session's, and php_session_register_serializer runs
- * against a session module that isn't ready yet.
- * See ~/ai/wiki/architecture/php-extension-c-conventions.md "Cross-extension
- * class lookup at MINIT" for the failure mode. */
-static const zend_module_dep phpser_deps[] = {
-    /* hash is mandatory since PHP 7.4 — we use its SHA256 ops for the
-     * signed-payload HMAC. ZEND_MOD_REQUIRED forces the engine to load
-     * hash's MINIT before ours so phpser_sha256_ops resolves cleanly. */
-    ZEND_MOD_REQUIRED("hash")
-#ifdef HAVE_PHP_SESSION
-    ZEND_MOD_OPTIONAL("session")
-#endif
-    ZEND_MOD_END
-};
-
-zend_module_entry phpser_module_entry = {
-    STANDARD_MODULE_HEADER_EX,
-    NULL,
-    phpser_deps,
-    PHP_PHPSER_EXTNAME,
-    ext_functions,
-    PHP_MINIT(phpser),
-    PHP_MSHUTDOWN(phpser),
-#if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
-    PHP_RINIT(phpser), NULL,
-#else
-    NULL, NULL,   /* no RINIT on NTS builds: zero per-request cost */
-#endif
-    PHP_MINFO(phpser),
-    PHP_PHPSER_VERSION,
-    STANDARD_MODULE_PROPERTIES,
-};
-
-/* Under ZTS, a dynamically-loaded extension needs its own TLS slot cache
- * because the host PHP's per-thread state pointer isn't accessible
- * through static linkage. Config defines ZEND_ENABLE_STATIC_TSRMLS_CACHE;
- * the matching cache_define + cache_update at MINIT completes the wiring.
- * On NTS builds both macros expand to nothing. */
-ZEND_TSRMLS_CACHE_DEFINE()
-
-/* get_module() is the dynamic-loader entry point; emit it only for a shared
- * build. A hypothetical static link into the PHP binary would otherwise get
- * a duplicate/clashing symbol. The OR mirrors the MINIT TSRMLS guard so the
- * hand-rolled dev Makefile (which defines ZEND_COMPILE_DL_EXT rather than
- * COMPILE_DL_PHPSER) still produces a loadable .so for `make test`. */
-#if defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)
-ZEND_GET_MODULE(phpser)
-#endif

@@ -52,6 +52,48 @@ $deep_bad = $H . str_repeat("\x07\x01", 1000) . "\x00"; // 1000 deep -> reject
 echo (phpser_unserialize($deep_ok) !== null) ? "decode_deep_ok OK\n" : "decode_deep_ok FAIL\n";
 echo (phpser_unserialize($deep_bad) === null) ? "decode_deep_reject OK\n" : "decode_deep_reject FAIL\n";
 
+// 5. String-leaf encode boundary: leaf packability shifts the fit/throw edge
+//    by one vs the int leaf above (nest(512) fits there). A non-packable
+//    "leaf" string nests one level less before the innermost array trips
+//    the cap — pin the empirical edge, not the mechanism.
+function snest(int $d) {
+    $a = "leaf";
+    for ($i = 0; $i < $d; $i++) { $a = [$a]; }
+    return $a;
+}
+$s = phpser_serialize(snest(511));
+$rt = phpser_unserialize($s);
+$probe = $rt; $d = 0;
+while (is_array($probe) && $d < 600) { $probe = $probe[0]; $d++; }
+echo ($probe === "leaf" && $d === 511) ? "strleaf511 roundtrip OK\n" : "strleaf511 roundtrip FAIL d=$d\n";
+try {
+    phpser_serialize(snest(512));
+    echo "strleaf512 throw FAIL (no exception)\n";
+} catch (\Exception $e) {
+    echo (strpos($e->getMessage(), "maximum nesting depth") !== false)
+        ? "strleaf512 throw OK\n" : "strleaf512 throw FAIL: {$e->getMessage()}\n";
+}
+
+// 6. Decode-side cap under a v2 header: same fit/reject shape as (4) — the
+//    version byte is a minimum-reader signal, not a second depth budget.
+$H2 = "\x02\x00";
+$v2_ok  = $H2 . str_repeat("\x07\x01", 400) . "\x00";
+$v2_bad = $H2 . str_repeat("\x07\x01", 1000) . "\x00";
+echo (phpser_unserialize($v2_ok) !== null) ? "decode_v2_deep_ok OK\n" : "decode_v2_deep_ok FAIL\n";
+echo (phpser_unserialize($v2_bad) === null) ? "decode_v2_deep_reject OK\n" : "decode_v2_deep_reject FAIL\n";
+
+// 7. NEW_REF chains collapse to their inner value, so a shallow chain is no
+//    depth workout at all — but a 1000-deep chain over a LONG must still
+//    reject to NULL (decode cap) warning-free, never a partial ref chain.
+echo (phpser_unserialize("\x01\x00\x11\x03\x02") === 1) ? "newref_single OK\n" : "newref_single FAIL\n";
+$warn097 = [];
+set_error_handler(function (int $no, string $str) use (&$warn097): bool {
+    $warn097[] = $str;
+    return true;
+});
+$rt = phpser_unserialize("\x01\x00" . str_repeat("\x11", 1000) . "\x03\x02");
+restore_error_handler();
+echo ($rt === null && $warn097 === []) ? "newref_deep_reject OK\n" : "newref_deep_reject FAIL\n";
 ?>
 --EXPECT--
 depth512 roundtrip OK
@@ -59,3 +101,9 @@ depth513 throw OK
 signed_deep throw OK
 decode_deep_ok OK
 decode_deep_reject OK
+strleaf511 roundtrip OK
+strleaf512 throw OK
+decode_v2_deep_ok OK
+decode_v2_deep_reject OK
+newref_single OK
+newref_deep_reject OK

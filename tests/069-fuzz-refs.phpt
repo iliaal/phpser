@@ -47,14 +47,19 @@ $rt = phpser_unserialize("\x01\x00\x11\x10\x00");
 // a tautology that would pass for any result, including a future crash.
 echo ($rt === null) ? "newref_self OK\n" : "newref_self FAIL\n";
 
-// --- TAG_NEW_REF nested deeply: depth bomb. Our decoder has no explicit
-// max-depth on the decode side, but the C stack frame per recursion is
-// small. 256 nested newrefs over TAG_NULL must not crash; the resulting
-// zval is a chain of refs that PHP shows as &NULL after one auto-deref.
-// We just assert no crash by surviving to the next line. ---
+// --- TAG_NEW_REF nested deeply: a NEW_REF chain flattens to its inner value
+// (NULL here), so the value alone is a weak oracle — pin NULL plus a clean
+// warning slate instead of @-suppressing. Survival to the next line pins
+// no-crash; the handler pins warning-freedom.
 $buf = "\x01\x00" . str_repeat("\x11", 256) . "\x00";
-@phpser_unserialize($buf);  // must not crash; type is implementation-detail
-echo "newref_deep OK\n";
+$warn069 = [];
+set_error_handler(function (int $no, string $str) use (&$warn069): bool {
+    $warn069[] = $str;
+    return true;
+});
+$rt = phpser_unserialize($buf);
+restore_error_handler();
+echo ($rt === null && $warn069 === []) ? "newref_deep OK\n" : "newref_deep FAIL\n";
 
 // --- Garbage tag inside otherwise valid frame ---
 $rt = phpser_unserialize("\x01\x00\xff");

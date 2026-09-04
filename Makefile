@@ -29,7 +29,7 @@ CFLAGS := \
 
 LDFLAGS := -shared
 
-SRCS := phpser.c
+SRCS := phpser.c phpser_hmac.c phpser_session.c phpser_module.c
 OBJS := $(SRCS:.c=.o)
 
 $(TARGET): $(OBJS) | modules

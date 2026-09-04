@@ -28,15 +28,19 @@ pointers across user code:
 
 On a release build each turns into a freed-heap read that valgrind/ASAN flags;
 without instrumentation the assertions still hold (encode completes, output
-round-trips). The scenario cannot run on a debug build: the misbehaving SPL
-write to the refcount>1 storage trips the engine's own HT_ASSERT_RC1 (active
-only under ZEND_DEBUG) and aborts before the walk continues, so the test skips
-there. The duplicate-path correctness that a debug/ASAN lane CAN exercise (no
-in-place SPL write) lives in test 128.
+round-trips).
+Lane matrix:
+  release / valgrind / ASAN  — this file (in-place SPL sinks below).
+  debug (ZEND_DEBUG)        — skipped here: the misbehaving SPL write to the
+    refcount>1 storage trips the engine's own HT_ASSERT_RC1 and aborts before
+    the walk continues. The duplicate-path correctness a debug/ASAN lane CAN
+    exercise (shared nested tables, hole compaction, no in-place SPL write)
+    lives in test 128, including the debug-safe ArrayObject dup-isolation
+    variant.
 --SKIPIF--
 <?php
 if (!extension_loaded("phpser")) die("skip phpser not loaded");
-if (PHP_DEBUG) die("skip debug build aborts on HT_ASSERT_RC1 before the walk; release/valgrind only");
+if (PHP_DEBUG) die("skip debug build aborts on HT_ASSERT_RC1 before the walk; release/valgrind only (see lane matrix above; debug coverage lives in test 128)");
 ?>
 --FILE--
 <?php

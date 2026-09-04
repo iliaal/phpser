@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Class-typed slots are now verified on decode. A payload smuggling a wrong-class
+  object into a typed property is rejected instead of installed silently.
+- Session reads of scalar or object payloads now fail instead of silently starting
+  an empty session. The engine logs the failure and destroys the session.
+- Signed and session payloads with trailing bytes are now rejected. Unsigned decode
+  still tolerates them.
+
+### Fixed
+
+- Unknown classes now decode to `__PHP_Incomplete_Class` with the name preserved.
+  Positional DTOs with an unavailable class decode to a property-less incomplete.
+- Failed session encodes from coder limits persist a tombstone marker, so the next
+  read fails loudly instead of resuming an empty session.
+- `SECURITY.md` supported versions now track 0.6.x. The README documents the
+  corrupt-input triple signal, the encode memory contract, and the id-claim rule.
+
+### Changed
+
+- `bench.php` now matches the published methodology: 35 timed reps, a warmup pass,
+  GC held off during timing, median reported with IQR spread.
+
+### For contributors
+
+- Oracle rollup: 075 asserts warning-free null, 102 pins the pre-mutation snapshot,
+  060/099 gain truncation/throw canaries, 097 pins v2 boundaries, 080 covers sessions.
+
 ## [0.6.1] - 2026-08-30
 
 ### Security

@@ -101,11 +101,19 @@ $s1 = phpser_serialize_signed($value, $key);
 $s2 = phpser_serialize_signed($value, $key);
 echo ($s1 === $s2) ? "deterministic OK\n" : "deterministic FAIL\n";
 
-// --- Signed payload through unsigned unserialize: garbage trail (the HMAC
-// looks like more data to the unsigned decoder). Should NOT throw, just
-// produce some value or NULL — never crash. ---
-$rt_unsigned = @phpser_unserialize($sig);
-echo "no_crash_unsigned_path OK\n";
+// --- Signed payload through unsigned unserialize: the HMAC looks like more
+// data to the unsigned decoder, which reads the first value and stops
+// (trailing-tolerant, like 069 extra_data). Must NOT throw, must NOT warn,
+// must NOT crash — and the leading value must survive intact.
+$warn074 = [];
+set_error_handler(function (int $no, string $str) use (&$warn074): bool {
+    $warn074[] = $str;
+    return true;
+});
+$rt_unsigned = phpser_unserialize($sig);
+restore_error_handler();
+echo ($rt_unsigned === $value && $warn074 === [])
+    ? "no_crash_unsigned_path OK\n" : "no_crash_unsigned_path FAIL\n";
 
 // --- allowed_classes still works in signed path. ---
 class Approved { public int $n = 7; }

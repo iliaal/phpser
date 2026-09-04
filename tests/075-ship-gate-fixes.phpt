@@ -83,11 +83,18 @@ echo $ok ? "cr002_defer_queue OK\n" : "cr002_defer_queue FAIL\n";
 // Decoder must reject (or terminate) without crash.
 // =====================================================================
 $buf = "\x01\x00" . str_repeat("\x11", 5000) . "\x00";
-$rt = @phpser_unserialize($buf);
-// Depth cap kicks in; deep nesting is rejected. *Some* value comes back
-// (NULL at the truncation point, or an UNDEF-equivalent). Critical
-// assertion: we survived.
-echo "cr003_depth_cap OK\n";
+// A NEW_REF chain over NULL flattens to NULL even shallow, so the value
+// alone cannot prove the cap fired — but the cap path must also reject to
+// NULL (never a partial ref chain), stay warning-free, and survive. Pin
+// all three; no @-suppression (a warning would escape the handler below).
+$warn075 = [];
+set_error_handler(function (int $no, string $str) use (&$warn075): bool {
+    $warn075[] = $str;
+    return true;
+});
+$rt = phpser_unserialize($buf);
+restore_error_handler();
+echo ($rt === null && $warn075 === []) ? "cr003_depth_cap OK\n" : "cr003_depth_cap FAIL\n";
 
 // Cap is high enough for legitimate payloads (200 nested arrays).
 $deep = "leaf";

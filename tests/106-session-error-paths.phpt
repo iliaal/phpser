@@ -1,5 +1,5 @@
 --TEST--
-phpser: session handler error arms — encode hook throws, non-array root decodes to an empty session
+phpser: session handler error arms — encode hook throws, non-array root fails the read
 --EXTENSIONS--
 phpser
 session
@@ -38,13 +38,15 @@ try {
 }
 $_SESSION = [];   // clear so the request-shutdown auto-save doesn't re-encode it
 
-// (2) A payload that decodes to a non-array root must become an empty session,
-// not a decode FAILURE that makes the engine destroy the session.
+// (2) A payload that decodes to a non-array root fails the read: the handler
+// returns FAILURE, so the engine warns, destroys the session, and
+// session_decode() returns false. The stale session is gone (not silently
+// replaced by an empty one) and no session id survives the destroy.
 $scalar_payload = phpser_serialize(42);   // decodes to int(42) — non-array root
 $_SESSION = ['stale' => 1];
 $r = session_decode($scalar_payload);
 echo "nonarray_root_decode: ",
-    ($r !== false && $_SESSION === []) ? "OK" : "FAIL", "\n";
+    ($r === false && $_SESSION === [] && session_id() === '') ? "OK" : "FAIL", "\n";
 
 $_SESSION = [];
 session_write_close();
@@ -53,5 +55,7 @@ echo "DONE\n";
 --EXPECTF--
 Warning: session_encode(): phpser: $_SESSION not serialized — a serialization hook threw in %s on line %d
 encode_hook_throw: boom-encode
+
+Warning: session_decode(): Failed to decode session object. Session has been destroyed in %s on line %d
 nonarray_root_decode: OK
 DONE

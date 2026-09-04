@@ -271,6 +271,17 @@ as a `session.serialize_handler` when available.
 
 ## Limitations / known gaps
 
+- **The three entry points signal corrupt input differently.** `phpser_unserialize()`
+  returns `null` on malformed, truncated, or over-deep input — silently, and
+  indistinguishably from a successfully-decoded `null`. Trailing bytes after
+  a complete top-level value are tolerated on this path (prefix read).
+  `phpser_unserialize_signed()` throws instead (since 0.4.0), so a
+  legitimately-signed `null` still decodes cleanly, and both the signed and
+  session paths require exact consumption of the frame. The session handler
+  reports decode failure to the engine (warning; a scalar-root payload fails
+  the read rather than becoming an empty session). When a cache miss must be
+  told apart from a cached `null`, use the signed entry point. `SECURITY.md`
+  carries the full contract.
 - **Recursion depth is capped at 512** on both encode and decode. On decode,
   anything deeper than 512 nested containers / refs is rejected (returns
   `null`) to bound stack consumption against adversarial wire payloads. On
@@ -284,20 +295,20 @@ as a `session.serialize_handler` when available.
   native `serialize()` by design: PHP throws when serializing a `Closure` and
   serializes a resource as its numeric resource id. phpser treats both as
   unsupported cache values and writes `NULL`.
-- **Unknown classes at decode fall back to `stdClass`** for plain objects
-  and `__serialize`-based objects, rather than PHP's `__PHP_Incomplete_Class`.
-  This is deliberate for the typical cache workload; `allowed_classes => [...]`
-  produces `__PHP_Incomplete_Class` with the original name preserved for
-  disallowed classes, matching PHP. The fallback does **not** apply to every
-  wire shape: a positional DTO (`TAG_OBJECT_SLOTS`) or an enum (`TAG_ENUM`)
-  whose class no longer exists fails the whole decode (returns `null`) because
-  slots carry only values and have no schema to decode into. A legacy
-  `Serializable` value (`TAG_OBJECT_LEGACY`) whose class is gone decodes as
-  `null` in place. Evolve classes append-only if
-  cached payloads must outlive a schema change. When a positional DTO is
-  disallowed and its class is not already loaded, phpser does not autoload it
-  for the sole purpose of recovering property names. The incomplete object
-  keeps its original class marker but discards its unnamed slot values.
+- **Unknown classes at decode become `__PHP_Incomplete_Class`** with the
+  original name preserved, matching PHP native `unserialize()`. This holds
+  for plain objects and `__serialize`-based objects, and for any shape whose
+  class the `allowed_classes` filter denies. Two wire shapes differ when the
+  class is merely absent (rather than denied): a legacy `Serializable`
+  value (`TAG_OBJECT_LEGACY`) whose class is gone decodes as `null` in
+  place, and an enum (`TAG_ENUM`) whose class is gone fails the whole
+  decode, because neither carries a property schema to install into. The
+  positional DTO (`TAG_OBJECT_SLOTS`) decodes to an incomplete object that
+  still claims its id for later back-refs; when its class is already loaded
+  the values are installed onto the incomplete, and only when the class is
+  unavailable are the unnamed slot values dropped (phpser does not autoload
+  a class for the sole purpose of recovering property names). Evolve classes
+  append-only if cached payloads must outlive a schema change.
 - **Enum cases are filtered by `allowed_classes`.** Native `unserialize()` does
   not consult the allowlist on its enum path, so a serialized enum is always
   resurrected there. phpser applies the filter: a disallowed enum decodes to
@@ -308,6 +319,13 @@ as a `session.serialize_handler` when available.
   Encoding a longer value fails loud (throws for the userland API, an
   `E_WARNING` for the session handler) rather than emitting bytes the decoder
   would reject. No single cache value realistically approaches this.
+- **Encode memory is O(distinct strings), uncapped.** The encoder interns
+  every distinct string it emits into a cache that grows without eviction
+  for the duration of the call (pre-sized from the top-level value, so the
+  common shapes never regrow mid-encode). A value with N unique strings
+  holds N entries until the encode returns; nothing is retained between
+  calls. Unusually string-diverse values cost temporary memory proportional
+  to their diversity — chunk the value if that matters.
 - **Wire integers outside the target `zend_long` range are rejected on 32-bit
   builds.** A payload written by a 64-bit process can carry values a 32-bit
   `zend_long` cannot hold. Decode returns `null` instead of narrowing them, so
@@ -339,10 +357,12 @@ as a `session.serialize_handler` when available.
   session formats, so switching handlers doesn't read back sessions written
   by another. It also decodes with all classes allowed and magic methods
   enabled: treat the session store as trusted, exactly as with the native
-  `php_serialize` handler. If session encode fails, the callback returns
-  failure and emits a warning, but PHP's session core may persist an empty
-  payload in place of the previous session; it does not preserve the old bytes
-  on failure.
+  `php_serialize` handler. If session encode fails on coder limits (over-deep
+  or oversized input), the handler persists a 29-byte `phpser:session-not-`
+  `serialized` tombstone marker instead of the session, so the next read
+  fails loudly (engine warning, session destroyed) rather than silently
+  resuming an empty session. Only a user-hook throw during encode persists
+  nothing, matching the never-persist-on-hook-failure rule.
 
 ## Wire format (V1 / V2)
 
@@ -400,9 +420,9 @@ key tags:
 ```
 
 Varints are LEB128 (unsigned); signed values use zigzag encoding. Tags
-0x10/0x11 plus 0x0a/0x0d/0x0e/0x0f/0x12 each claim the next id in encounter
+0x0a/0x0d/0x0e/0x0f/0x11/0x12 each claim the next id in encounter
 order, so the decoder reconstructs back-refs by counting
-container tags as it parses.
+container tags as it parses. 0x10 REF never claims — it is lookup-only.
 
 The version byte is emitted as `0x02` only when the body actually uses a
 v2-only tag (`0x12`–`0x17`); otherwise it stays `0x01`. On decode it is a

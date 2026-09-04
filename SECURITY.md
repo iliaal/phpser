@@ -31,6 +31,16 @@ handcrafted wire bytes. The signed decoder therefore applies the same
 duplicate-key, numeric-key, integer-range, nesting, and collision-work checks
 as the unsigned decoder before taking any structural fast path.
 
+**The allowlist is a per-decode gate, not a sanitizer.** A value decoded
+under `allowed_classes => false` (or a narrow allowlist) as
+`__PHP_Incomplete_Class` still carries its original class name, and
+re-encoding that incomplete object preserves it: decoding the re-encoded
+bytes with a wider allowlist (or the default) resurrects the original
+class with its state. Likewise, a value filtered on one read and cached
+can come back to life on a later permissive read of the same bytes.
+Never re-encode an `__PHP_Incomplete_Class` into a store that a
+permissive reader trusts.
+
 Wire-controlled HashTable keys are rejected when a collision chain exhausts
 the decoder's bounded work budget. This prevents deterministic collisions in
 Zend's stable string hash from turning a bounded payload into quadratic decode
@@ -72,7 +82,9 @@ signed session frames would harden this path but are not shipped today.
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.4.x   | :white_check_mark: |
+| 0.6.x   | :white_check_mark: |
+| 0.5.x   | :x:                |
+| 0.4.x   | :x:                |
 
 Pre-1.0, security fixes land on the latest minor. Once 1.0 ships, the two
 most recent minor versions will receive security fixes.
@@ -152,8 +164,10 @@ semantics, with these intentional differences:
   `unserialize()` returns `false` plus an `E_WARNING`.
   `phpser_unserialize_signed()` instead *throws* on failure (since
   0.4.0), so the signed path — the one you use for untrusted bytes —
-  is unambiguous. Prefer it when you need to distinguish a decode
-  failure from a legitimate `null`.
+  is unambiguous. The session handler reports decode failure to the
+  engine (warning; a scalar-root payload fails the read rather than
+  becoming an empty session). Prefer the signed entry point when you
+  need to distinguish a decode failure from a legitimate `null`.
 
 - **Unloaded, disallowed positional objects keep no slot state.**
   `TAG_OBJECT_SLOTS` carries values in class slot order without property names.

@@ -10,7 +10,8 @@
 //   php ... bench.php --html > docs/index.html
 //
 // Knobs (env): BENCH_ITERS (inner loop, default 1000),
-//              BENCH_REPS  (timed repetitions, median reported, default 7).
+//              BENCH_REPS  (timed repetitions, median+IQR reported, default 35),
+//              BENCH_WARMUP (untimed warmup iters per op, default 100, 0 disables).
 
 declare(strict_types=1);
 
@@ -175,9 +176,9 @@ if (!isset($SERIALIZERS['phpser'])) {
     exit(1);
 }
 $REFERENCE = isset($SERIALIZERS['igbinary']) ? 'igbinary' : 'phpser';
-
 $ITERS = (int) (getenv('BENCH_ITERS') ?: 1000);
-$REPS  = max(1, (int) (getenv('BENCH_REPS') ?: 7));
+$REPS  = max(1, (int) (getenv('BENCH_REPS') ?: 35));
+$WARMUP_ITERS = max(0, (int) (getenv('BENCH_WARMUP') ?: 100));
 $FORMAT = match (true) {
     in_array('--html', $argv, true),
     in_array('--format=html', $argv, true) => 'html',
@@ -190,6 +191,20 @@ function median(array $xs): float {
     $n = count($xs);
     $m = intdiv($n, 2);
     return ($n % 2) ? $xs[$m] : ($xs[$m - 1] + $xs[$m]) / 2.0;
+}
+
+function percentile_sorted(array $sorted, float $q): float {
+    $n = count($sorted);
+    if ($n === 1) return $sorted[0];
+    $pos = ($n - 1) * $q;
+    $lo = (int) floor($pos);
+    $hi = (int) ceil($pos);
+    return $lo === $hi ? $sorted[$lo] : $sorted[$lo] + ($sorted[$hi] - $sorted[$lo]) * ($pos - $lo);
+}
+
+function iqr(array $xs): float {
+    sort($xs);
+    return percentile_sorted($xs, 0.75) - percentile_sorted($xs, 0.25);
 }
 
 function time_op_sample(callable $fn, $arg, int $iters): float {
@@ -255,6 +270,11 @@ $timed = array_filter(
 // Measure: results[$shape][$serializer] = ['size','enc','dec'] or ['err'].
 // ---------------------------------------------------------------------------
 $results = [];
+// GC pauses are noise, not signal: collect once, then hold the collector
+// off while timing so a cycle run can't land inside one rep's samples.
+gc_collect_cycles();
+gc_disable();
+try {
 foreach ($timed as $label => $data) {
     $prepared = [];
     foreach ($SERIALIZERS as $name => [$enc, $dec]) {
@@ -276,6 +296,14 @@ foreach ($timed as $label => $data) {
     }
 
     $names = array_keys($prepared);
+
+    // Untimed warmup so cold caches / first-call paths don't pollute rep 0.
+    if ($WARMUP_ITERS > 0) {
+        foreach ($prepared as [$enc, $dec, $blob]) {
+            time_op_sample($enc, $data, $WARMUP_ITERS);
+            time_op_sample($dec, $blob, $WARMUP_ITERS);
+        }
+    }
     for ($rep = 0; $rep < $REPS; $rep++) {
         $order = serializer_order($names, $rep);
         foreach ($order as $name) {
@@ -295,19 +323,26 @@ foreach ($timed as $label => $data) {
             $results[$label][$name]['enc_samples']);
         $results[$label][$name]['dec'] = median(
             $results[$label][$name]['dec_samples']);
+        $results[$label][$name]['enc_iqr'] = iqr(
+            $results[$label][$name]['enc_samples']);
+        $results[$label][$name]['dec_iqr'] = iqr(
+            $results[$label][$name]['dec_samples']);
         unset(
             $results[$label][$name]['enc_samples'],
             $results[$label][$name]['dec_samples']
         );
     }
+} // end foreach ($timed ...)
+} finally {
+    gc_enable();
 }
-
 $meta = [
     'php'      => PHP_VERSION,
     'arch'     => php_uname('m'),
     'os'       => php_uname('s') . ' ' . php_uname('r'),
     'iters'    => $ITERS,
     'reps'     => $REPS,
+    'warmup_iters' => $WARMUP_ITERS,
     'date'     => date('Y-m-d'),
     'phpser'   => phpversion('phpser') ?: 'dev',
     'igbinary' => phpversion('igbinary') ?: null,
@@ -334,15 +369,17 @@ function fmt_ns(float $ns): string {
 }
 
 function render_text(array $results, array $serializers, string $ref, array $meta): void {
-    printf("phpser bench: PHP %s %s, %d iters, median of %d\n",
-        $meta['php'], $meta['arch'], $meta['iters'], $meta['reps']);
+    printf("phpser bench: PHP %s %s, %d iters, median of %d (warmup %d, GC off, ±IQR spread)\n",
+        $meta['php'], $meta['arch'], $meta['iters'], $meta['reps'], $meta['warmup_iters']);
     echo "serializers: " . implode(', ', $serializers) . " (reference: $ref)\n";
     echo "round-trip OK\n\n";
 
+    $widths = ['size' => 16, 'enc' => 22, 'dec' => 22];
     foreach (['size' => 'SIZE (bytes)', 'enc' => 'ENCODE (ns/op)', 'dec' => 'DECODE (ns/op)'] as $metric => $title) {
+        $w = $widths[$metric];
         echo $title . "\n";
         printf("%-14s", 'shape');
-        foreach ($serializers as $s) printf(" | %-16s", $s);
+        foreach ($serializers as $s) printf(" | %-{$w}s", $s);
         echo "\n";
         foreach ($results as $shape => $row) {
             printf("%-14s", $shape);
@@ -350,16 +387,19 @@ function render_text(array $results, array $serializers, string $ref, array $met
             foreach ($serializers as $s) {
                 $cell = $row[$s] ?? ['err' => 'n/a'];
                 if (isset($cell['err'])) {
-                    printf(" | %-16s", 'n/a');
+                    printf(" | %-{$w}s", 'n/a');
                     continue;
                 }
                 $val = $cell[$metric];
                 $disp = ($metric === 'size') ? (string) $val : fmt_ns($val);
+                if ($metric !== 'size') {
+                    $disp .= ' ±' . fmt_ns($cell[$metric . '_iqr'] ?? 0);
+                }
                 if ($base && $s !== $ref) {
                     $pct = ($val - $base) * 100.0 / $base;
                     $disp .= sprintf(' (%+.0f%%)', $pct);
                 }
-                printf(" | %-16s", $disp);
+                printf(" | %-{$w}s", $disp);
             }
             echo "\n";
         }
@@ -451,6 +491,7 @@ function render_html(array $results, array $serializers, string $ref, array $met
     <span><b>os</b> <?=$h($meta['os'])?></span>
     <span><b>iters</b> <?=$h($meta['iters'])?></span>
     <span><b>median of</b> <?=$h($meta['reps'])?></span>
+    <span><b>warmup</b> <?=$h($meta['warmup_iters'])?></span>
     <span><b>phpser</b> <?=$h($meta['phpser'])?></span>
     <?php if ($meta['igbinary']): ?><span><b>igbinary</b> <?=$h($meta['igbinary'])?></span><?php endif; ?>
     <?php if ($meta['msgpack']): ?><span><b>msgpack</b> <?=$h($meta['msgpack'])?></span><?php endif; ?>
@@ -495,6 +536,9 @@ function render_html(array $results, array $serializers, string $ref, array $met
             $isBest = abs($v - $min) < 1e-9;
             $w = $max > 0 ? max(4, round($v / $max * 100)) : 0;
             $disp = $isTime ? fmt_ns($v) : number_format($v);
+            if ($isTime) {
+                $disp .= ' ±' . fmt_ns($cell[$metric . '_iqr'] ?? 0);
+            }
             $delta = '';
             if ($base && $s !== $ref) {
               $pct = ($v - $base) * 100.0 / $base;

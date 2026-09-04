@@ -48,9 +48,24 @@ try {
 } catch (LogicException $e) {
     echo ($e->getMessage() === "ser boom") ? "serialize_throw OK\n" : "serialize_throw FAIL msg\n";
 }
-
-// 4. Process integrity: after all the aborted encodes, a normal serialize still
-//    works (no leaked encode state / dangling id table).
+// 3b. __serialize that throws inside a columnar TABLE. Four uniform rows
+//     take the TAG_TABLE path; the cell hook aborts the whole frame (same
+//     e->failed / id-rollback discipline as the generic walk) instead of
+//     shipping a column with a TAG_NULL hole.
+class TableBoom {
+    public function __serialize(): array { throw new LogicException("table cell boom"); }
+}
+$tabrows = [];
+for ($i = 0; $i < 4; $i++) $tabrows[] = ['a' => new TableBoom(), 'b' => "tail$i"];
+try {
+    phpser_serialize($tabrows);
+    echo "table_throw FAIL (no exception)\n";
+} catch (LogicException $e) {
+    echo ($e->getMessage() === "table cell boom") ? "table_throw OK\n" : "table_throw FAIL msg\n";
+}
+// 4. Process integrity: after all the aborted encodes (including the TABLE
+//    abort above), a normal serialize still works (no leaked encode state /
+//    dangling id table).
 $ok = phpser_unserialize(phpser_serialize(['sane' => [1, 2, 3]]));
 echo ($ok === ['sane' => [1, 2, 3]]) ? "recovery OK\n" : "recovery FAIL\n";
 
@@ -59,4 +74,5 @@ echo ($ok === ['sane' => [1, 2, 3]]) ? "recovery OK\n" : "recovery FAIL\n";
 lazy_init_throw OK
 lazy_nested_throw OK
 serialize_throw OK
+table_throw OK
 recovery OK

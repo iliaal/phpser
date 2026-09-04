@@ -36,17 +36,20 @@ $top = [&$inner];        // nest by-reference so $inner's array is not COW-shiel
 $blob = phpser_serialize($top);
 var_dump(is_string($blob) && strlen($blob) > 0);
 
-// Round-trips to a well-formed structure (the exact grown length is not the
-// point — memory-safety and a decodable frame are).
+// Pre-mutation snapshot: the walk must have emitted the 2-element array as
+// it stood before element 0's hook ran — the 'tail' sentinel survives at
+// index 1 and none of the 128 hook-appended rows leak into the frame
+// (the 086 object-walk analog asserts second/third/preexisting + !dyn0).
 $rt = phpser_unserialize($blob);
-var_dump(is_array($rt));
-var_dump(is_array($rt[0]));
-var_dump($rt[0][0] instanceof G_refgrow);
+$ok = is_array($rt) && count($rt) === 1
+    && is_array($rt[0]) && count($rt[0]) === 2
+    && ($rt[0][1] ?? null) === 'tail'
+    && ($rt[0][0] instanceof G_refgrow) && (($rt[0][0]->done ?? null) === 1)
+    && !isset($rt[0]['x0']) && !isset($rt[0][2]);
+echo $ok ? "snapshot_intact OK\n" : "snapshot_intact FAIL\n";
 echo "no fault\n";
 ?>
 --EXPECT--
 bool(true)
-bool(true)
-bool(true)
-bool(true)
+snapshot_intact OK
 no fault

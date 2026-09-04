@@ -160,9 +160,8 @@ echo is_string(array_key_first($rl)) ? "numkey_leadzero_string OK\n" : "numkey_l
 //    fail-fast to NULL — no crash, no read past the buffer.
 $H = "\x02\x01\x01a";
 $v2 = [
-    // OBJECT_SLOTS: class_idx varint missing / names an undefined class
+    // OBJECT_SLOTS: class_idx varint missing
     "slots_trunc"       => "\x02\x00\x12",
-    "slots_badclass"    => "\x02\x01\x03Foo\x12\x00\x00",
     // ASSOC_DICT: key idx out of range / count overflow / truncated key run
     "assocdict_badidx"  => "\x02\x00\x13\x01\x05",
     "assocdict_novflow" => "\x02\x00\x13\xff\xff\xff\xff\xff",
@@ -185,6 +184,15 @@ echo "v2 tags OK\n";
 ini_set('memory_limit', '64M');
 $dos = "{$H}\x15\x80\x80\x80\x80\x01\x01\x00\x08\x00"; // nrows=2^28, ncols=1, idx=0, LONGS
 echo (phpser_unserialize($dos) === null) ? "table_nrows_dos OK\n" : "table_nrows_dos FAIL\n";
+
+// 6a'. OBJECT_SLOTS naming an undefined class is NOT a frame failure: the
+//      value slot is still claimed (later back-refs resolve), but with no
+//      class there is no schema — decode yields __PHP_Incomplete_Class
+//      carrying the name and zero properties.
+$rt = phpser_unserialize("\x02\x01\x03Foo\x12\x00\x00");
+$ok = $rt instanceof __PHP_Incomplete_Class
+    && ((array) $rt) === ['__PHP_Incomplete_Class_Name' => 'Foo'];
+echo $ok ? "slots_undef_incomplete OK\n" : "slots_undef_incomplete FAIL\n";
 
 // 6b. Duplicate rowset/table schema keys must be REJECTED (BUG-R2-C2-A1-H1).
 //     An honest array never carries a duplicate schema key, so this shape is
@@ -215,6 +223,11 @@ echo (phpser_unserialize($num_table) === null) ? "table_num_schema OK\n" : "tabl
 $HKV = "\x02\x02\x01k\x01v"; // dict ["k","v"]
 $trunc_col = "{$HKV}\x15\x02\x01\x00\x0b\x01"; // nrows=2, ncols=1, STRINGS col: 1 cell then EOF
 echo (phpser_unserialize($trunc_col) === null) ? "table_trunc_column OK\n" : "table_trunc_column FAIL\n";
+// 6b'''. A TAG_ROWSET truncated mid-values must fail cleanly, not crash —
+//       the row-major counterpart to table_trunc_column above. nrows=2,
+//       ncols=1 holds one LONG cell where two belong, then EOF.
+$rowset_trunc = "{$HKV}\x14\x02\x01\x00\x03\x02"; // nrows=2, ncols=1, idx=[0], 1 cell then EOF
+echo (phpser_unserialize($rowset_trunc) === null) ? "rowset_trunc_values OK\n" : "rowset_trunc_values FAIL\n";
 
 // An unknown column tag must reject cleanly: the column buffer is allocated but
 // dec_table_column fills nothing, so every cell must be blanked before the
@@ -347,11 +360,13 @@ numkey_dual_collapse OK
 numkey_leadzero_string OK
 v2 tags OK
 table_nrows_dos OK
+slots_undef_incomplete OK
 rowset_dup_schema OK
 table_dup_schema OK
 rowset_num_schema OK
 table_num_schema OK
 table_trunc_column OK
+rowset_trunc_values OK
 table_bad_coltag OK
 table_trusted_badidx OK
 legacy_adversarial OK
