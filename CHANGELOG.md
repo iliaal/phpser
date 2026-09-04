@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-09-04
+
 ### Security
 
 - Class-typed slots are now verified on decode. A payload smuggling a wrong-class
@@ -310,7 +312,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.6.1...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.6.2...HEAD
+[0.6.2]: https://github.com/iliaal/phpser/releases/tag/0.6.2
 [0.6.1]: https://github.com/iliaal/phpser/releases/tag/0.6.1
 [0.6.0]: https://github.com/iliaal/phpser/releases/tag/0.6.0
 [0.5.0]: https://github.com/iliaal/phpser/releases/tag/0.5.0
