@@ -16,14 +16,8 @@ session.use_cookies=0
 session.cache_limiter=
 --FILE--
 <?php
-// REGRESSION: when a deferred __wakeup/__unserialize threw, the decoder
-// returned -1 with `out` still holding the fully-decoded graph, violating
-// its "out is NULL on error" contract. The session decode hook returns
-// FAILURE without dtoring its zval, so the whole graph leaked (request-
-// bounded, but a debug/ASAN leak report and a latent footgun for any C
-// caller trusting the contract). The graph here — a Boom object plus its
-// property table — is exactly what leaked. Under a debug or ASAN build the
-// harness LEAK detector fails this test if the contract regresses.
+// A throwing wakeup must leave decode output NULL. The session caller does
+// not destroy failed output; the debug/ASAN harness detects leaked graphs.
 session_save_path(sys_get_temp_dir());
 session_id('phpserWakeupThrow01');
 

@@ -70,11 +70,7 @@ function mk_deep_nested(int $depth): array {
     return $cur;
 }
 
-// DTO shapes modeled after Laravel queue payloads
-// (Illuminate\Queue\SerializableClosure, Eloquent ModelIdentifier).
-// Real apps serialize batches of small typed objects through queue/cache:
-// the per-object cost (class entry lookup, property iteration, dict ref
-// per prop name) is the workload the rowset bench doesn't cover.
+// DTO batches measure class lookup and property handling absent from array rowsets.
 
 final class UserDto {
     public function __construct(
@@ -118,9 +114,7 @@ function mk_dto_users(int $n): array {
     return $out;
 }
 
-// Mixed object payload: a typical "job with relations" shape with a UserDto
-// containing references to OrderDto array. Exercises class-entry lookup
-// for two distinct classes interleaved.
+// Interleave two classes to exercise mixed-class lookup.
 function mk_dto_mixed(int $users): array {
     $out = [];
     for ($i = 0; $i < $users; $i++) {
@@ -153,11 +147,6 @@ function mk_dto_mixed(int $users): array {
     return $out;
 }
 
-// ---------------------------------------------------------------------------
-// Serializer registry. phpser is the subject; igbinary the reference column.
-// Each is included only if both its encode and decode functions are loaded,
-// so the bench degrades gracefully when an extension is missing.
-// ---------------------------------------------------------------------------
 $ALL_SERIALIZERS = [
     'phpser'    => ['phpser_serialize',   'phpser_unserialize'],
     'igbinary'  => ['igbinary_serialize', 'igbinary_unserialize'],
@@ -222,9 +211,6 @@ function serializer_order(array $names, int $rep): array {
     return array_merge(array_slice($names, $offset), array_slice($names, 0, $offset));
 }
 
-// ---------------------------------------------------------------------------
-// Correctness gate: phpser must round-trip every shape before we time it.
-// ---------------------------------------------------------------------------
 $cases = [
     'null'        => null,
     'bool'        => true,
@@ -259,16 +245,12 @@ for ($i = 0; $i < $distinctRowCount; $i++) {
     }
 }
 
-// Timed shapes only (skip the scalar correctness cases).
 $timed = array_filter(
     $cases,
     fn($k) => !in_array($k, ['null', 'bool', 'int', 'float', 'string'], true),
     ARRAY_FILTER_USE_KEY
 );
 
-// ---------------------------------------------------------------------------
-// Measure: results[$shape][$serializer] = ['size','enc','dec'] or ['err'].
-// ---------------------------------------------------------------------------
 $results = [];
 // GC pauses are noise, not signal: collect once, then hold the collector
 // off while timing so a cycle run can't land inside one rep's samples.
@@ -332,7 +314,7 @@ foreach ($timed as $label => $data) {
             $results[$label][$name]['dec_samples']
         );
     }
-} // end foreach ($timed ...)
+}
 } finally {
     gc_enable();
 }
@@ -360,9 +342,6 @@ if ($FORMAT === 'html') {
     render_text($results, array_keys($SERIALIZERS), $REFERENCE, $meta);
 }
 
-// ---------------------------------------------------------------------------
-// Renderers
-// ---------------------------------------------------------------------------
 function fmt_ns(float $ns): string {
     if ($ns >= 1000) return sprintf('%.1fk', $ns / 1000);
     return sprintf('%.0f', $ns);
@@ -416,7 +395,6 @@ function render_html(array $results, array $serializers, string $ref, array $met
         'dec'  => ['DECODE', 'ns / op', true],
     ];
 
-    // Precompute, per metric+shape, the best (min) value to highlight.
     ob_start();
     ?>
 <!doctype html>

@@ -1,9 +1,4 @@
-# Hand-rolled Makefile for phpser. Targets in-tree PHP at $(PHP_SRC) — avoids
-# phpize, which expects an installed PHP build tree at $(prefix)/lib/php/build.
-#
-# Override PHP_SRC to point at a different in-tree PHP checkout, e.g.
-#   make PHP_SRC=$HOME/php-src-8.4
-# Default is the opt (release-mode) tree we use for benchmarks.
+# Build against an in-tree PHP checkout; override PHP_SRC to select the tree.
 
 PHP_SRC      ?= $(HOME)/php-src-8.4-opt
 CC           ?= cc
@@ -17,9 +12,7 @@ INCLUDES := \
   -I$(PHP_SRC)/ext \
   -I$(PHP_SRC)/ext/date/lib
 
-# Match the flags the PHP build system uses for built-in extensions, minus
-# the ones that only matter for the static link. -DZEND_ENABLE_STATIC_TSRMLS_CACHE
-# is the per-extension TLS shortcut that PHP's build system sets for shared exts.
+# Match PHP's shared-extension flags, including its per-extension TLS cache.
 CFLAGS := \
   -O2 -g -fPIC -fvisibility=hidden \
   -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
@@ -46,9 +39,7 @@ clean:
 	rm -rf modules
 	rm -rf tests/*.diff tests/*.out tests/*.exp tests/*.log tests/*.sh
 
-# Run the .phpt test suite via the PHP build's run-tests.php. TEST_PHP_ARGS
-# is what run-tests.php injects into every child PHP process — passing
-# `-d extension=...` to our parent invocation wouldn't propagate.
+# TEST_PHP_ARGS loads the extension in child processes; parent -d flags do not.
 .PHONY: clean test
 
 test: $(TARGET)

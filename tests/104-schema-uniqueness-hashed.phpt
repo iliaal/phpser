@@ -4,15 +4,8 @@ phpser: schema uniqueness on the hashed branch (ncols > 32) — unique round-tri
 phpser
 --FILE--
 <?php
-// dec_schema_keys_are_unique switches from the O(n^2) pairwise scan to a
-// HashTable set above 32 keys. The trusted-path add_new decision now runs that
-// check unconditionally (CR-004), so both branches must be exercised. Part A: a
-// legit 40-column rowset (unique -> hashed set returns true -> add_new). Part B:
-// a forged-but-signed 33-column TABLE whose schema repeats one key (hashed set
-// returns false). A duplicate schema key exists only in handcrafted wire and
-// routing it through zend_symtable_update walks an unbudgeted integer-domain
-// hash chain (quadratic decode, BUG-R2-C2-A1-H1 / CWE-400), so the frame is
-// now REJECTED at schema-parse time and the signed decoder throws (CR-008).
+// Above 32 schema keys, uniqueness uses a hashed set. Cover valid 40-key
+// rows and a signed 33-key schema containing a duplicate.
 $key = str_repeat("k", 32);
 function v($n){ $o=""; while($n>=0x80){ $o.=chr(($n&0x7f)|0x80); $n>>=7;} return $o.chr($n); }
 function sign($b,$k){ return $b . hash_hmac('sha256',$b,$k,true); }

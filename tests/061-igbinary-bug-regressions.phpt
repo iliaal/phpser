@@ -18,19 +18,13 @@ for ($i = 0; $i < 30; $i++) {
 }
 echo "bug72134 OK\n";
 
-// --- igbinary_020-style: incomplete class fallback ---
-// Encode a payload referring to an unknown class, decode it — should yield
-// some safe representation (we fall back to stdClass; igbinary fabricates
-// __PHP_Incomplete_Class). Either is acceptable as long as no crash.
+// igbinary_020-style control: the class remains defined during decode.
 class TempClass020 { public int $a = 7; public int $b = 2; }
 $ser = phpser_serialize(new TempClass020());
-// "Forget" the class by overwriting the name in the dict header. We just
-// check decode doesn't crash and returns a value with our props.
 $rt = phpser_unserialize($ser); // class still exists; sanity check
 echo $rt->a === 7 ? "bug020 OK\n" : "bug020 fail\n";
 
-// --- igbinary_024-style: recursive objects ---
-// Tree of parent/child nodes. Cycles via parent pointer flatten via depth cap.
+// igbinary_024-style: parent/child cycles.
 class Node024 {
     public ?Node024 $parent = null;
     public array $children = [];
@@ -44,9 +38,7 @@ for ($i = 0; $i < 5; $i++) {
 $rt = phpser_unserialize(phpser_serialize($root));
 echo (count($rt->children) === 5) ? "bug024 OK\n" : "bug024 fail\n";
 
-// --- igbinary_065-style: object that exposes IS_UNDEF entries via __sleep ---
-// We don't honor __sleep, but objects with NULL-valued typed props should
-// still round-trip the props' current value (NULL when nullable type).
+// igbinary_065-style control: nullable properties retain their values.
 class Bug065 {
     public ?int $kept = 2;
     public ?int $x = null;
@@ -126,12 +118,7 @@ $nested = ['a' => ['b' => ['c' => 42]]];
 $rt = phpser_unserialize(phpser_serialize($nested));
 echo (current($rt) === ['b' => ['c' => 42]]) ? "bug096 OK\n" : "bug096 fail\n";
 
-// --- igbinary_099-style: dynamic property emission (PHP 8.2+) ---
-// On PHP 8.2+, creating a dynamic property without #[AllowDynamicProperties]
-// is a deprecation. Encoding/decoding such an object should preserve the
-// declared-vs-dynamic split correctly (or at least not warn-spam if the
-// class allows dynamic props). Verify with AllowDynamicProperties to avoid
-// the PHP-version-dependent deprecation noise.
+// AllowDynamicProperties keeps version-dependent deprecations out of this test.
 if (PHP_VERSION_ID >= 80200) {
     #[\AllowDynamicProperties]
     class Bug099 { public int $declared = 1; }

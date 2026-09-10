@@ -10,14 +10,6 @@
   +----------------------------------------------------------------------+
 */
 
-/*
- * phpser_module.c — cold userland entry points and module plumbing.
- *
- * Holds the PHP_FUNCTION wrappers, the allowed_classes option parser, and
- * MINIT/MSHUTDOWN/RINIT/MINFO plus the module entry. All hot encode/decode
- * work stays static in phpser.c; this TU only frames the calls.
- */
-
 #include "phpser_int.h"
 #include "ext/standard/info.h"
 #include "Zend/zend_exceptions.h"
@@ -33,8 +25,6 @@ PHP_FUNCTION(phpser_serialize) {
     ZEND_PARSE_PARAMETERS_END();
     zend_string *out = phpser_encode_zval(value, /* throw_on_overflow */ true);
     if (UNEXPECTED(!out)) {
-        /* Encode failed — depth cap, >4GiB string, or a hook threw — with
-         * the exception already pending. */
         RETURN_THROWS();
     }
     RETVAL_STR(out);
@@ -58,9 +48,7 @@ static int parse_unserialize_options(
     if (Z_TYPE_P(ac) == IS_FALSE) { *out_mode = ALLOWED_NONE; return 0; }
     if (Z_TYPE_P(ac) == IS_TRUE)  { *out_mode = ALLOWED_ALL;  return 0; }
     if (Z_TYPE_P(ac) == IS_ARRAY) {
-        /* Build a lowercased-name lookup set. PHP class names are
-         * case-insensitive; storing pre-lowered keeps the per-object
-         * filter check to one zend_hash_exists. */
+        /* PHP class names are case-insensitive. */
         *out_mode = ALLOWED_SET;
         *out_set = emalloc(sizeof(HashTable));
         zend_hash_init(*out_set, zend_hash_num_elements(Z_ARRVAL_P(ac)),
@@ -69,10 +57,6 @@ static int parse_unserialize_options(
         ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ac), cn) {
             ZVAL_DEREF(cn);
             if (Z_TYPE_P(cn) != IS_STRING) {
-                /* Match PHP's native unserialize: non-string entry in
-                 * the allowed_classes array is a TypeError. Silently
-                 * skipping would let a misconfigured allowlist pass
-                 * unflagged. */
                 zend_hash_destroy(*out_set);
                 efree(*out_set);
                 *out_set = NULL;
@@ -94,8 +78,6 @@ static int parse_unserialize_options(
         } ZEND_HASH_FOREACH_END();
         return 0;
     }
-    /* Callers return immediately on -1, but leave the out-param determinate
-     * so a future caller can't read an uninitialized set pointer. */
     *out_set = NULL;
     zend_argument_value_error(param_idx,
         "allowed_classes option must be array or bool");
@@ -138,9 +120,7 @@ PHP_FUNCTION(phpser_serialize_signed) {
         Z_PARAM_STRING(key, key_len)
     ZEND_PARSE_PARAMETERS_END();
 
-    /* An empty key reduces HMAC to a fixed, keyless tag anyone can compute,
-     * silently downgrading the signed path to forgeable. Reject loudly rather
-     * than emit an unprotected payload. */
+    /* An empty key makes HMAC forgeable. */
     if (key_len == 0) {
         zend_throw_exception(zend_ce_exception,
             "phpser: signing key must not be empty", 0);
@@ -149,12 +129,8 @@ PHP_FUNCTION(phpser_serialize_signed) {
 
     zend_string *frame = phpser_encode_zval(value, /* throw_on_overflow */ true);
     if (UNEXPECTED(!frame)) {
-        /* Encode failed — depth cap, >4GiB string, or a hook threw — with
-         * the exception already pending. */
         RETURN_THROWS();
     }
-    /* Reallocate to add tag space. zend_string_extend grows the underlying
-     * allocation and bumps ZSTR_LEN. The 32 trailing bytes become the HMAC. */
     size_t frame_len = ZSTR_LEN(frame);
     zend_string *signed_str = zend_string_extend(frame, frame_len + PHPSER_HMAC_TAG_LEN, 0);
     unsigned char *tag = (unsigned char *)ZSTR_VAL(signed_str) + frame_len;
@@ -186,17 +162,13 @@ PHP_FUNCTION(phpser_unserialize_signed) {
         Z_PARAM_ARRAY_HT(options_ht)
     ZEND_PARSE_PARAMETERS_END();
 
-    /* An empty key makes the HMAC keyless and forgeable; reject before any
-     * verify work so a misconfigured caller fails loud instead of accepting
-     * attacker-signed bytes. Matches the serialize_signed guard. */
+    /* An empty key makes HMAC forgeable. */
     if (key_len == 0) {
         zend_throw_exception(zend_ce_exception,
             "phpser: signing key must not be empty", 0);
         RETURN_THROWS();
     }
 
-    /* Payload must include at least the 32-byte tag. Anything shorter is
-     * either truncated or never signed — reject without leaking which. */
     if (payload_len < PHPSER_HMAC_TAG_LEN) {
         zend_throw_exception(zend_ce_exception,
             "phpser: signed payload too short", 0);
@@ -237,12 +209,8 @@ PHP_FUNCTION(phpser_unserialize_signed) {
         efree(allowed_set);
     }
 
-    /* A valid HMAC over a body that then fails to decode (corruption, or a
-     * class the payload needs was removed since it was signed) is an error,
-     * not data — throw rather than return a silent null the caller can't
-     * distinguish from a legitimately-signed null (which decodes as rc==0).
-     * Mirrors the signature-failure throw above. If the decode already left an
-     * exception pending (e.g. a __wakeup hook threw), let that propagate. */
+    /* Distinguish malformed signed data from a valid signed null. Preserve
+     * exceptions already raised by decode hooks. */
     if (rc < 0) {
         if (!EG(exception)) {
             zend_throw_exception(zend_ce_exception,
@@ -260,19 +228,11 @@ PHP_FUNCTION(phpser_unserialize_signed) {
 
 static PHP_MINIT_FUNCTION(phpser) {
 #if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
-    /* Populate our TLS slot from the host PHP's thread-local state pointer.
-     * Required for dynamically-loaded extensions under ZTS — otherwise
-     * macros that touch CG/EG via the TSRMLS cache crash on lookup.
-     *
-     * The OR covers both build paths: phpize-generated config.m4 defines
-     * COMPILE_DL_<EXTNAME>; the hand-rolled Makefile defines the generic
-     * ZEND_COMPILE_DL_EXT. Without this widening, a ZTS build via the
-     * Makefile path would compile but crash on first CG/EG access. */
+    /* Initialize TLS for shared ZTS builds. phpize defines COMPILE_DL_PHPSER;
+     * the in-tree Makefile defines ZEND_COMPILE_DL_EXT. */
     ZEND_TSRMLS_CACHE_UPDATE();
 #endif
 #ifdef HAVE_PHP_SESSION
-    /* Serializer entry points live in phpser_session.c; declare them here
-     * for the registration call below. */
     PS_SERIALIZER_FUNCS(phpser);
     /* Register session.serialize_handler = phpser. Best-effort: the session
      * extension may not be loaded (rare in shared-build setups), and we
@@ -282,11 +242,7 @@ static PHP_MINIT_FUNCTION(phpser) {
         PS_SERIALIZER_ENCODE_NAME(phpser),
         PS_SERIALIZER_DECODE_NAME(phpser));
 #endif
-    /* Cache SHA256 ops for HMAC signing. ext/hash is mandatory since PHP
-     * 7.4 so this never fails in normal builds; we still null-check at
-     * call time. php_hash_fetch_ops only reads the algo name for the table
-     * lookup — it doesn't retain the pointer — so the lookup zend_string is
-     * a transient stack-local released immediately, not a module global. */
+    /* php_hash_fetch_ops does not retain the name; release it after lookup. */
     zend_string *algo = zend_string_init("sha256", sizeof("sha256") - 1, 0);
     phpser_sha256_ops = php_hash_fetch_ops(algo);
     zend_string_release(algo);
@@ -299,17 +255,8 @@ static PHP_MSHUTDOWN_FUNCTION(phpser) {
 }
 
 #if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
-/* Refresh this thread's TLS-cache slot every request. MINIT's
- * ZEND_TSRMLS_CACHE_UPDATE() only populates the cache on the thread that
- * loaded the module; under a threaded ZTS SAPI (Windows ships TS builds)
- * worker threads run RINIT, not MINIT, and would otherwise touch CG/EG
- * through an unpopulated cache and crash. Mirrors the canonical ext_skel
- * skeleton and the widened DL guard used in MINIT / get_module().
- *
- * The whole function — and its module-entry slot below — is compiled out on
- * NTS builds (php-fpm and friends), so those register no RINIT and pay zero
- * per-request cost. Only threaded ZTS DL builds, which actually need the
- * per-thread refresh, carry it. */
+/* MINIT initializes only the loading thread; each ZTS worker needs its own
+ * TLS cache initialized before CG/EG access. */
 static PHP_RINIT_FUNCTION(phpser) {
     ZEND_TSRMLS_CACHE_UPDATE();
     return SUCCESS;
@@ -328,17 +275,10 @@ static PHP_MINFO_FUNCTION(phpser) {
     php_info_print_table_end();
 }
 
-/* Declare session as an OPTIONAL dependency. The runtime declaration
- * (vs. only config.m4's PHP_ADD_EXTENSION_DEP) is what controls MINIT
- * ordering — without it, alphabetical conf.d load order can put our
- * MINIT before session's, and php_session_register_serializer runs
- * against a session module that isn't ready yet.
- * See ~/ai/wiki/architecture/php-extension-c-conventions.md "Cross-extension
- * class lookup at MINIT" for the failure mode. */
+/* Runtime dependencies order MINIT; config.m4 dependencies alone do not.
+ * Session must initialize before we register its serializer. */
 static const zend_module_dep phpser_deps[] = {
-    /* hash is mandatory since PHP 7.4 — we use its SHA256 ops for the
-     * signed-payload HMAC. ZEND_MOD_REQUIRED forces the engine to load
-     * hash's MINIT before ours so phpser_sha256_ops resolves cleanly. */
+    /* Resolve hash's MINIT before fetching SHA256 ops. */
     ZEND_MOD_REQUIRED("hash")
 #ifdef HAVE_PHP_SESSION
     ZEND_MOD_OPTIONAL("session")
@@ -364,18 +304,10 @@ zend_module_entry phpser_module_entry = {
     STANDARD_MODULE_PROPERTIES,
 };
 
-/* Under ZTS, a dynamically-loaded extension needs its own TLS slot cache
- * because the host PHP's per-thread state pointer isn't accessible
- * through static linkage. Config defines ZEND_ENABLE_STATIC_TSRMLS_CACHE;
- * the matching cache_define + cache_update at MINIT completes the wiring.
- * On NTS builds both macros expand to nothing. */
+/* Shared ZTS builds need an extension-local TLS cache. */
 ZEND_TSRMLS_CACHE_DEFINE()
 
-/* get_module() is the dynamic-loader entry point; emit it only for a shared
- * build. A hypothetical static link into the PHP binary would otherwise get
- * a duplicate/clashing symbol. The OR mirrors the MINIT TSRMLS guard so the
- * hand-rolled dev Makefile (which defines ZEND_COMPILE_DL_EXT rather than
- * COMPILE_DL_PHPSER) still produces a loadable .so for `make test`. */
+/* Both shared-build paths need get_module; static builds must omit it. */
 #if defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)
 ZEND_GET_MODULE(phpser)
 #endif

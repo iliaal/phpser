@@ -4,8 +4,6 @@ phpser: cycle safety (depth cap prevents crash, IS_REFERENCE flattens)
 phpser
 --FILE--
 <?php
-// Self-referential array — would loop forever via the flatten path
-// without MAX_DEPTH. The result is truncated but the call returns.
 $a = ["start"];
 $a[] = &$a;
 $bytes = phpser_serialize($a);
@@ -13,7 +11,6 @@ echo "self_array survived: ", strlen($bytes) > 0 ? "yes" : "no", "\n";
 $rt = phpser_unserialize($bytes);
 echo "decoded type: ", gettype($rt), "\n";
 
-// Object self-reference
 $o = new stdClass();
 $o->self = &$o;
 $bytes = phpser_serialize($o);

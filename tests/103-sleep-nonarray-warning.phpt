@@ -4,11 +4,8 @@ phpser: a non-array __sleep return emits E_WARNING and serializes null (matches 
 phpser
 --FILE--
 <?php
-// __sleep returning a non-array is a lossy case: native serialize() emits an
-// E_WARNING and writes null in the object's place. phpser previously wrote the
-// null silently (comment claimed "warned" but no warning was emitted). It now
-// matches native — same message, same null result (CR-005). A thrown exception
-// still aborts the whole frame; only the no-exception non-array return warns.
+// A non-array __sleep result warns and serializes null, matching native PHP.
+// A thrown hook exception still aborts the frame.
 class S_badsleep {
     public $x = 1;
     public function __sleep() { return "nope"; }

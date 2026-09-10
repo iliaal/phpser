@@ -28,10 +28,6 @@
 
 const php_hash_ops *phpser_sha256_ops = NULL;
 
-/* HMAC-SHA256 of `data` under `key`. Writes a 32-byte tag to `out`.
- * Returns 0 on success, -1 if SHA256 ops aren't available, -2 if the
- * reported block size exceeds the stack pad (a version-skewed ext/hash
- * would otherwise fail with the misleading "unavailable" message). */
 int phpser_hmac_sha256(
     const unsigned char *key, size_t key_len,
     const unsigned char *data, size_t data_len,
@@ -40,7 +36,6 @@ int phpser_hmac_sha256(
     const php_hash_ops *ops = phpser_sha256_ops;
     if (UNEXPECTED(!ops)) return -1;
     size_t bs = ops->block_size;
-    /* SHA256 block size is 64 — small enough for a stack buffer. */
     unsigned char K[64];
     if (UNEXPECTED(bs > sizeof(K))) return -2;
 
@@ -66,22 +61,15 @@ int phpser_hmac_sha256(
     ops->hash_update(ctx, K, bs);
     ops->hash_update(ctx, out, ops->digest_size);
     ops->hash_final(out, ctx);
-    /* Wipe key material before returning. After the outer XOR pass K
-     * still holds K^opad — XOR with 0x5c…5c recovers K. A separate
-     * stack-read primitive elsewhere in the process would otherwise
-     * leak the signing key. Also wipe the hash context (SHA256 internal
-     * state derived from the key) before freeing. ZEND_SECURE_ZERO ==
-     * explicit_bzero on glibc / RtlSecureZeroMemory on Windows — the
-     * compiler cannot optimize it away. */
+    /* K still contains reversible K^opad. Securely wipe it and the key-derived
+     * hash state so the compiler cannot eliminate the erasure. */
     ZEND_SECURE_ZERO(K, sizeof(K));
     ZEND_SECURE_ZERO(ctx, ops->context_size);
     efree(ctx);
     return 0;
 }
 
-/* Constant-time byte compare. Returns 1 if all `n` bytes are equal.
- * Mirrors the pattern PHP's hash_equals() uses internally — avoids the
- * early-exit timing leak that memcmp would have. */
+/* Do not use memcmp: its early exit leaks the matching prefix. */
 int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n) {
     unsigned char r = 0;
     for (size_t i = 0; i < n; i++) r |= (unsigned char)(a[i] ^ b[i]);

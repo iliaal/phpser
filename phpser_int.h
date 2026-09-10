@@ -10,16 +10,8 @@
   +----------------------------------------------------------------------+
 */
 
-/*
- * phpser_int.h — internal shared declarations for the phpser translation
- * units (phpser.c, phpser_hmac.c, phpser_session.c, phpser_module.c).
- *
- * This header carries ONLY shared constants and cross-TU entry points.
- * All hot encode/decode paths (encode_value/intern/dict/packed/table/
- * assoc/object/slots/enum/magic/decode_value/dict-header/caches) stay
- * static in phpser.c so no cross-TU boundary can cost inlining on the
- * hot path. Never installed (see config.m4 PHP_INSTALL_HEADERS).
- */
+/* Internal cross-TU declarations; hot encode/decode helpers stay static in
+ * phpser.c to preserve inlining. This header is not installed. */
 #ifndef PHP_PHPSER_INT_H
 #define PHP_PHPSER_INT_H
 
@@ -30,27 +22,11 @@
 /* SHA256 output size; the signed-payload tag length. */
 #define PHPSER_HMAC_TAG_LEN 32
 
-/* Session encode-failure tombstone (CR-006). Returned instead of NULL when
- * $_SESSION can't be encoded (over-depth, over-size, hook threw): the engine
- * persists an empty string for NULL, which the next request would read as a
- * brand-new SUCCESS-empty session — silent data loss. This marker is
- * deliberately not a valid frame (first byte is no wire version), so the
- * next read fails loudly via the decode-FAILURE path. */
+/* Depth/size failures persist an invalid frame so the next session read
+ * reports failure instead of treating an empty string as a new session. */
 #define PHPSER_SESSION_TOMBSTONE "phpser:session-not-serialized"
 
-/* Cycle guard for recursive encode/decode. Cache payloads usually nest
- * 5-10 deep; anything beyond MAX_DEPTH is treated as a runaway and
- * aborted. The most common way to hit this is IS_REFERENCE pointing back
- * into an ancestor: we flatten references rather than encode them as
- * shareable, so a true self-ref turns into an infinite chase without
- * this counter.
- *
- * 512 picked to stay safely below stack-overflow on every supported
- * build: ASAN-instrumented decode_value frames can hit ~1.5 KB each
- * (vs ~150 B for opt-NTS), so the cap must hold within a single 8 MB
- * stack worst-case. 512 leaves ~2x headroom under ASAN and ~50x under
- * opt-NTS, and is still many orders of magnitude past any legitimate
- * cache payload. */
+/* Bound C-stack use on deeply nested input, including ASAN builds. */
 #define MAX_DEPTH 512
 
 /* allowed_classes filter modes for phpser_decode_buf_opts. */

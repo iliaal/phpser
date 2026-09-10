@@ -4,11 +4,8 @@ phpser: CR-007 wire magic member cannot override an incomplete-class name
 phpser
 --FILE--
 <?php
-// Spoof is deliberately defined: if the wire name overwrote the magic
-// member, the round trip below would resurrect a live Spoof instance and
-// the no_resurrect oracle would fail. (Without the class, broken output
-// would also decode to __PHP_Incomplete_Class and the check would pass
-// on broken code.)
+// Define Spoof so an overwritten class marker would resurrect a real object;
+// an undefined class would mask the failure with another incomplete object.
 class Spoof { public $x = 0; }
 // A crafted TAG_OBJECT for a denied class carrying a property literally
 // named __PHP_Incomplete_Class_Name must not overwrite the engine-set

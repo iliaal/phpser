@@ -5,11 +5,7 @@ phpser
 --FILE--
 <?php
 
-// --- Nested __unserialize call ordering (igbinary __serialize_004 shape).
-// Outer must see inner already-__unserialize'd by the time its own
-// __unserialize runs — because we defer all calls to end-of-pass and run
-// them in encounter order, parents fire AFTER children. PHP's
-// var_unserializer.re uses the same ordering. ---
+// Nested magic methods (igbinary __serialize_004): verify reconstructed data.
 class Recorder { public static array $order = []; }
 class Inner {
     public $data;
@@ -33,10 +29,6 @@ class Outer {
 Recorder::$order = [];
 $o = new Outer(new Inner("X"));
 $rt = phpser_unserialize(phpser_serialize($o));
-// Encounter order: Outer's __unserialize is queued first, then Inner's.
-// We run them in queue order, so outer fires first — but at the time it
-// runs, $this->i is already the Inner *object* (registered when materialized).
-// Inner's __unserialize runs after; data populated then.
 $ok = $rt instanceof Outer
    && $rt->i instanceof Inner
    && $rt->i->data === "X"
@@ -59,7 +51,6 @@ class B_GH {
 }
 $b = new B_GH();
 $rt = phpser_unserialize(phpser_serialize($b));
-// After round-trip: $rt is B_GH, $rt->a is A_GH, $rt->a->x === $rt (cycle preserved)
 $ok = $rt instanceof B_GH
    && $rt->a instanceof A_GH
    && $rt->a->x === $rt;

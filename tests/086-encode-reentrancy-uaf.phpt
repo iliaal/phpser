@@ -5,19 +5,8 @@ phpser
 --FILE--
 <?php
 
-// =====================================================================
-// The object slow-path property walk cached props->arData / end pointers
-// and called encode_value() inside the loop. A property value's
-// __serialize (or __sleep, or a destructor) can run there and add dynamic
-// properties to the SAME object, reallocating obj->properties in place —
-// the cached bucket pointer then dangles (UAF read at enc_obj_prop_val).
-// The fix takes a ref on the table via zend_get_properties_for so the
-// mutation COW-separates instead of reallocating under the iterator,
-// exactly as native serialize() does. Under valgrind/ASan the bug crashes;
-// without instrumentation it silently corrupts the emitted properties.
-// We assert the emitted snapshot round-trips to the pre-mutation state and
-// matches native serialize(), a sufficient proxy either way.
-// =====================================================================
+// A nested hook grows the object during its property walk. The emitted
+// snapshot must retain pre-mutation properties, matching native serialize().
 
 #[\AllowDynamicProperties]
 class C_reent {
@@ -74,11 +63,7 @@ $c2->first->parent = null;
 echo (($nc->second ?? null) === "second-value" && !isset($nc->dyn0))
     ? "native_parity OK\n" : "native_parity FAIL\n";
 
-// =====================================================================
-// __sleep variant: a listed property's value grows the object mid-walk.
-// The __sleep path iterates the returned name array (a fresh temporary)
-// and re-resolves each property, so it was never vulnerable — pin it.
-// =====================================================================
+// A listed property's value grows the object during __sleep serialization.
 #[\AllowDynamicProperties]
 class S_sleep {
     public $a;
@@ -101,8 +86,6 @@ $s->a->parent = null;  // cut the S<->E cycle
 echo (($rt->b ?? null) === "b-value" && ($rt->a->v ?? null) === 2)
     ? "sleep_reentrancy OK\n" : "sleep_reentrancy FAIL\n";
 
-// Belt and suspenders: collect anything cyclic left over so the leak
-// checker sees a clean heap at shutdown.
 gc_collect_cycles();
 
 ?>

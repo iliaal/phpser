@@ -16,8 +16,7 @@ echo ($rt == $v) ? "unsigned_lenient OK\n" : "unsigned_lenient FAIL\n";
 $s = phpser_serialize_signed($v, $key);
 echo (phpser_unserialize_signed($s, $key) == $v) ? "signed_valid OK\n" : "signed_valid FAIL\n";
 
-// A suffixed frame re-signed under the same key must NOT verify: the HMAC
-// would otherwise cover bytes the decoder never looks at.
+// A valid HMAC does not excuse trailing bytes: decode must consume the frame.
 $frame = substr($s, 0, -32);
 $suffixed = $frame . "\x00";
 $forged = $suffixed . hash_hmac("sha256", $suffixed, $key, true);

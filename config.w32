@@ -1,21 +1,11 @@
-// Windows build configuration for phpser.
-// Mirrors config.m4; no vendored dependencies. Hot paths stay in phpser.c;
-// phpser_hmac.c (HMAC-SHA256), phpser_session.c (session glue) and
-// phpser_module.c (entry points + module plumbing) are cold TUs.
-
 ARG_ENABLE("phpser", "Enable phpser binary-serializer support", "no");
 
 if (PHP_PHPSER != "no") {
     EXTENSION("phpser", "phpser.c phpser_hmac.c phpser_session.c phpser_module.c", null,
         "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
 
-    // HAVE_PHP_SESSION, which gates the serialize_handler glue in
-    // phpser_session.c / phpser_module.c, is defined by the session
-    // extension's own config.w32, so it reaches phpser through php_config.h
-    // and must not be redefined here.
-    // The third argument marks the dependency optional, which makes an absent
-    // session extension return early with a message. Without it, a missing
-    // dependency drops the php_phpser.dll build target outright.
+    // php_config.h supplies HAVE_PHP_SESSION. Keep the dependency optional:
+    // a missing required dependency drops the DLL build target.
     ADD_EXTENSION_DEP("phpser", "session", true);
 
     PHP_INSTALL_HEADERS("ext/phpser", "php_phpser.h");

@@ -4,12 +4,7 @@ phpser: round-4 review fixes — encode depth-cap throws (no silent truncation);
 phpser
 --FILE--
 <?php
-// =====================================================================
-// Encode now FAILS LOUD when input nests deeper than the cap, instead of
-// silently emitting a payload that decode rejects in full (NULL). The
-// encode and decode caps are equal, so a truncated payload would have
-// been undecodable — silent total data loss. Both encoders throw now.
-// =====================================================================
+// Encode must reject over-depth input instead of emitting an undecodable frame.
 $deep = "leaf";
 for ($i = 0; $i < 1000; $i++) $deep = [$deep];
 
@@ -37,10 +32,7 @@ $probe = $rt; $d = 0;
 while (is_array($probe)) { $probe = $probe[0]; $d++; }
 echo ($probe === "leaf" && $d === 100) ? "shallow_roundtrip OK\n" : "shallow_roundtrip FAIL d=$d\n";
 
-// =====================================================================
-// The allowed_classes TypeError names the CALLING function. Regression:
-// the signed path used to report "phpser_unserialize()".
-// =====================================================================
+// The signed path must name phpser_unserialize_signed in its TypeError.
 try {
     phpser_unserialize("\x01\x00\x00", ['allowed_classes' => [123]]);
     echo "unser_typeerror FAIL (no throw)\n";

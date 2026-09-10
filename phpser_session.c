@@ -54,12 +54,7 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
                 "wire-format limit");
             break;
         case PHPSER_ENC_EXCEPTION:
-            /* A __serialize/__sleep hook in the session graph threw. The
-             * exception is pending and propagates to the save call site —
-             * already loud — so decline with NULL and persist nothing,
-             * matching the pinned "never persist on hook failure" contract.
-             * (Depth/size failures below only warn, so they get the
-             * tombstone instead.) */
+            /* Hook exceptions propagate to the save caller; persist nothing. */
             php_error_docref(NULL, E_WARNING,
                 "phpser: $_SESSION not serialized — a serialization hook threw");
             return NULL;
@@ -69,20 +64,12 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
                 MAX_DEPTH);
             break;
         default:
-            /* Unreachable with the current status enum (OK never returns
-             * NULL here; SIZE and EXCEPTION are handled above) — defensive
-             * arm so a future status can't silently fall through as depth. */
             php_error_docref(NULL, E_WARNING,
                 "phpser: $_SESSION not serialized — encoding failed");
             break;
         }
-        /* Tombstone, not NULL: the engine persists an empty string for a
-         * NULL encode, and the next request reads that back through the
-         * vallen==0 fast path as a brand-new SUCCESS-empty session — the
-         * data loss is silent. A distinctive undecodable marker makes the
-         * next read fail loudly ("Failed to decode session object")
-         * instead. session_encode() surfaces the marker string rather
-         * than false so the failure is observable at the call site too. */
+        /* NULL encodes persist as empty strings, which decode as new sessions.
+         * Persist an invalid marker so the next read reports the data loss. */
         return zend_string_init(PHPSER_SESSION_TOMBSTONE,
                                sizeof(PHPSER_SESSION_TOMBSTONE) - 1, 0);
     }
@@ -91,20 +78,12 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
 PS_SERIALIZER_DECODE_FUNC(phpser) {
     zval decoded;
     if (vallen == 0) {
-        /* A brand-new session reads back as an empty string from storage.
-         * PHP's native serializers treat that as an empty session; feeding
-         * it to the decoder fails the version-byte check (FAILURE), which
-         * makes the engine emit "Failed to decode session object" and
-         * destroy the session on every first request. Start empty instead. */
+        /* Empty storage represents a new session; it has no wire version byte. */
         array_init(&decoded);
     } else if (phpser_decode_buf(val, vallen, &decoded) < 0) {
         return FAILURE;
     } else if (Z_TYPE(decoded) != IS_ARRAY) {
-        /* A scalar (or object) root can't populate $_SESSION. The old code
-         * swapped in [] with SUCCESS, silently coercing the payload into an
-         * empty session with no signal. Return FAILURE instead so the engine
-         * logs "Failed to decode session object" and starts clean — the
-         * coercion is observable rather than silent. */
+        /* A non-array root cannot populate $_SESSION. */
         zval_ptr_dtor(&decoded);
         return FAILURE;
     }
@@ -113,12 +92,7 @@ PS_SERIALIZER_DECODE_FUNC(phpser) {
     }
     ZVAL_NEW_REF(&PS(http_session_vars), &decoded);
     Z_ADDREF_P(&PS(http_session_vars));
-    /* Re-bind the userland $_SESSION symbol to the new reference. Without
-     * this, user code reads the previous request's array via the stale
-     * symbol-table entry — the PS(http_session_vars) slot is updated but
-     * $_SESSION still aliases the old one. PHP's own session decoders
-     * (php_serialize, php) do this. See session.c:986 (PS_SERIALIZER_
-     * DECODE_FUNC(php_serialize)). */
+    /* Keep the userland $_SESSION symbol bound to the new session reference. */
     zend_string *var_name = ZSTR_INIT_LITERAL("_SESSION", 0);
     zend_hash_update_ind(&EG(symbol_table), var_name, &PS(http_session_vars));
     zend_string_release_ex(var_name, 0);

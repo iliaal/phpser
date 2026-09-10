@@ -5,10 +5,7 @@ phpser
 --FILE--
 <?php
 
-// PHP's serialize() mangles protected ("\0*\0name") and private ("\0Class\0name")
-// property keys when emitting them through get_properties(). Our encoder reads
-// the same HashTable, so the same mangled keys flow into the dict. The decoder
-// installs them back via write_property which honors the mangling.
+// Protected and private properties use mangled wire keys, independent of scope.
 
 class WithVisibility
 {

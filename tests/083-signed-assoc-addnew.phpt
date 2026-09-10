@@ -4,12 +4,7 @@ phpser: signed (trusted) decode of assoc arrays — all key shapes round-trip ==
 phpser
 --FILE--
 <?php
-// phpser_unserialize_signed decodes HMAC-authenticated bytes. Dict-keyed assoc
-// (TAG_ASSOC_DICT) and rowset/table schemas take the add_new fast path only
-// when the keys are pre-scanned unique and non-numeric; plain TAG_ASSOC always
-// uses update (last-write-wins + numeric coercion). A valid HMAC proves key
-// possession, not uniqueness, so uniqueness is enforced, not assumed. Verify
-// every assoc key shape still round-trips identically to native serialize().
+// Signed array keys must round-trip with native coercion and no phantom buckets.
 $key = str_repeat("k", 32);
 
 function rt_ok($v) {

@@ -4,9 +4,7 @@ phpser: CR-019 top-level object with 100+ props round-trips (intern seeding)
 phpser
 --FILE--
 <?php
-// Seeding the encode intern cache from a top-level object's property count
-// is allocation-strategy only (wire-identical); this pins that the seeding
-// path (n > 64) round-trips every property exactly.
+// More than 64 properties exercises top-level object cache seeding.
 $o = new stdClass();
 for ($i = 0; $i < 100; $i++) {
     $o->{"k$i"} = "v$i";

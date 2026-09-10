@@ -4,20 +4,8 @@ phpser: signed (trusted) forged duplicate keys — object prop + back-ref UAF an
 phpser
 --FILE--
 <?php
-// =====================================================================
-// A valid HMAC proves key possession, not honest-encoder provenance: a
-// forged-but-signed frame can carry duplicate keys the encoder never emits.
-// The signed (trusted) path once skipped the id-table object pin and used
-// unconditional add_new for assoc, so:
-//   CR-001: a duplicate object-property key whose first value is a nested,
-//           id-registered object frees it on overwrite; a later TAG_REF then
-//           deref/addref-writes freed memory (heap UAF).
-//   CR-003: a duplicate/numeric assoc key produced phantom buckets and left
-//           canonical-numeric string keys ("5") as string buckets.
-// Fix: pin every registered object unconditionally (dec_register) and use
-// last-write-wins update semantics on the trusted assoc path too. Under
-// valgrind/ASan the pre-fix CR-001 frame crashes.
-// =====================================================================
+// Signed frames can contain duplicate keys. Overwrites must preserve id-table
+// references, collapse duplicate keys, and coerce numeric keys.
 function v($n){ $o=""; while($n>=0x80){ $o.=chr(($n&0x7f)|0x80); $n>>=7;} return $o.chr($n); }
 $key = str_repeat("k", 32);
 function sign($body,$key){ return $body . hash_hmac('sha256',$body,$key,true); }

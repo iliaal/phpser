@@ -4,22 +4,8 @@ phpser: signed (trusted) forged rowset/table with duplicate schema keys — reje
 phpser
 --FILE--
 <?php
-// =====================================================================
-// dec_read_schema_keys() gated add_new on `d->trusted || unique`, so a
-// forged-but-signed ROWSET/TABLE with duplicate schema keys skipped the
-// uniqueness scan entirely -> per-row phantom buckets, and (with the
-// numeric-forced update path over an unpinned object cell) the CR-001 UAF
-// class (CR-004). The interim fix ran uniqueness on every path but still
-// COLLAPSED dup/numeric schemas through zend_symtable_update, whose
-// integer-domain bucket walk has no MAX_HASH_CHAIN_LENGTH budget — a
-// quadratic-decode DoS (BUG-R2-C2-A1-H1, CWE-400). Final fix: a duplicate
-// (or numeric) schema key can only occur in handcrafted wire, so
-// dec_read_schema_keys REJECTS the frame at schema-parse time, before any
-// cell/object is decoded. A signed frame is not exempt: a valid HMAC does
-// not prove the schema keys are distinct. Rejecting up front also removes
-// the back-ref UAF surface entirely (no object is registered before the
-// bail).
-// =====================================================================
+// Signed duplicate schemas must reject before decoding cells. HMAC verification
+// proves neither key uniqueness nor safe numeric-key hash chains.
 function v($n){ $o=""; while($n>=0x80){ $o.=chr(($n&0x7f)|0x80); $n>>=7;} return $o.chr($n); }
 $key = str_repeat("k", 32);
 function sign($body,$key){ return $body . hash_hmac('sha256',$body,$key,true); }

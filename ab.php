@@ -100,7 +100,6 @@ $shapes = [
 
 foreach ($shapes as $name => $data) {
     $blob = phpser_serialize($data);
-    // round-trip guard
     if (serialize(phpser_unserialize($blob)) !== serialize($data)) {
         fwrite(STDERR, "MISMATCH $name\n");
         exit(1);

@@ -8,11 +8,7 @@ if (!method_exists(ReflectionClass::class, "newLazyGhost")) die("skip lazy objec
 ?>
 --FILE--
 <?php
-// Regression guard for the property-slot encode fast path: a lazy ghost/proxy
-// has uninitialized declared-property slots until its initializer fires. The
-// fast path reads OBJ_PROP directly, so without the lazy guard it would
-// serialize uninitialized values. Native serialize() triggers initialization
-// (via get_properties); phpser must match.
+// Lazy objects must initialize before the encoder reads declared slots.
 
 final class Point {
     public function __construct(public int $x, public string $label) {}
