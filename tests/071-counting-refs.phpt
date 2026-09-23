@@ -1,5 +1,5 @@
 --TEST--
-phpser: ref counting — distinct zend_references stay distinct (counting_of_references.phpt)
+phpser: ref counting: distinct zend_references stay distinct (counting_of_references.phpt)
 --EXTENSIONS--
 phpser
 --FILE--
@@ -7,7 +7,7 @@ phpser
 
 // PHP serialize() output for this shape is:
 //   "a:4:{i:0;i:1;i:1;R:2;i:2;i:2;i:3;R:3;}"
-// — two distinct refs ($ref1, $ref2), each shared between two slots.
+// Two distinct refs ($ref1, $ref2), each shared between two slots.
 // We must achieve the same semantic: [0]/[1] alias one zend_reference,
 // [2]/[3] alias another, and the two refs are independent.
 

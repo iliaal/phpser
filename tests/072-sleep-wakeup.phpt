@@ -64,7 +64,7 @@ echo ($rt->declared === 1 && $rt->extra === "dyn")
     ? "sleep_dynamic OK\n" : "sleep_dynamic FAIL\n";
 
 // --- sleep_uninitialized_typed_prop shape: a typed prop is currently
-// IS_UNDEF (no value assigned, no default). Skip silently — PHP warns
+// IS_UNDEF (no value assigned, no default). Skip silently; PHP warns
 // but doesn't fail. ---
 class TypedUninit {
     public int $x;

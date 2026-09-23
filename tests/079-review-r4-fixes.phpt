@@ -1,5 +1,5 @@
 --TEST--
-phpser: round-4 review fixes — encode depth-cap throws (no silent truncation); option TypeError names the calling function
+phpser: encode depth-cap throws (no silent truncation); option TypeError names the calling function
 --EXTENSIONS--
 phpser
 --FILE--

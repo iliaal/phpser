@@ -1,5 +1,5 @@
 --TEST--
-phpser: TAG_ASSOC_DICT wire v2 — dict-only assoc keys without per-key tag bytes
+phpser: TAG_ASSOC_DICT wire v2: dict-only assoc keys without per-key tag bytes
 --EXTENSIONS--
 phpser
 --FILE--

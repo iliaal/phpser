@@ -1,5 +1,5 @@
 --TEST--
-phpser: session serialize_handler — fresh session, round-trip, empty decode, over-depth
+phpser: session serialize_handler: fresh session, round-trip, empty decode, over-depth
 --EXTENSIONS--
 phpser
 session
@@ -37,7 +37,7 @@ echo "roundtrip: ",
     ? "OK" : "FAIL", "\n";
 
 // SLOTS (positional wire v2), rowset (columnar wire v2), and negative-int
-// (zigzag) shapes round-trip through the handler — not just the assoc and
+// (zigzag) shapes round-trip through the handler, not just the assoc and
 // scalar shapes pinned above.
 final class SessDto {
     public function __construct(

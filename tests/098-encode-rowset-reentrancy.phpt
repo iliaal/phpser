@@ -5,9 +5,9 @@ enc_try_table gathers raw &b->val pointers across every row, then emits
 column-major, running user code (__serialize) for MIXED object columns. A cell
 hook that reaches a sibling row must not dangle those pointers. Safety rests on
 (a) reference rows being excluded from the columnar path and (b) array
-copy-on-write separating any second-handle mutation. This is the regression
-canary for that invariant — run under the ASAN lane it turns a UAF into an
-invalid-read abort; without ASAN it still asserts correct output.
+copy-on-write separating any second-handle mutation. Under the ASAN lane a
+UAF becomes an invalid-read abort; without ASAN the test still asserts correct
+output.
 --EXTENSIONS--
 phpser
 --FILE--
@@ -20,7 +20,7 @@ class Cell {
     public function __serialize(): array {
         // Reach a sibling row of the rowset being serialized and grow it,
         // forcing that inner array to realloc. self::$outer holds a second
-        // handle (refcount >= 2), so COW separates the copy — the encoder's
+        // handle (refcount >= 2), so COW separates the copy and the encoder's
         // rowset is untouched. If the columnar gather ever dropped this
         // guarantee, the cached &b->val for row 1 would dangle here.
         if (self::$outer !== null) {

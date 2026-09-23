@@ -1,5 +1,5 @@
 --TEST--
-phpser: encode-side UAF — a __serialize hook grows the array being walked through a by-reference alias
+phpser: encode-side UAF: a __serialize hook grows the array being walked through a by-reference alias
 --EXTENSIONS--
 phpser
 --FILE--
@@ -9,7 +9,7 @@ phpser
 // encode_value() calls in its element loop, and those calls run user hooks
 // (__serialize/__sleep). An element object whose __serialize appends to the
 // SAME array through a by-reference alias reallocates the table under the
-// iterator -> use-after-free (CR-002). Native serialize() has the identical
+// iterator -> use-after-free. Native serialize() has the identical
 // bug and faults on this shape; phpser takes a ref across the walk so the
 // mutating write COW-separates instead, the array analog of the object
 // property-table guard (086). Under valgrind/ASan the pre-fix code crashes;
@@ -37,7 +37,7 @@ $blob = phpser_serialize($top);
 var_dump(is_string($blob) && strlen($blob) > 0);
 
 // Pre-mutation snapshot: the walk must have emitted the 2-element array as
-// it stood before element 0's hook ran — the 'tail' sentinel survives at
+// it stood before element 0's hook ran: the 'tail' sentinel survives at
 // index 1 and none of the 128 hook-appended rows leak into the frame
 // (the 086 object-walk analog asserts second/third/preexisting + !dyn0).
 $rt = phpser_unserialize($blob);

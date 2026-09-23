@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-005 session decode enforces exact consumption (no suffix)
+phpser: session decode enforces exact consumption (no suffix)
 --EXTENSIONS--
 phpser
 session

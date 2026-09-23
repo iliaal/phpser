@@ -1,5 +1,5 @@
 --TEST--
-phpser: encode-side UAF — a property's __serialize/__sleep grows the object's property table mid-walk
+phpser: encode-side UAF: a property's __serialize/__sleep grows the object's property table mid-walk
 --EXTENSIONS--
 phpser
 --FILE--
@@ -46,7 +46,7 @@ $rt = phpser_unserialize(phpser_serialize($c1));
 $c1->first->parent = null;
 // The properties that existed before the mutation must survive intact; the
 // dynamic props added during __serialize belong to the COW-separated copy
-// and are (correctly) absent from the point-in-time snapshot — same as native.
+// and are (correctly) absent from the point-in-time snapshot, same as native.
 $ok = $rt instanceof C_reent
     && $rt->second === "second-value"
     && $rt->third === "third-value"

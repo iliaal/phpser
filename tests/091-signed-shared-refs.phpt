@@ -1,5 +1,5 @@
 --TEST--
-phpser: signed (trusted) shared refs, object identity, cycles — ASAN coverage for the id-table pin
+phpser: signed (trusted) shared refs, object identity, cycles: ASAN coverage for the id-table pin
 --EXTENSIONS--
 phpser
 --FILE--
@@ -8,8 +8,8 @@ phpser
 // for the decode pass, same as the untrusted path. 065-shared-refs covers these
 // shapes on the untrusted path; this mirrors them through
 // phpser_unserialize_signed so the ASAN lane exercises shared objects,
-// back-references, and cycles on the trusted path — where a forged-but-signed
-// duplicate key could otherwise free a still-referenced object (CR-001).
+// back-references, and cycles on the trusted path, where a forged-but-signed
+// duplicate key could otherwise free a still-referenced object.
 $key = str_repeat("s", 32);
 
 function sround($v) {

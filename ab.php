@@ -1,5 +1,5 @@
 <?php
-// ab.php — phpser-only A/B harness for perf candidates. Times encode+decode
+// ab.php: phpser-only A/B harness for perf candidates. Times encode+decode
 // per shape, median of BENCH_REPS, phpser only (no igbinary/msgpack noise).
 // Run the SAME script alternately against baseline.so and candidate.so:
 //   php -d extension=baseline.so  ab.php

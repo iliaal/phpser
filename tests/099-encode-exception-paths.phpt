@@ -13,10 +13,10 @@ phpser
 --FILE--
 <?php
 
-// 1. A lazy ghost whose initializer throws during serialize (CR-003). The
+// 1. A lazy ghost whose initializer throws during serialize. The
 //    zend_get_properties_for call on the object slow path runs the initializer;
-//    the new EG(exception) guard must roll back the claimed id, flag failure,
-//    and let the exception propagate — no partial payload returned.
+//    the EG(exception) guard must roll back the claimed id, flag failure,
+//    and let the exception propagate with no partial payload.
 class LazyDto { public int $x = 0; public string $y = ""; }
 $r = new ReflectionClass(LazyDto::class);
 $ghost = $r->newLazyGhost(function ($o) { throw new RuntimeException("init boom"); });

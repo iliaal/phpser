@@ -6,7 +6,7 @@ phpser
 <?php
 // Attacker object carries a property literally named __PHP_Incomplete_Class_Name.
 // Decoded under allowed_classes=>false it must become an incomplete "Evil"
-// placeholder whose reserved name the wire property cannot overwrite — otherwise
+// placeholder whose reserved name the wire property cannot overwrite; otherwise
 // reserializing and decoding it with classes allowed would resurrect Spoof and
 // run Spoof::__wakeup, defeating the filter across a store-reload cycle.
 class Spoof { public function __wakeup() { echo "SPOOF_WAKEUP\n"; } }

@@ -1,5 +1,5 @@
 --TEST--
-phpser: signed mode (HMAC-SHA256) — round-trip, tamper detection, key isolation
+phpser: signed mode (HMAC-SHA256): round-trip, tamper detection, key isolation
 --EXTENSIONS--
 phpser
 --FILE--
@@ -104,7 +104,7 @@ echo ($s1 === $s2) ? "deterministic OK\n" : "deterministic FAIL\n";
 // --- Signed payload through unsigned unserialize: the HMAC looks like more
 // data to the unsigned decoder, which reads the first value and stops
 // (trailing-tolerant, like 069 extra_data). Must NOT throw, must NOT warn,
-// must NOT crash — and the leading value must survive intact.
+// must NOT crash, and the leading value must survive intact.
 $warn074 = [];
 set_error_handler(function (int $no, string $str) use (&$warn074): bool {
     $warn074[] = $str;
@@ -159,9 +159,8 @@ try {
 echo ($autoloads === 0 && SignedWakeProbe::$wakes === 0)
     ? "reject_before_decode OK\n" : "reject_before_decode FAIL\n";
 
-// --- Encoded values can include null and false (which the legacy
-// "false=failure" pattern would have ambiguity for — we throw on bad sig
-// instead, so the return slot is free). ---
+// --- Encoded values can include null and false. A bad signature throws
+// instead of returning false, so the return slot is unambiguous. ---
 $signull = phpser_serialize_signed(null, $key);
 $rtnull = phpser_unserialize_signed($signull, $key);
 echo ($rtnull === null) ? "null_value OK\n" : "null_value FAIL\n";

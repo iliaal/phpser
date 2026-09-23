@@ -40,7 +40,7 @@ echo $ok ? "gh12265_wrapped OK\n" : "gh12265_wrapped FAIL\n";
 // MAX_DEPTH=512. Build a chain longer than that and verify the encoder
 // rejects it loudly (throws) rather than emitting a truncated payload.
 // The encode and decode caps are equal, so a truncated payload would be
-// undecodable (decode returns NULL in full) — silent total data loss.
+// undecodable (decode returns NULL in full): silent total data loss.
 // Fail loud at encode instead. ---
 class Node { public ?Node $next = null; }
 $first = new Node();
@@ -50,7 +50,7 @@ for ($i = 0; $i < 5000; $i++) {  // exceeds MAX_DEPTH
     $node = $node->next;
 }
 try {
-    phpser_serialize($first);  // must throw — not crash, not truncate
+    phpser_serialize($first);  // must throw, not crash or truncate
     echo "gh15169_no_crash FAIL (no throw)\n";
 } catch (\Exception $e) {
     echo str_contains($e->getMessage(), "maximum nesting depth")
@@ -69,9 +69,9 @@ $probe = $rt; $depth = 0;
 while ($probe instanceof Node && $depth < 200) { $probe = $probe->next; $depth++; }
 echo ($depth === 101) ? "gh15169_under_cap OK\n" : "gh15169_under_cap FAIL d=$depth\n";
 
-// --- gh19701: serialize loses some data — clone + alias preserved
+// --- gh19701: serialize loses some data; clone + alias preserved
 // across both copies' presence in the same outer array.
-// $data = [clone $base, $base] — PHP must serialize both with their
+// $data = [clone $base, $base]: PHP must serialize both with their
 // internal cycles intact; the clone's cycle is distinct from the
 // original's cycle. ---
 #[\AllowDynamicProperties]

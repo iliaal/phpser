@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-007 wire magic member cannot override an incomplete-class name
+phpser: wire magic member cannot override an incomplete-class name
 --EXTENSIONS--
 phpser
 --FILE--

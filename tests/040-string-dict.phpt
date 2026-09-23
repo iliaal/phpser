@@ -18,7 +18,7 @@ for ($i = 0; $i < 50; $i++) {
 $rt = phpser_unserialize(phpser_serialize($rows));
 var_dump(serialize($rt) === serialize($rows));
 
-// Same content from distinct allocations — content-dedup still works
+// Same content from distinct allocations; content dedup still works
 // once threshold is crossed.
 $a = str_repeat("x", 8);
 $b = str_repeat("x", 8);

@@ -1,12 +1,12 @@
 --TEST--
-phpser: regressions for issues.md CR-001/003/004/006/008/009
+phpser: typed-property, dict-index, dup-key, HMAC, allowed_classes, and double-encoding regressions
 --EXTENSIONS--
 phpser
 --FILE--
 <?php
 
 // =====================================================================
-// CR-001: typed-property invariant — crafted payload must not plant a
+// Typed-property invariant: a crafted payload must not plant a
 // string into an `int`-typed slot. Pre-fix this silently succeeded.
 // =====================================================================
 class T_int { public int $x = 0; }
@@ -46,7 +46,7 @@ try {
 echo $threw ? "cr001_typed_ref OK\n" : "cr001_typed_ref FAIL\n";
 
 // =====================================================================
-// CR-003: dict index varint above UINT32_MAX must reject, not wrap to 0.
+// Dict index varint above UINT32_MAX must reject, not wrap to 0.
 // LEB128 of 2^32 = 0x80 0x80 0x80 0x80 0x10. Build payload:
 //   version + dict_len=1 + entry "x" + TAG_STR_DICT + varint(2^32)
 // =====================================================================
@@ -62,7 +62,7 @@ $rt = phpser_unserialize($buf);
 echo ($rt === "x") ? "cr003_inrange OK\n" : "cr003_inrange FAIL\n";
 
 // =====================================================================
-// CR-004: duplicate assoc keys must collapse to the last value, not
+// Duplicate assoc keys must collapse to the last value, not
 // create a malformed HashTable with count != actual entries.
 // =====================================================================
 // Hand-craft TAG_ASSOC with two "a" keys.
@@ -82,7 +82,7 @@ $rt = phpser_unserialize($buf);
 echo (count($rt) === 1 && $rt[0] === 3) ? "cr004_dup_int_collapse OK\n" : "cr004_dup_int_collapse FAIL\n";
 
 // =====================================================================
-// CR-006: HMAC stack key wipe — can't directly observe, but verify the
+// HMAC stack key wipe: can't directly observe, but verify the
 // signing still round-trips. The wipe is defense-in-depth; tests just
 // catch a build-level breakage of the wipe path.
 // =====================================================================
@@ -99,7 +99,7 @@ $rt = phpser_unserialize_signed($sig, $longkey);
 echo ($rt === ['x' => 1]) ? "cr006_long_key OK\n" : "cr006_long_key FAIL\n";
 
 // =====================================================================
-// CR-008: allowed_classes with non-string entry must throw TypeError,
+// allowed_classes with a non-string entry must throw TypeError,
 // matching PHP's native unserialize behavior.
 // =====================================================================
 class C_ok {}
@@ -125,7 +125,7 @@ $rt = phpser_unserialize($ser, ['allowed_classes' => [C_ok::class]]);
 echo ($rt instanceof C_ok) ? "cr008_valid OK\n" : "cr008_valid FAIL\n";
 
 // =====================================================================
-// CR-009: doubles encode as little-endian per wire-format spec. We can't
+// Doubles encode as little-endian per wire-format spec. We can't
 // flip endianness at runtime, but we can verify the LE byte layout on a
 // known value (all of x86 / ARM / WSL are LE so this test runs there).
 // =====================================================================
@@ -153,7 +153,7 @@ echo ($rt[0] === PHP_FLOAT_MIN && $rt[1] === INF && $rt[2] === -INF && is_nan($r
 // REGRESSION: uninitialized typed properties must be SKIPPED on encode
 // (not emitted as NULL). Before this fix, get_properties iteration saw
 // IS_INDIRECT pointing to IS_UNDEF and didn't deref, so the slot was
-// counted + emitted as TAG_NULL. Combined with CR-001's decoder type-
+// counted + emitted as TAG_NULL. Combined with the decoder type-
 // check, that produced "Cannot assign null to property of type int".
 // =====================================================================
 class Uninit {
@@ -168,7 +168,7 @@ echo ($rt->set === 1 && $rt->also_set === "x"
       && !isset($rt->uninit) && $rt->nullable === null)
     ? "uninit_typed_skip OK\n" : "uninit_typed_skip FAIL\n";
 
-// Same shape, but no typed props (the bug only manifested with typed) —
+// Same shape, but no typed props (the bug only manifested with typed);
 // confirm we didn't accidentally lose untyped prop emission.
 class Untyped {
     public $a = 1;
@@ -184,7 +184,7 @@ echo ($rt->a === 1 && $rt->b === "x" && $rt->c === null)
 // __sleep failures (non-array return without throw), then emit TAG_NULL
 // without registering the corresponding slot on the decode side. Result:
 // any back-ref to the same object later in the payload deref'd the wrong
-// id_table slot — typically out-of-bounds, decoder rejected the WHOLE
+// id_table slot, typically out-of-bounds, and the decoder rejected the WHOLE
 // payload as malformed. Fix: roll back the speculative enc_visit before
 // emitting TAG_NULL.
 //
@@ -211,7 +211,7 @@ echo ($rt instanceof Wrap_ && $rt->a === null && $rt->b === null && $rt->c === "
     ? "magic_fail_no_desync OK\n" : "magic_fail_no_desync FAIL\n";
 
 // REGRESSION: a __serialize() that returns a non-array without throwing used
-// to be silently encoded as TAG_NULL — the object vanished from the payload
+// to be silently encoded as TAG_NULL; the object vanished from the payload
 // with no error at write time. Native PHP raises a TypeError for this; phpser
 // now matches, failing loud instead of shipping undecodable data loss.
 class BadSerialize {

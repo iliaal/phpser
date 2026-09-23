@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-008 denied+unloaded SLOTS is a hollow SUCCESS with a live id
+phpser: denied+unloaded SLOTS is a hollow SUCCESS with a live id
 --EXTENSIONS--
 phpser
 --FILE--

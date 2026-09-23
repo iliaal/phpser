@@ -1,5 +1,5 @@
 --TEST--
-phpser: documented limitations — features not yet supported, no-crash contract
+phpser: documented limitations: features not yet supported, no-crash contract
 --EXTENSIONS--
 phpser
 --FILE--
@@ -19,7 +19,7 @@ echo $rt instanceof ArrayObject && count($rt) === 1
     ? "arrayobject_state OK\n" : "arrayobject_state FAIL\n";
 
 
-// --- Closures and resources — emit NULL, no crash ---
+// --- Closures and resources emit NULL, no crash ---
 $f = function () { return 42; };
 $rt = phpser_unserialize(phpser_serialize($f));
 echo $rt === null ? "closure_null OK\n" : "closure_null FAIL\n";

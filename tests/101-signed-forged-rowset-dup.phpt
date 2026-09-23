@@ -1,5 +1,5 @@
 --TEST--
-phpser: signed (trusted) forged rowset/table with duplicate schema keys — rejected before any cell decode (no phantom buckets, no back-ref UAF)
+phpser: signed (trusted) forged rowset/table with duplicate schema keys are rejected before any cell decode (no phantom buckets, no back-ref UAF)
 --EXTENSIONS--
 phpser
 --FILE--
@@ -13,7 +13,7 @@ function sign($body,$key){ return $body . hash_hmac('sha256',$body,$key,true); }
 // --- Object cell + back-ref: ROWSET(1 row, schema ["x","x"]) whose row is
 // [ OBJECT stdClass(id0), null ] then a TAG_REF back-ref. The duplicate "x"
 // schema key is rejected before the object cell is ever decoded, so the frame
-// fails to decode and the signed decoder throws (CR-008). No object is
+// fails to decode and the signed decoder throws. No object is
 // registered, so the back-ref UAF class cannot arise. ---
 $body =
     "\x02" . v(2) . v(1)."x" . v(8)."stdClass" .   // v2, dict = [x, stdClass]

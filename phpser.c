@@ -23,7 +23,7 @@
 #include "Zend/zend_objects_API.h"      /* zend_get_typed_property_info_for_slot */
 #include "ext/standard/php_incomplete_class.h"
 #if PHP_VERSION_ID >= 80400
-# include "Zend/zend_lazy_objects.h"     /* zend_object_is_lazy — guards the property-slot fast path */
+# include "Zend/zend_lazy_objects.h"     /* zend_object_is_lazy, for the property-slot fast path */
 #endif
 
 #include <stdint.h>
@@ -67,45 +67,39 @@
 #define TAG_PACKED_LONGS    0x08   /* varint(len), N×zigzag-varint */
 #define TAG_PACKED_DOUBLES  0x09   /* varint(len), N×8-byte LE */
 #define TAG_OBJECT          0x0a   /* varint(class_idx), varint(nprops), N×(key_idx, val) */
-#define TAG_PACKED_STRINGS  0x0b   /* varint(len), N×varint(dict_idx) — typed string run */
-#define TAG_STR_INLINE      0x0c   /* varint(len), bytes — single-use string, skips dict */
+#define TAG_PACKED_STRINGS  0x0b   /* varint(len), N×varint(dict_idx); typed string run */
+#define TAG_STR_INLINE      0x0c   /* varint(len), bytes; single-use string, skips dict */
 #define TAG_ENUM            0x0d   /* varint(class_idx), varint(case_name_idx) */
-#define TAG_OBJECT_MAGIC    0x0e   /* varint(class_idx), value — class with __serialize/__unserialize.
-                                      The value is whatever __serialize() returned (always an array,
-                                      enforced by PHP). On decode we instantiate + call __unserialize. */
-#define TAG_OBJECT_LEGACY   0x0f   /* varint(class_idx), varint(len), bytes — class with the C-level
-                                      ce->serialize / ce->unserialize hook (Serializable interface and
-                                      old SPL classes that haven't migrated to __serialize). The bytes
-                                      are opaque output from ce->serialize. */
-#define TAG_REF             0x10   /* varint(id) — back-reference to a previously-emitted container.
+#define TAG_OBJECT_MAGIC    0x0e   /* varint(class_idx), value; class with __serialize/__unserialize.
+                                      The value is the array __serialize() returned. */
+#define TAG_OBJECT_LEGACY   0x0f   /* varint(class_idx), varint(len), bytes; class with the C-level
+                                      ce->serialize / ce->unserialize hook (Serializable and SPL
+                                      classes without __serialize). The bytes are opaque
+                                      ce->serialize output. */
+#define TAG_REF             0x10   /* varint(id); back-reference to a previously-emitted container.
                                       id counts in encounter order on both sides; tags TAG_OBJECT,
                                       TAG_OBJECT_SLOTS, TAG_OBJECT_MAGIC, TAG_OBJECT_LEGACY, TAG_ENUM,
                                       and TAG_NEW_REF each implicitly claim the next id. */
-#define TAG_NEW_REF         0x11   /* inner value follows — claims the next id for an IS_REFERENCE wrap.
-                                      On decode we allocate a fresh zend_reference, register it in the
-                                      id table, then decode the inner value into ref->val. */
-#define TAG_OBJECT_SLOTS    0x12   /* varint(class_idx), varint(nprops), N×val — declared-property
-                                      values only, in ce->properties_info_table order (wire v2).
-                                      Encoder emits when the object matches the property-slot fast-path
-                                      eligibility rules and the class has no __unserialize hook. */
-#define TAG_ASSOC_DICT      0x13   /* varint(n), N×varint(dict_key_idx), N×val — assoc whose keys are
-                                      all dict-bound string refs (wire v2). Skips the per-key KEY_STR
-                                      tag byte; values use the same decode path as TAG_ASSOC. */
+#define TAG_NEW_REF         0x11   /* inner value follows; claims the next id for an IS_REFERENCE wrap. */
+#define TAG_OBJECT_SLOTS    0x12   /* varint(class_idx), varint(nprops), N×val; declared-property
+                                      values only, in ce->properties_info_table order (wire v2). */
+#define TAG_ASSOC_DICT      0x13   /* varint(n), N×varint(dict_key_idx), N×val; assoc whose keys are
+                                      all dict-bound string refs (wire v2). */
 #define TAG_ROWSET          0x14   /* varint(nrows), varint(ncols), N×varint(dict_key_idx),
-                                      nrows×ncols×val — packed array of homogeneous assoc rows (wire
+                                      nrows×ncols×val; packed array of homogeneous assoc rows (wire
                                       v2). Emits the column schema once; each row is values only. */
 #define TAG_TABLE           0x15   /* varint(nrows), varint(ncols), N×varint(dict_key_idx),
-                                      ncols×(col_tag, col_payload) — columnar rowset (wire v2).
+                                      ncols×(col_tag, col_payload); columnar rowset (wire v2).
                                       col_tag is PACKED_LONGS/DOUBLES/STRINGS/MIXED/DELTA; row
                                       count is implicit in the table header (no per-column len
                                       varint). */
-#define TAG_PACKED_DELTA    0x16   /* varint(len), zigzag(v0), (len-1)×zigzag(delta) — integer run
+#define TAG_PACKED_DELTA    0x16   /* varint(len), zigzag(v0), (len-1)×zigzag(delta); integer run
                                       stored as consecutive differences (wire v2). Arithmetic is
                                       wrapping mod 2^64 on both sides, so any int64 sequence
                                       reconstructs exactly and no overflow checks are needed.
                                       Standalone or as a TAG_TABLE column (column form omits the
                                       len varint like every other column tag). */
-#define TAG_PACKED_AFFINE   0x17   /* varint(len), zigzag(base), zigzag(step) — integer run where
+#define TAG_PACKED_AFFINE   0x17   /* varint(len), zigzag(base), zigzag(step); integer run where
                                       v[i] = base + i*step, mod 2^64 (wire v2). Constant runs are
                                       step 0. O(1) wire bytes for O(len) decoded data, which
                                       breaks the decoder's bytes-bound-memory invariant, so both
@@ -523,7 +517,7 @@ static void enc_icache_grow(encode_ctx *e) {
 }
 
 /* Insert `zs` (which the caller has confirmed absent via enc_cache_find) and
- * return its slot. No eviction — the cache grows with the payload's distinct
+ * return its slot. No eviction: the cache grows with the payload's distinct
  * string count, so every pointer-shared repeat stays cached. The caller writes
  * .idx immediately; no enc_cache_alloc_slot call may intervene before that
  * write, so the returned pointer can't be invalidated by a rehash. */
@@ -539,10 +533,9 @@ static inline intern_slot *enc_cache_alloc_slot(encode_ctx *e, zend_string *zs) 
     return &c[h];
 }
 
-/* Allocate a dict slot for `zs` and return its index. Also maintains the
- * content hash_map once the dict has crossed HASH_MAP_THRESHOLD entries
- * (small dicts skip the hash work entirely — pointer-equality via cache
- * already catches the literal-interned case). */
+/* Allocate a dict slot for `zs` and return its index. Maintains the content
+ * hash_map once the dict crosses HASH_MAP_THRESHOLD entries; below that,
+ * pointer equality already catches the literal-interned case. */
 static uint32_t enc_dict_append(encode_ctx *e, zend_string *zs) {
     if (UNEXPECTED(ZSTR_LEN(zs) > UINT32_MAX)) e->size_exceeded = 1;
     if (e->dict_len == e->dict_cap) {
@@ -634,7 +627,7 @@ static zend_always_inline int enc_emit_str_tagged(
             emit_tag_and_varint(body, dict_tag, SLOT_DICT_IDX(*s));
             return 0;
         }
-        /* INLINE_EMITTED — upgrade in place. */
+        /* INLINE_EMITTED: upgrade in place. */
         s->idx = enc_dict_append(e, zs);  /* writes into low 31 bits; high bit cleared */
         emit_tag_and_varint(body, dict_tag, s->idx);
         return 0;
@@ -695,9 +688,8 @@ static void enc_patch_nprops(smart_str *body, size_t off, uint32_t nprops) {
 }
 
 static void enc_emit_str_key(smart_str *body, encode_ctx *e, zend_string *zs) {
-    /* Keys have no placeholder kind — a TAG_NULL would be structurally wrong
-     * in a key slot — so the >4GiB key path stays discard-dependent by
-     * design: size_exceeded is set and the whole frame is dropped. */
+    /* Keys have no placeholder (a TAG_NULL is invalid in a key slot), so an
+     * over-4GiB key relies on size_exceeded dropping the whole frame. */
     (void)enc_emit_str_tagged(body, e, zs, KEY_STR, KEY_STR_INLINE);
 }
 
@@ -735,10 +727,9 @@ static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
         smart_str_appendc(body, TAG_NULL);
         return;
     }
-    /* Declared properties surface as IS_INDIRECT in get_properties() HTs —
-     * the bucket holds a pointer to the real slot in properties_table[].
-     * Deref before dispatching; otherwise we'd emit NULL for every typed
-     * property. */
+    /* Declared properties surface as IS_INDIRECT in get_properties() HTs,
+     * pointing at the real slot in properties_table[]. Without the deref
+     * every typed property would emit NULL. */
     if (Z_TYPE_P(v) == IS_INDIRECT) {
         v = Z_INDIRECT_P(v);
     }
@@ -909,9 +900,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             return;
         }
         case IS_REFERENCE: {
-            /* zend_reference identity: if we've seen this exact zend_reference
-             * struct, emit a back-ref. Otherwise claim a new id and emit
-             * TAG_NEW_REF + inner value. */
+            /* A repeated zend_reference emits a back-ref; a new one claims an
+             * id and emits TAG_NEW_REF + inner value. */
             zend_reference *ref = Z_REF_P(v);
             uint32_t id;
             if (!enc_visit(e, ref, ENC_ID_REFERENCE, &id)) {
@@ -919,28 +909,23 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                 return;
             }
             smart_str_appendc(body, TAG_NEW_REF);
-            /* id is implicitly id == enc_visit's assigned id; decoder will
-             * register the new zend_reference at next_id++ in encounter order
-             * BEFORE recursing into the inner value (so a back-ref inside
-             * the inner can resolve to this very reference). */
+            /* The decoder registers the reference at next_id++ before
+             * decoding the inner value, so a back-ref inside it resolves to
+             * this reference. */
             encode_value_ex(body, e, Z_REFVAL_P(v), true);
             return;
         }
         case IS_OBJECT: {
             zend_object *obj = Z_OBJ_P(v);
-            /* Classes marked NOT_SERIALIZABLE (Closure, Generator, internal
-             * resources etc.) can't be reconstructed by object_init_ex —
-             * their create_object handlers reject external instantiation.
-             * Emit NULL like PHP's serialize() does (modulo the userland
-             * error PHP raises that we don't expose yet). */
+            /* NOT_SERIALIZABLE classes (Closure, Generator, etc.) can't be
+             * rebuilt by object_init_ex. Emit NULL; native serialize() throws
+             * here instead. */
             if (obj->ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
                 smart_str_appendc(body, TAG_NULL);
                 return;
             }
-            /* Object handle identity: PHP's `r:N` semantics. If we've seen
-             * this exact zend_object before, emit a back-ref. Otherwise
-             * claim a new id and let the chosen container tag below take
-             * it implicitly via encounter order. */
+            /* Object identity (PHP's `r:N`): a repeat emits a back-ref; a new
+             * object claims an id taken implicitly by the container tag below. */
             /* Cheap disjuncts first: a repeat visit of an already-tracked
              * object returns below without paying the __sleep function_table
              * lookup, which otherwise runs on every back-reference. */
@@ -967,11 +952,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             } else {
                 e->next_id++;
             }
-            /* Legacy C-level serializer (Serializable interface or built-in
-             * SPL classes that haven't migrated to __serialize). PHP checks
-             * __serialize FIRST and falls through to this if it's absent.
-             * SplPriorityQueue, SplMinHeap, SplMaxHeap, SplFileInfo all
-             * land here. */
+            /* Legacy C-level serializer (Serializable, SplPriorityQueue,
+             * SplMinHeap, ...). As in PHP, __serialize takes precedence. */
             if (obj->ce->__serialize == NULL && obj->ce->serialize != NULL) {
                 unsigned char *data = NULL;
                 size_t len = 0;
@@ -988,11 +970,9 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                     return;
                 }
                 if (UNEXPECTED(EG(exception))) {
-                    /* A C-level serializer that returned SUCCESS with an
-                     * exception still pending (native rechecks after the hook
-                     * regardless of its return). Drop the output and abort
-                     * rather than emit a valid TAG_OBJECT_LEGACY over a thrown
-                     * state, matching the __serialize path. */
+                    /* SUCCESS with a pending exception: native rechecks after
+                     * the hook regardless of its return, so abort as on the
+                     * __serialize path. */
                     if (data) efree(data);
                     enc_unvisit_last(e, obj, identity_tracked);
                     e->failed = 1;
@@ -1016,10 +996,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                 if (data) efree(data);
                 return;
             }
-            /* __serialize() takes precedence over property iteration for
-             * any class that defines it (PHP 7.4+). This unlocks ArrayObject,
-             * SplObjectStorage, DateTime, and the rest of the SPL classes
-             * that have migrated to the modern magic methods. */
+            /* __serialize() takes precedence over property iteration
+             * (ArrayObject, SplObjectStorage, DateTime, ...). */
             if (obj->ce->__serialize != NULL) {
                 zval retval;
                 ZVAL_UNDEF(&retval);
@@ -1036,9 +1014,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                     }
                     zval_ptr_dtor(&retval);
                     enc_unvisit_last(e, obj, identity_tracked);
-                    /* An exception is now pending (either __serialize threw or
-                     * we just raised the TypeError). Abort the walk rather than
-                     * ship a frame with a TAG_NULL hole. */
+                    /* An exception is pending (hook threw or TypeError above);
+                     * abort rather than ship a frame with a TAG_NULL hole. */
                     if (EG(exception)) e->failed = 1;
                     smart_str_appendc(body, TAG_NULL);
                     return;
@@ -1049,9 +1026,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                 zval_ptr_dtor(&retval);
                 return;
             }
-            /* Enums are class-controlled singletons — object_init_ex won't
-             * recreate them on the decode side. Emit class + case name so
-             * we can resolve via zend_enum_get_case during decode. */
+            /* Enums are singletons object_init_ex can't recreate; emit class +
+             * case name for zend_enum_get_case on decode. */
             if (obj->ce->ce_flags & ZEND_ACC_ENUM) {
                 uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
                 zval *cname = zend_enum_fetch_case_name(obj);
@@ -1101,9 +1077,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                 }
                 if (slots_ok) {
                     uint32_t fp_nprops = slot_count;
-                    /* Wire v2: values only in declaration-table order. Requires
-                     * every declared slot to be initialized — IS_UNDEF must fall
-                     * back to keyed TAG_OBJECT (skip on wire), same as before. */
+                    /* Wire v2: values only, in declaration-table order. Any
+                     * IS_UNDEF slot falls back to keyed TAG_OBJECT. */
                     e->wire_v2 = 1;
                     smart_str_appendc(body, TAG_OBJECT_SLOTS);
                     varint_write_u64(body, class_idx);
@@ -1121,8 +1096,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                         zval *pv = OBJ_PROP(obj, info->offset);
                         if (snap == NULL && Z_TYPE_P(pv) >= IS_ARRAY) {
                             uint32_t snap_n = fp_nprops - emitted;
-                            /* Typical DTOs carry a short array/object tail after
-                             * their scalar columns — keep those snapshots off
+                            /* Typical DTOs have a short array/object tail after
+                             * their scalar columns; keep those snapshots off
                              * the allocator. */
                             snap = snap_n <= 4 ? snap_stack
                                 : (zval *)safe_emalloc(snap_n, sizeof(zval), 0);
@@ -1284,7 +1259,7 @@ static int enc_match_rowset_schema(
         }
     }
 
-    /* Schema confirmed across every row — intern row-0's field names now. */
+    /* Schema confirmed across every row; intern row-0's field names now. */
     uint32_t *key_idx = (uint32_t *)safe_emalloc((size_t)ncols, sizeof(uint32_t), 0);
     for (uint32_t c = 0; c < ncols; c++) {
         key_idx[c] = enc_intern_zstr(e, k0[c]);
@@ -1506,7 +1481,7 @@ static void enc_emit_table_column(
         smart_str_alloc(body, (size_t)nrows * VARINT_MAX_BYTES, 0);
         char *base = ZSTR_VAL(body->s);
         size_t pos = ZSTR_LEN(body->s);
-        /* same_value computed once by enc_detect_column_tag — no second walk. */
+        /* same_value comes from enc_detect_column_tag; no second walk. */
         zend_string *s0 = Z_STR_P(cells[0]);
         uint64_t same_idx = same_value ? enc_intern_zstr(e, s0) : 0;
         for (uint32_t r = 0; r < nrows; r++) {
@@ -1623,11 +1598,9 @@ static uint8_t enc_pick_long_run_tag(encode_ctx *e, const zval *zp,
     if (n < 4) return TAG_PACKED_LONGS;
     uint64_t prev = (uint64_t)Z_LVAL(zp[0]);
     uint64_t step0 = (uint64_t)Z_LVAL(zp[1]) - prev;
-    /* Affine probe first — one subtract and compare per element, with an
-     * early break. The byte-sizing pass below costs more than the varint
-     * emission an affine run saves, so it runs only once affine is off the
-     * table (non-affine data breaks out of this loop within a few
-     * elements). */
+    /* Affine probe first: one subtract and compare per element with an early
+     * break. The byte-sizing pass below costs more than an affine run saves,
+     * so it runs only once affine is ruled out. */
     int affine = 1;
     for (uint32_t i = 1; i < n; i++) {
         uint64_t cur = (uint64_t)Z_LVAL(zp[i]);
@@ -1725,14 +1698,12 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
             ZSTR_LEN(body->s) = pos;
             return;
         }
-        /* Dense packed, non-string lead — try a numeric typed-run tag. */
+        /* Dense packed, non-string lead: try a numeric typed-run tag. */
         int64_t affine_step = 0;
         uint8_t tag = detect_packed_run(e, ht, n_used, &affine_step);
-        /* enc_try_table emits TAG_TABLE on any homogeneous string-keyed rowset,
-         * including all-MIXED columns (each such column falls back to per-cell
-         * encode_value). It therefore supersedes the row-major TAG_ROWSET encode
-         * entirely, so there is no fallback call here. TAG_ROWSET decode is kept
-         * for payloads written by older releases. */
+        /* enc_try_table covers every homogeneous string-keyed rowset, including
+         * all-MIXED columns, so TAG_ROWSET is never encoded. Its decoder stays
+         * for older payloads. */
         if (tag == TAG_PACKED_MIXED && enc_try_table(body, e, zp, n_used)) {
             return;
         }
@@ -1757,10 +1728,8 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
             }
             ZSTR_LEN(body->s) = pos;
         } else if (tag == TAG_PACKED_LONGS) {
-            /* Reserve the whole run's worst case once, then write raw —
-             * collapses n_used per-element capacity checks to one. Nothing
-             * else appends to body inside the loop, so the cached base stays
-             * valid. */
+            /* Reserve the run's worst case once, then write raw. Nothing else
+             * appends to body inside the loop, so the cached base stays valid. */
             smart_str_alloc(body, (size_t)n_used * VARINT_MAX_BYTES, 0);
             char *base = ZSTR_VAL(body->s);
             size_t pos = ZSTR_LEN(body->s);
@@ -1919,11 +1888,9 @@ typedef struct {
      * to dict_len, lazy-allocated on first class-carrying tag. Invalid names
      * abort the decode, so only "valid" is ever stored. */
     uint8_t *cname_cache;
-    /* C-stack recursion guard: TAG_NEW_REF / TAG_PACKED_MIXED / TAG_ASSOC /
-     * TAG_OBJECT / TAG_OBJECT_MAGIC all recurse through decode_value.
-     * Without a cap, attacker-controlled wire format can blow the pthread
-     * stack at ~100K nested frames. Bracket decode_value with ++/-- and
-     * reject when >= MAX_DEPTH. */
+    /* C-stack recursion guard for container tags that recurse through
+     * decode_value. Uncapped, a crafted payload blows the pthread stack at
+     * ~100K nested frames. */
     uint32_t depth;
     /* Elements already materialized under sub-linear tags; see
      * PHPSER_SUBLINEAR_MAX_ELEMS. */
@@ -1982,9 +1949,8 @@ static void dec_register(decode_ctx *d, zval *z) {
         GC_ADDREF(s->u.ref);
         s->pinned = 1;
     } else {
-        /* Encoder always claimed an id for this slot; we must register
-         * something to keep id counts aligned. Back-refs to a NULL slot
-         * yield NULL on the decode side. */
+        /* The encoder claimed an id here; register a NULL slot to keep ids
+         * aligned. Back-refs to it yield NULL. */
         s->kind = ID_NULL;
     }
 }
@@ -2241,14 +2207,12 @@ static int dec_apply_data_as_props(zend_object *obj, HashTable *data_ht) {
         zval tmp;
         ZVAL_COPY(&tmp, val);  /* addref for the new owner */
         if (key) {
-            /* dec_install_prop dtors tmp on a typed-slot mismatch and leaves a
-             * pending TypeError. Stop and report so the caller fails the decode
-             * instead of continuing to install props and queue __wakeup under a
-             * pending exception (fail-fast, like TAG_OBJECT / TAG_OBJECT_SLOTS). */
+            /* A typed-slot mismatch leaves a pending TypeError; fail the decode
+             * instead of installing more props and queueing __wakeup under it. */
             if (dec_install_prop(obj, obj_props, key, &tmp) < 0) return -1;
         } else {
-            /* Int key — convert to string for the dynamic-property table,
-             * matching PHP's behavior (creates property "0", "1", etc.). */
+            /* Int keys become string-named dynamic properties ("0", "1"), as
+             * in PHP. */
             zend_string *str_key = zend_long_to_str((zend_long)h);
             int rc = dec_install_prop(obj, obj_props, str_key, &tmp);
             zend_string_release(str_key);
@@ -2270,9 +2234,8 @@ static int dec_make_incomplete(zval *out, zend_string *original_class_name) {
     return 0;
 }
 
-/* Takes a uint64 because varint_read_u64 produces uint64. Bound-check
- * BEFORE narrowing — otherwise an attacker can craft idx = 2^32 (or any
- * multiple of dict_len) and the uint32 truncation lands on a valid slot. */
+/* Bound-check the uint64 index BEFORE narrowing; otherwise idx = 2^32 (or any
+ * multiple of dict_len) truncates onto a valid slot. */
 static inline zend_string *dec_get_zstr(decode_ctx *d, uint64_t idx) {
     if (UNEXPECTED(idx >= d->dict_len)) return NULL;
     return d->dict[idx];
@@ -2304,10 +2267,8 @@ static int dec_schema_keys_are_unique(zend_string **keys, uint64_t nkeys);
 static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out);
 static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out);
 
-/* Materialize the dict header. We eagerly allocate every dict slot and
- * pre-compute its hash. This trades a tiny up-front cost for one less branch
- * in the per-string hot path, plus zend_hash_add_new gets a hot hash on the
- * zend_string and skips its compute step. */
+/* Eagerly materialize every dict slot with a precomputed hash: one less branch
+ * in the per-string hot path, and zend_hash_add_new skips hashing. */
 static int decode_header(decode_ctx *d) {
     if (d->len < 1) return -1;
     uint8_t ver = d->buf[d->pos++];
@@ -2425,9 +2386,9 @@ static int decode_key(decode_ctx *d, key_val *out_key) {
 
 static int decode_value_inner(decode_ctx *d, zval *out);
 
-/* Scalar tags are the fixed-width / dict-ref leaves. Container runs
- * (0x06-0x0b) sit between TAG_DOUBLE and TAG_STR_INLINE and must not
- * be treated as scalars — TAG_PACKED_STRINGS is 0x0b < TAG_STR_INLINE. */
+/* Scalar tags are the fixed-width and dict-ref leaves. Container tags
+ * 0x06-0x0b sit between TAG_DOUBLE and TAG_STR_INLINE, so a plain
+ * `tag <= TAG_STR_INLINE` range check would misclassify them. */
 static zend_always_inline int dec_is_scalar_tag(uint8_t tag) {
     return tag <= TAG_DOUBLE || tag == TAG_STR_DICT || tag == TAG_STR_INLINE;
 }
@@ -2623,8 +2584,7 @@ static int dec_table_column(decode_ctx *d, zval *col, uint64_t nrows, uint8_t co
 fail:
     /* A partial column leaves cells [i, nrows) as uninitialized emalloc bytes.
      * Blank them so the caller's uniform zval_ptr_dtor over all nrows can't
-     * release garbage. On success this label is never reached — no hot-path
-     * cost. */
+     * release garbage. Only the failure path reaches this label. */
     for (; i < nrows; i++) {
         ZVAL_UNDEF(&col[i]);
     }
@@ -2684,12 +2644,10 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
         case TAG_PACKED_LONGS: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-            /* Bound N by remaining buffer — each element is at least 1 byte
-             * (the smallest varint). Without this a malformed payload could
-             * announce N=2^32 elements and OOM us before parsing fails. */
+            /* Each element is at least one byte, so bound N by the remaining
+             * buffer; otherwise N=2^32 OOMs before parsing fails. */
             if (n > UINT32_MAX || n > d->len - d->pos) return -1;
-            /* Pre-sized HT + direct arPacked writes. This is the hot path
-             * we expect to beat igbinary on numeric arrays. */
+            /* Pre-sized HT + direct arPacked writes. */
             zend_array *arr = zend_new_array((uint32_t)n);
             zend_hash_real_init_packed(arr);
             for (uint64_t i = 0; i < n; i++) {
@@ -2707,7 +2665,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
         case TAG_PACKED_DOUBLES: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-            /* PACKED_DOUBLES requires exactly 8*N bytes — check fits exactly. */
+            /* PACKED_DOUBLES needs exactly 8*N bytes. */
             if (n > UINT32_MAX || n > (d->len - d->pos) / 8) return -1;
             zend_array *arr = zend_new_array((uint32_t)n);
             zend_hash_real_init_packed(arr);
@@ -2761,7 +2719,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
         case TAG_PACKED_DELTA: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-            /* v0 plus n-1 deltas is at least n wire bytes — the same linear
+            /* v0 plus n-1 deltas is at least n wire bytes, the same linear
              * bound as PACKED_LONGS. */
             if (n > UINT32_MAX || n > d->len - d->pos) return -1;
             zend_array *arr = zend_new_array((uint32_t)n);
@@ -2833,17 +2791,16 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             }
             zend_class_entry *ce = dec_class_resolve(d, class_idx, class_name);
             if (!ce || ce->unserialize == NULL) {
-                /* Unknown class or no C-level unserializer — skip past the
-                 * payload bytes, yield NULL, and register a NULL id-slot so
-                 * subsequent TAG_REFs to this position resolve to NULL
-                 * (matching what we'd see on a partial decode). */
+                /* Unknown class or no C-level unserializer: skip the payload,
+                 * yield NULL, and register a NULL id slot so later TAG_REFs
+                 * resolve to NULL. */
                 d->pos += blen;
                 ZVAL_NULL(out);
                 dec_register(d, out);
                 return 0;
             }
-            /* ce->unserialize is responsible for initializing *out; we don't
-             * pre-init it. var_hash is NULL — same caveat as the encode side. */
+            /* ce->unserialize initializes *out. var_hash is NULL, as on the
+             * encode side. */
             const unsigned char *payload = d->buf + d->pos;
             d->pos += blen;
             if (ce->unserialize(out, ce, payload, (size_t)blen, NULL) != SUCCESS) {
@@ -2865,11 +2822,9 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             int allowed = dec_class_allowed(d, class_idx, class_name);
             zend_class_entry *ce = allowed
                 ? dec_class_resolve(d, class_idx, class_name) : NULL;
-            /* Unknown class: decode to __PHP_Incomplete_Class with the
-             * original name preserved, exactly like a denied class — never
-             * a live stdClass with the name lost (which also silently
-             * dropped the re-encode recovery path). Uniform across OBJECT,
-             * MAGIC, and SLOTS. */
+            /* Unknown class: decode to __PHP_Incomplete_Class with the original
+             * name preserved, like a denied class, so a re-encode can recover
+             * it. Uniform across OBJECT, MAGIC, and SLOTS. */
             int known = (ce != NULL);
             if (!ce) ce = PHP_IC_ENTRY;
 
@@ -2882,11 +2837,9 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 return -1;
             }
             if (!allowed || !known) php_store_class_name(out, class_name);
-            /* Register the empty object NOW, before decoding the data array.
-             * A back-ref inside the data array can then resolve to this very
-             * object (cycles through __serialize-class payloads). __unserialize
-             * is deferred to the end of the decode pass so the whole graph is
-             * stitched before any user code runs that might depend on it. */
+            /* Register the empty object before decoding the data array so a
+             * back-ref inside it resolves here. __unserialize is deferred until
+             * the whole graph is stitched. */
             dec_register(d, out);
 
             zval data;
@@ -2907,18 +2860,15 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                  * including on incomplete classes. */
                 if (dec_apply_data_as_props(Z_OBJ_P(out), Z_ARRVAL(data)) < 0) {
                     /* A typed slot rejected the data (pending TypeError). `out`
-                     * is registered; decode_destroy releases it during
-                     * teardown — same convention as the decode-failure path
-                     * above. Do not queue __wakeup. */
+                     * is registered, so decode_destroy releases it. Do not
+                     * queue __wakeup. */
                     zval_ptr_dtor(&data);
                     return -1;
                 }
                 zval_ptr_dtor(&data);
-                /* Native then calls __wakeup() if the (instantiable, allowed)
-                 * class defines it: a __serialize()+__wakeup() class without
-                 * __unserialize() falls through the no-__unserialize branch
-                 * above and must still fire __wakeup(). Gated on `allowed` so
-                 * incomplete classes (PHP_IC_ENTRY) never run a hook. */
+                /* Like native, a class with __serialize() + __wakeup() but no
+                 * __unserialize() still gets __wakeup(). Gated on `allowed` so
+                 * incomplete classes never run a hook. */
                 if (allowed) {
                     dec_maybe_defer_wakeup(d, ce, Z_OBJ_P(out));
                 }
@@ -2999,10 +2949,9 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             }
 
             /* Allowed: the layout must come from the real class. An unknown
-             * class has no layout; consume the values into a property-less
-             * incomplete instead of hard-failing — the same hollow-SUCCESS
-             * contract as the denied+unloaded path above, so the id still
-             * claims a slot and later TAG_REFs resolve. */
+             * class has none, so consume the values into a property-less
+             * incomplete, as on the denied+unloaded path; the id still claims a
+             * slot and later TAG_REFs resolve. */
             zend_class_entry *ce = dec_class_resolve(d, class_idx, class_name);
             if (!ce) {
                 if (dec_make_incomplete(out, class_name) < 0) return -1;
@@ -3078,18 +3027,13 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             zend_string *class_name = dec_get_class_name(d, class_idx);
             if (!class_name) return -1;
 
-            /* allowed_classes filter: disallowed classes decode into
-             * __PHP_Incomplete_Class with the original name attached as
-             * the magic property. Properties below still land via the
-             * normal IS_INDIRECT / dynamic-prop write path. */
+            /* Disallowed classes decode into __PHP_Incomplete_Class with the
+             * original name in the magic property. */
             int allowed = dec_class_allowed(d, class_idx, class_name);
             zend_class_entry *ce = allowed
                 ? dec_class_resolve(d, class_idx, class_name) : NULL;
             /* Unknown class: __PHP_Incomplete_Class with the original name
-             * preserved (uniform with MAGIC/SLOTS). The old stdClass
-             * fallback lost the name, so a later re-encode could never
-             * recover the real class — and it diverged from SLOTS, which
-             * hard-failed the same input. */
+             * preserved, uniform with MAGIC/SLOTS. */
             int known = (ce != NULL);
             if (!ce) ce = PHP_IC_ENTRY;
 
@@ -3159,9 +3103,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx) < 0) goto obj_fail;
                 zend_string *key = dec_get_zstr(d, key_idx);
                 if (!key) goto obj_fail;
-                /* Reject a forbidden dynamic property at the key, before the
-                 * value is decoded — otherwise a class named in the value
-                 * autoloads before the rejection (native rejects at the key). */
+                /* Reject a forbidden dynamic property at the key, as native
+                 * does; decoding the value first could autoload a class. */
                 if (UNEXPECTED(dec_dynamic_prop_forbidden(obj, obj_props, key))) {
                     goto obj_fail;
                 }
@@ -3175,11 +3118,9 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                         }
                         continue;
                     }
-                    /* Dynamic or otherwise non-slot key: materialize once
-                     * and stay in materialized mode — this and every later
-                     * key goes through dec_install_prop, which resolves
-                     * declared props via the HT's IS_INDIRECT entries
-                     * (identical slot writes, just through the table). */
+                    /* Non-slot key: materialize once and route this and every
+                     * later key through dec_install_prop, which reaches
+                     * declared slots via IS_INDIRECT entries. */
                     obj_props = zend_std_get_properties(obj);
                 }
                 /* dec_install_prop mirrors var_unserializer.re:608-708:
@@ -3191,9 +3132,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             obj_fail:
                 zval_ptr_dtor(out); ZVAL_NULL(out); return -1;
             }
-            /* Queue __wakeup if the class defines it. Deferred to end-of-pass
-             * so the full graph is stitched before any wakeup hook runs and
-             * sees cycle back-edges intact. */
+            /* Defer __wakeup until the full graph, including cycle back-edges,
+             * is stitched. */
             dec_maybe_defer_wakeup(d, ce, obj);
             return 0;
         }
@@ -3581,10 +3521,9 @@ zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
             ctx.icache_init_cap = cap;
         }
     } else if (Z_TYPE_P(value) == IS_OBJECT) {
-        /* Same intern-cache seeding for a top-level object: every distinct
-         * property name (and class name) occupies a slot. Count declared
-         * slots without materializing plus any dynamic table — an
-         * over-estimate only costs zeroed bytes, wire output is unaffected. */
+        /* Same seeding for a top-level object: each property and class name
+         * takes a slot. Count declared slots without materializing, plus any
+         * dynamic table; an over-estimate only costs zeroed bytes. */
         zend_class_entry *sce = Z_OBJCE_P(value);
         uint32_t n = sce->default_properties_count;
         if (Z_OBJ_P(value)->properties) {
@@ -3612,17 +3551,14 @@ zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
         if (status) *status = PHPSER_ENC_EXCEPTION;
         return NULL;
     }
-    /* Reject over-deep input rather than ship a truncated payload. The
-     * decoder caps at the same MAX_DEPTH, so a payload that hit the encode
-     * cap would decode to NULL in full — silent total data loss. Fail
-     * loud here instead. */
+    /* Reject over-deep input: the decoder caps at the same MAX_DEPTH, so a
+     * truncated payload would decode to NULL in full. */
     if (UNEXPECTED(ctx.depth_exceeded)) {
         return enc_finish_overflow(
             &body, &ctx, throw_on_overflow, status, PHPSER_ENC_DEPTH);
     }
-    /* Same fail-loud contract for an over-4GiB string/blob: the decoder's
-     * per-string UINT32_MAX cap would reject the whole payload, so refuse to
-     * emit one rather than hand back undecodable bytes. */
+    /* Likewise for an over-4GiB string/blob, which the decoder's per-string
+     * UINT32_MAX cap would reject. */
     if (UNEXPECTED(ctx.size_exceeded)) {
         return enc_finish_overflow(
             &body, &ctx, throw_on_overflow, status, PHPSER_ENC_SIZE);

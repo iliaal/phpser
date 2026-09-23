@@ -1,5 +1,5 @@
 --TEST--
-phpser: schema uniqueness on the hashed branch (ncols > 32) — unique round-trips, forged dup rejected
+phpser: schema uniqueness on the hashed branch (ncols > 32): unique round-trips, forged dup rejected
 --EXTENSIONS--
 phpser
 --FILE--
@@ -32,7 +32,7 @@ $cols = "";
 for ($i = 0; $i < $ncols; $i++) {
     $val = $i * 10;
     // TAG_PACKED_LONGS column: tag byte + nrows cells (nrows=1 here, from the
-    // TABLE header — no per-column count). One zigzag varint for the cell.
+    // TABLE header; no per-column count). One zigzag varint for the cell.
     $cols .= "\x08" . v($val << 1);
 }
 $body = "\x02" . v(32) . $dict . "\x15" . v(1) . v($ncols) . $schema . $cols;

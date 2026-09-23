@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-014 allowed-but-unknown classes decode to named incompletes
+phpser: allowed-but-unknown classes decode to named incompletes
 --EXTENSIONS--
 phpser
 --FILE--

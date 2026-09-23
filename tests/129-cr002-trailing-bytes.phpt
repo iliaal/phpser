@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-002 trailing bytes rejected on signed path, tolerated unsigned
+phpser: trailing bytes rejected on signed path, tolerated unsigned
 --EXTENSIONS--
 phpser
 --FILE--

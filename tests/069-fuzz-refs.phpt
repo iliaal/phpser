@@ -43,12 +43,11 @@ $rt = phpser_unserialize("\x01\x00\x11\x10\x00");
 // Self-referencing ref: a reference whose value IS the reference itself
 // (the degenerate $r = &$r cycle). phpser flattens references, so this
 // shape can't be represented and the decoder rejects it to NULL rather
-// than crashing. Pin that value — the earlier `|| true` made this assert
-// a tautology that would pass for any result, including a future crash.
+// than crashing. Pin that value.
 echo ($rt === null) ? "newref_self OK\n" : "newref_self FAIL\n";
 
 // --- TAG_NEW_REF nested deeply: a NEW_REF chain flattens to its inner value
-// (NULL here), so the value alone is a weak oracle — pin NULL plus a clean
+// (NULL here), so the value alone is a weak oracle; pin NULL plus a clean
 // warning slate instead of @-suppressing. Survival to the next line pins
 // no-crash; the handler pins warning-freedom.
 $buf = "\x01\x00" . str_repeat("\x11", 256) . "\x00";
@@ -100,7 +99,7 @@ for ($i = 0; $i < 100; $i++) {
 }
 echo "random_fuzz OK\n";
 
-// --- Deeply nested arrays — verify our MAX_DEPTH cap. Both encoder and
+// --- Deeply nested arrays: verify the MAX_DEPTH cap. Both encoder and
 // decoder cap at depth 512 (encoder throws past it, decoder rejects to
 // NULL). Build a 200-deep array, well under the cap, round-trip OK. ---
 $deep = "x";

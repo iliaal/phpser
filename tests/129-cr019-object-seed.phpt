@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-019 top-level object with 100+ props round-trips (intern seeding)
+phpser: top-level object with 100+ props round-trips (intern seeding)
 --EXTENSIONS--
 phpser
 --FILE--

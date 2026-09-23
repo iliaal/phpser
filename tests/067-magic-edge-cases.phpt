@@ -57,7 +57,7 @@ $ok = $rt instanceof B_GH
 echo $ok ? "gh12265_cycle OK\n" : "gh12265_cycle FAIL\n";
 
 // --- __serialize returning array with internal shared object (no cycle).
-// The same inner object appears in two slots of the __serialize output —
+// The same inner object appears in two slots of the __serialize output;
 // must come back as one object. ---
 class Shared {
     public int $n;

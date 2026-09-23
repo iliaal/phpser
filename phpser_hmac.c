@@ -16,10 +16,9 @@
  * storage layer is untrusted (e.g. shared Memcached).
  *
  * Wire format for signed payloads: [raw frame bytes][32-byte HMAC tag].
- * The tag is computed over the raw frame only. Separate function names
- * (vs. a flag in unserialize) mean the caller's intent is explicit at the
- * call site — no magic-byte detection, no chance of accidentally accepting
- * an unsigned payload through the signed path.
+ * The tag is computed over the raw frame only. Separate entry points (not a
+ * flag or magic-byte detection) keep an unsigned payload from ever being
+ * accepted through the signed path.
  * ------------------------------------------------------------------------- */
 
 #include "phpser_int.h"

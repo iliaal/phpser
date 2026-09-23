@@ -71,7 +71,7 @@ $rt64k = phpser_unserialize(phpser_serialize($a64k));
 echo ($rt256 === $a256 && $rt64k === $a64k) ? "bug077 OK\n" : "bug077 fail\n";
 
 // --- igbinary_080-style: numeric-string content that looks like int ---
-// PHP's array indexing converts string '3010480803' to int — but as a
+// PHP's array indexing converts string '3010480803' to int, but as a
 // VALUE in an assoc array, it stays a string. Verify both keys and values.
 $var = ['id' => "3010480803", 'user_id' => 12346];
 $rt = phpser_unserialize(phpser_serialize($var));
@@ -99,8 +99,7 @@ foreach ($rt as $i => $obj) {
 echo $ok ? "bug086 OK\n" : "bug086 fail\n";
 
 // --- igbinary_090-style: arrays whose values come via globals (IS_INDIRECT) ---
-// $GLOBALS is special — values come through as IS_INDIRECT. We deref in the
-// encoder. Test indirectly by manipulating $GLOBALS.
+// $GLOBALS values come through as IS_INDIRECT, which the encoder derefs. Test indirectly by manipulating $GLOBALS.
 $myGlobalVar086_a = 123;
 $myGlobalVar086_b = "hello";
 $g = [

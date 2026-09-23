@@ -1,5 +1,5 @@
 --TEST--
-phpser: TAG_OBJECT_SLOTS wire v2 — declaration-order DTO encode/decode
+phpser: TAG_OBJECT_SLOTS wire v2: declaration-order DTO encode/decode
 --EXTENSIONS--
 phpser
 --FILE--
@@ -7,7 +7,7 @@ phpser
 
 // Return the top-level value tag byte, skipping the [version][dict] header,
 // so tag assertions can't be fooled by a 0x0a/0x12 byte occurring inside dict
-// content or a varint (a plain strpos over the whole frame can — see CR-019).
+// content or a varint (a plain strpos over the whole frame can).
 function top_tag(string $blob): int {
     $p = 1; // skip version byte
     $rd = function () use ($blob, &$p): int {

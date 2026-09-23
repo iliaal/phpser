@@ -1,5 +1,5 @@
 --TEST--
-phpser: signed decode — denied, unloaded TAG_OBJECT_SLOTS whose discarded slot value is back-referenced (id-table pin safety)
+phpser: signed decode of a denied, unloaded TAG_OBJECT_SLOTS whose discarded slot value is back-referenced (id-table pin safety)
 --EXTENSIONS--
 phpser
 --FILE--

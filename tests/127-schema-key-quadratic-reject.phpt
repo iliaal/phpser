@@ -1,18 +1,17 @@
 --TEST--
-phpser: schema-key install rejects numeric/duplicate keys — no unbudgeted integer-domain quadratic decode (BUG-R2-C2-A1-H1, CWE-400)
+phpser: schema-key install rejects numeric/duplicate keys, preventing unbudgeted integer-domain quadratic decode (CWE-400)
 --DESCRIPTION--
 The three schema-key container tags (TAG_ASSOC_DICT 0x13, TAG_ROWSET 0x14,
-TAG_TABLE 0x15) gated an add_new fast path on "non-numeric && unique" and
-otherwise fell back to zend_symtable_update. That fallback coerces canonical
+TAG_TABLE 0x15) must not fall back to zend_symtable_update, which coerces canonical
 numeric-string keys to INTEGER keys, whose bucket slot is h & (nTableSize-1)
 with no hash function and no MAX_HASH_CHAIN_LENGTH budget. Because the
 destination table is pre-sized to next_pow2(n) and never resizes, crafted keys
 T, 2T, ..., nT all collapse into one slot: Theta(n^2) bucket walks from a
-bounded-size frame — the exact quadratic-blowup class the security policy
-excludes, and the class the 0.5.0 collision budget claimed to close. No honest
-frame can reach the fallback (a real string-keyed bucket is never a canonical
-numeric string, and array keys are unique), so dec_read_schema_keys now REJECTS
-numeric or duplicate schema keys at schema-parse time, before any cell decode.
+bounded-size frame, the quadratic-blowup class the security policy excludes.
+No honest frame produces such keys (a real string-keyed bucket is never a
+canonical numeric string, and array keys are unique), so dec_read_schema_keys
+REJECTS numeric or duplicate schema keys at schema-parse time, before any cell
+decode.
 --EXTENSIONS--
 phpser
 --FILE--
@@ -34,14 +33,13 @@ function collide_assoc_dict($n){
 
 // A non-trivial n: pre-fix this decoded (and burned quadratic time); post-fix
 // it must reject. Rejection is the security property and the regression guard:
-// a fallback to the old collapse path would DECODE this to a valid array, so
-// `=== null` catches it. (No wall-clock assertion — decode time is instrumented
+// a fallback to a collapse path would DECODE this to a valid array, so
+// `=== null` catches it. (No wall-clock assertion: decode time is instrumented
 // build and runner dependent; an ASAN lane rejects this same frame in seconds.)
 $r = phpser_unserialize(collide_assoc_dict(16384));
 echo ($r === null) ? "assoc_dict_reject OK\n" : "assoc_dict_reject FAIL\n";
 
-// Single numeric key is enough to force the (former) fallback for the whole
-// schema — reject.
+// A single numeric key rejects the whole schema.
 $num1 = "\x01" . v(1) . v(1) . "7" . "\x13" . v(1) . v(0) . "\x00";
 echo (phpser_unserialize($num1) === null) ? "single_numeric_reject OK\n" : "single_numeric_reject FAIL\n";
 

@@ -1,5 +1,5 @@
 --TEST--
-phpser: encode-side UAF — a __serialize hook mutates the live ArrayObject storage it was handed out from (BUG-R2-C4-A1-H1 / BUG-R2-C4-A2-H1)
+phpser: encode-side UAF: a __serialize hook mutates the live ArrayObject storage it was handed out from
 --DESCRIPTION--
 ArrayObject/ArrayIterator::__serialize embed the object's LIVE internal
 storage array in the retval by ZVAL_COPY (an addref, not a copy). phpser
@@ -10,14 +10,13 @@ table in place through the refcount-blind zend_hash C-API (HT_ASSERT_RC1 is
 ZEND_DEBUG-only), so the hold does not protect it:
 
   - An INSERT (offsetSet/append) reallocs the storage's arData under
-    encode_hashtable's cached bucket iterator (sink BUG-R2-C4-A1-H1).
+    encode_hashtable's cached bucket iterator.
   - A DELETE (offsetUnset) of an RC-1 row frees that row's HashTable under
-    enc_try_table's gathered col_cells pointers (sink BUG-R2-C4-A2-H1).
+    enc_try_table's gathered col_cells pointers.
   - A row that is itself a second ArrayObject's storage is REALLOCATED in
     place by a sibling cell's hook, dangling the same col_cells pointers.
 
-All are heap use-after-free. The fix closes the two sites that hold raw
-pointers across user code:
+All are heap use-after-free. Two sites hold raw pointers across user code:
 
   - encode_hashtable's generic per-element loops walk a private duplicate
     (enc_pin_walk -> zend_array_dup) of any shared (refcount>1) NESTED table
@@ -30,8 +29,8 @@ On a release build each turns into a freed-heap read that valgrind/ASAN flags;
 without instrumentation the assertions still hold (encode completes, output
 round-trips).
 Lane matrix:
-  release / valgrind / ASAN  — this file (in-place SPL sinks below).
-  debug (ZEND_DEBUG)        — skipped here: the misbehaving SPL write to the
+  release / valgrind / ASAN: this file (in-place SPL sinks below).
+  debug (ZEND_DEBUG): skipped here; the misbehaving SPL write to the
     refcount>1 storage trips the engine's own HT_ASSERT_RC1 and aborts before
     the walk continues. The duplicate-path correctness a debug/ASAN lane CAN
     exercise (shared nested tables, hole compaction, no in-place SPL write)

@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-004 session scalar root decodes to FAILURE, not empty SUCCESS
+phpser: session scalar root decodes to FAILURE, not empty SUCCESS
 --EXTENSIONS--
 phpser
 session

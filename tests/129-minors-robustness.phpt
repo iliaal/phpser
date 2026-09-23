@@ -1,5 +1,5 @@
 --TEST--
-phpser: minors batch B encode/decode robustness pins
+phpser: encode/decode robustness pins
 --EXTENSIONS--
 phpser
 --FILE--

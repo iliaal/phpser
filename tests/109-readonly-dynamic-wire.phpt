@@ -43,7 +43,7 @@ echo $allowed->x, "\n";
 
 // Fail-fast: the forbidden dynamic property must reject at the key, before
 // the value is decoded. If the value names a class, decoding it would fire
-// the autoloader — native rejects first and never touches the value.
+// the autoloader; native rejects first and never touches the value.
 $autoloaded = [];
 spl_autoload_register(function (string $name) use (&$autoloaded): void {
     $autoloaded[] = $name;

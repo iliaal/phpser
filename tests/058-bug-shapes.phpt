@@ -28,7 +28,7 @@ $special = "a\nb\tc\rd\0e\\f\"g'h";
 
 // Same content from different allocations
 $s1 = "hello";
-$s2 = "hel" . "lo";    // concat — likely a distinct allocation
+$s2 = "hel" . "lo";    // concat: likely a distinct allocation
 $s3 = strrev(strrev("hello")); // runtime-built
 
 $cases = [

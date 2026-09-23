@@ -19,7 +19,7 @@ $tiny = PHP_FLOAT_MIN / 2;
 $rt = phpser_unserialize(phpser_serialize($tiny));
 var_dump($tiny === $rt);
 
-// Negative zero — bit-level comparison, since 1/$rt would raise
+// Negative zero: bit-level comparison, since 1/$rt would raise
 // DivisionByZeroError in PHP 8.
 $rt = phpser_unserialize(phpser_serialize(-0.0));
 var_dump(pack("d", $rt) === pack("d", -0.0));

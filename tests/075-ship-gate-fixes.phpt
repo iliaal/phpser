@@ -1,17 +1,17 @@
 --TEST--
-phpser: ship-gate regressions — CR-001 leak, CR-002 wakeup UAF, CR-003 depth cap, CR-004 exception
+phpser: decode regressions: partial-decode leak, wakeup UAF, depth cap, deferred-hook exception
 --EXTENSIONS--
 phpser
 --FILE--
 <?php
 
 // =====================================================================
-// CR-002: UAF in wakeup queue when an earlier __wakeup mutates own
+// UAF in wakeup queue when an earlier __wakeup mutates own
 // properties to drop the only reference to a sibling object also queued.
 // Without the GC_ADDREF fix the second iteration deref's freed memory.
 // Under ASan / valgrind this would crash; without instrumentation it
 // usually just produces garbage. We assert the post-wakeup state is
-// sane — a sufficient proxy.
+// sane, a sufficient proxy.
 // =====================================================================
 class A_uaf {
     public string $tag = "A";
@@ -34,7 +34,7 @@ $rt = phpser_unserialize(phpser_serialize($b));
 // Both wakeups must have run. The inner A_uaf is gone from $rt->inner
 // (B's __wakeup unset it), but the wakeup queue must still have called
 // its __wakeup. Since A_uaf is unset from $rt, we can't observe its
-// $woke directly — but we can detect the UAF crash via survival here.
+// $woke directly, but survival here detects the UAF crash.
 echo ($rt instanceof B_uaf && $rt->tag === "B") ? "cr002_uaf OK\n" : "cr002_uaf FAIL\n";
 
 // Variant: A's __wakeup queued first, drops a sibling C.
@@ -55,7 +55,7 @@ $rt = phpser_unserialize(phpser_serialize($p));
 echo ($rt instanceof P_uaf && $rt->a instanceof A_uaf && $rt->a->woke === true)
     ? "cr002_sibling OK\n" : "cr002_sibling FAIL\n";
 
-// Variant: deferred __unserialize queue same shape — defense-in-depth.
+// Variant: deferred __unserialize queue same shape (defense in depth).
 class D_def {
     public string $name = "";
     public bool $unserialized = false;
@@ -75,16 +75,16 @@ foreach ($rt as $i => $o) {
 echo $ok ? "cr002_defer_queue OK\n" : "cr002_defer_queue FAIL\n";
 
 // =====================================================================
-// CR-003: Decoder depth cap. A wire payload of 5000 nested TAG_NEW_REFs
+// Decoder depth cap. A wire payload of 5000 nested TAG_NEW_REFs
 // would blow the C stack without the cap. Build by hand:
-//   0x01 0x00         — version + empty dict
-//   0x11 × N          — TAG_NEW_REF repeated
-//   0x00              — TAG_NULL (the innermost value)
+//   0x01 0x00         version + empty dict
+//   0x11 × N          TAG_NEW_REF repeated
+//   0x00              TAG_NULL (the innermost value)
 // Decoder must reject (or terminate) without crash.
 // =====================================================================
 $buf = "\x01\x00" . str_repeat("\x11", 5000) . "\x00";
 // A NEW_REF chain over NULL flattens to NULL even shallow, so the value
-// alone cannot prove the cap fired — but the cap path must also reject to
+// alone cannot prove the cap fired, but the cap path must also reject to
 // NULL (never a partial ref chain), stay warning-free, and survive. Pin
 // all three; no @-suppression (a warning would escape the handler below).
 $warn075 = [];
@@ -105,7 +105,7 @@ while (is_array($probe) && $d < 300) { $probe = $probe[0]; $d++; }
 echo ($probe === "leaf" && $d === 200) ? "cr003_legit_depth OK\n" : "cr003_legit_depth FAIL d=$d\n";
 
 // =====================================================================
-// CR-001: zval leak on partial decode. Run a tight loop on a payload
+// zval leak on partial decode. Run a tight loop on a payload
 // that's truncated mid-object. Without the fix, valgrind/LSAN would
 // report a leak per iteration; without instrumentation, memory usage
 // grows. We compare memory_get_usage(true) before/after.
@@ -130,13 +130,13 @@ for ($i = 0; $i < 5000; $i++) {
 }
 gc_collect_cycles();
 $after = memory_get_usage(true);
-// Allow some slack — PHP's allocator may hold pages — but per-iteration
+// Allow some slack (PHP's allocator may hold pages), but a per-iteration
 // leak would balloon by tens of KB easily.
 $growth = $after - $before;
 echo ($growth < 200000) ? "cr001_no_leak OK\n" : "cr001_no_leak FAIL growth=$growth\n";
 
 // Variant: truncated mid-reference. TAG_NEW_REF allocates a
-// zend_reference, then inner decode fails — wrapper must release it.
+// zend_reference, then inner decode fails; the wrapper must release it.
 $ref = "shared";
 $arr = [&$ref, &$ref];
 $payload = phpser_serialize($arr);
@@ -151,7 +151,7 @@ $growth = memory_get_usage(true) - $before;
 echo ($growth < 200000) ? "cr001_ref_no_leak OK\n" : "cr001_ref_no_leak FAIL growth=$growth\n";
 
 // =====================================================================
-// CR-004: When __unserialize throws during the deferred loop, the
+// When __unserialize throws during the deferred loop, the
 // outer C function must propagate failure rather than returning success
 // with an exception pending. PHP-level callers see the exception (Zend
 // unwinds at the function boundary); we verify that path works cleanly.

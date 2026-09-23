@@ -12,13 +12,13 @@ where decode time matters more than encode time or payload size.
 
 ## Why phpser?
 
-PHP cache workloads pay decode cost on every read. Encode happens once per write. The default `igbinary` was the right answer for over a decade, but leaves performance on the table for common cache shapes: database rowsets, packed numeric arrays, deep-nested structures, and same-class DTO batches (Laravel queue payloads, cached models).
+PHP cache workloads pay decode cost on every read and encode cost once per write. `igbinary` has been the default for over a decade, but it leaves performance on the table for common cache shapes: database rowsets, packed numeric arrays, deep-nested structures, and same-class DTO batches (Laravel queue payloads, cached models).
 
-phpser is decoder-optimized. It uses pointer-equality dict interning with a bounded content fallback, reuses decoded zend_strings by refcount, pre-sizes hash tables, writes straight into packed zval storage, and emits tagged scalar runs. On the current ARM benchmark, phpser beats igbinary on encode and decode in all ten cases. Integer ranges collapse to constant-size affine runs and decode 91-92% faster, shuffled integer arrays decode 73% faster, deep nesting decodes 22% faster, and DTO batches decode 53-63% faster.
+phpser optimizes for decode. It uses pointer-equality dict interning with a bounded content fallback, reuses decoded zend_strings by refcount, pre-sizes hash tables, writes straight into packed zval storage, and emits tagged scalar runs. On the current ARM benchmark, phpser beats igbinary on encode and decode in all ten cases. Integer ranges collapse to constant-size affine runs and decode 91-92% faster, shuffled integer arrays decode 73% faster, deep nesting decodes 22% faster, and DTO batches decode 53-63% faster.
 
 Rowsets keep the pointer-equality fast path for shared strings, while columnar encoding also deduplicates low-cardinality strings and equal packed-string vectors by content. In `rowset_distinct_1000`, where equal repeated strings have separate allocations, phpser is 56% smaller, 63% faster to encode, and 51% faster to decode than igbinary.
 
-📖 **The design writeup:** [phpser: a fast, secure binary serializer for PHP cache workloads](https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads), on what the decoder does differently and why decode time is the metric to optimize. The [interactive benchmark page](https://iliaal.github.io/phpser/) compares phpser against igbinary, native `serialize()`, and msgpack across every cache shape.
+📖 Design writeup: [phpser: a fast, secure binary serializer for PHP cache workloads](https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads) covers what the decoder does differently and why decode time is the metric to optimize. The [interactive benchmark page](https://iliaal.github.io/phpser/) compares phpser against igbinary, native `serialize()`, and msgpack across every cache shape.
 
 ## Install
 
@@ -39,11 +39,11 @@ sudo apt install -y git bison libtool-bin unzip
 brew install bison libtool
 ```
 
-`unzip` is load-bearing on Debian: composer shells out to `/usr/bin/unzip`
-when extracting PIE's prebuilt-binary zip. If `unzip` is missing, composer
-silently falls back to PHP's ZipArchive which lays the `.so` out at a
-path PIE doesn't check, and install fails with `ExtensionBinaryNotFound`
-even though the zip downloaded fine.
+Install `unzip` on Debian. Composer shells out to `/usr/bin/unzip` to
+extract PIE's prebuilt-binary zip. Without it, composer silently falls back
+to PHP's ZipArchive, which puts the `.so` at a path PIE doesn't check, and
+install fails with `ExtensionBinaryNotFound` even though the download
+succeeded.
 
 ### From source
 
@@ -61,8 +61,8 @@ echo 'extension=phpser.so' | sudo tee /etc/php/conf.d/phpser.ini
 Pre-built `.dll`s for Windows (PHP 8.2-8.5, TS/NTS, x86 and x64) and `.so`s for
 Linux glibc (x86_64, arm64) and macOS arm64 (PHP 8.4-8.5) are attached
 to each [GitHub release](https://github.com/iliaal/phpser/releases). PIE
-fetches the matching binary automatically; falls back to source-build
-when no asset matches.
+fetches the matching binary automatically and builds from source when no
+asset matches.
 
 ## Usage
 
@@ -112,9 +112,9 @@ model.
 
 ## ✨ Features
 
-- **Signed payloads for integrity.** `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input *before* any decoding work runs. Use this whenever the storage layer crosses a trust boundary: memcached, redis, files, cookies, anywhere an attacker who can write to the store could otherwise feed a crafted payload to your decoder. An empty key is rejected on both sides. A keyless HMAC is forgeable, so callers must supply real key material.
-- **Safe handling of untrusted input.** `allowed_classes` option on both unserialize entry points, matching PHP's native `unserialize($payload, ['allowed_classes' => ...])` shape: pass `false` to reject all classes, an array to allowlist specific ones, or `true` for the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved, never instantiated. Recursion depth is capped at 512 on both encode and decode (encode throws, decode returns `null`), and assoc decode uses bounded update semantics so duplicate-key payloads collapse to last-write-wins rather than phantom buckets. Wire-controlled keys run against a bounded collision budget, so a payload built around Zend's stable string hash cannot turn an array, property table, or rowset schema into quadratic decode work; a chain that exhausts the budget rejects the payload rather than grinding through it.
-- **PHP 8.2+ (8.3, 8.4, 8.5, master).** BSD 3-Clause.
+- **Signed payloads**: `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input before any decoding runs. Use it whenever the store crosses a trust boundary (memcached, redis, files, cookies), anywhere an attacker who can write to the store could feed your decoder a crafted payload. Both sides reject an empty key, since a keyless HMAC is forgeable.
+- **Untrusted input limits**: both unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (returns `null`). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled keys run against a bounded collision budget, so a payload built around Zend's stable string hash cannot make an array, property table, or rowset schema quadratic to decode; exhausting the budget rejects the payload.
+- **Supported versions**: PHP 8.2+ (8.3, 8.4, 8.5, master). BSD 3-Clause.
 
 ## Bench (PHP 8.4.23 aarch64, idle box, 1000 iters, median of 35)
 
@@ -144,7 +144,7 @@ strings and equal packed-string vectors. That makes `rowset_distinct_1000`
 the same 25,993-byte payload as `rowset_1000`; against igbinary it is **56%
 smaller, 63% faster to encode, and 51% faster to decode**.
 
-DTO workloads (Laravel-queue-style payloads, single-class arrays) are now
+DTO workloads (Laravel-queue-style payloads, single-class arrays) are
 **22-34% smaller, 53-63% faster to decode, 12-21% faster to encode** than
 igbinary. Wire-v2 `TAG_OBJECT_SLOTS` drops the per-property key indices and
 installs declared values straight into property slots; the dict dedups prop
@@ -160,61 +160,58 @@ Regenerate it with `php ... bench.php --html > docs/index.html`.
 
 ## Design highlights
 
-The core ideas that drive the perf wins above:
-
-- **Pointer-equality dict intern.** Encoding hits a `*zend_string == *zend_string`
-  check first; only on miss do we hash the bytes. Cuts intern cost to
-  near-zero for rowset-shaped data where PHP literals share interned
+- **Pointer-equality dict intern**: encoding checks `*zend_string == *zend_string`
+  first and hashes the bytes only on a miss. Intern cost is near zero for
+  rowset-shaped data where PHP literals share interned
   zend_strings. Columnar rowsets additionally scan for at most eight distinct
   string values and prebind equal packed-string vectors, preserving dictionary
   reuse when database drivers return separate allocations for equal content.
-- **Front-loaded string dictionary.** Same shape as igbinary's
-  `compact_strings`, except we emit the table once at the head and
+- **Front-loaded string dictionary**: same shape as igbinary's
+  `compact_strings`, except phpser emits the table once at the head and
   reference by varint index from values. Trade-off: not streamable.
-- **Integer-run compression.** Constant-stride runs (ranges, constant
+- **Integer-run compression**: constant-stride runs (ranges, constant
   fills) collapse to a base+step affine tag a few bytes long, bounded by a
   one-million-element budget the encoder and decoder enforce identically.
   Other integer runs and rowset id columns store zigzag deltas whenever
   those encode smaller; wrapping mod-2^64 arithmetic keeps every int64
   sequence exact with no overflow checks.
-- **Refcount-reuse of zend_strings on decode.** Per-decode cache parallel
-  to the dict. First reference allocates, subsequent ones `addref`.
-- **HT_IS_PACKED detection via flag, not iteration.** Avoid scanning the
-  buckets just to determine layout.
-- **`arPacked` stride awareness.** PHP 8+'s packed-array layout stores
-  zvals directly, not Buckets. Stride is 16, not 32.
-- **Sparse-packed fallback.** Arrays with holes (post-`unset`) preserve
+- **Refcount reuse of zend_strings on decode**: a per-decode cache parallels
+  the dict. The first reference allocates; later ones `addref`.
+- **HT_IS_PACKED flag check**: layout comes from the flag, without
+  scanning buckets.
+- **`arPacked` stride awareness**: PHP 8+ packed arrays store zvals
+  directly, not Buckets, so the stride is 16, not 32.
+- **Sparse-packed fallback**: arrays with holes (post-`unset`) preserve
   original int keys via Assoc rather than silently re-indexing.
 
 ## Where phpser diverges from igbinary
 
-igbinary is the closest reference point. The areas where there's still
-measurable perf to take, and that this project targets, are:
+igbinary is the closest reference point. phpser takes measurable
+performance in these areas, all shipped:
 
 1. **Pre-sized HT + direct `arPacked` writes on decode.** When the wire
    format declares `PACKED_LEN N`, allocate the HT once via
    `zend_new_array(N)` and write directly into `arPacked` with `ZVAL_*`
    macros. Skips N `zend_hash_next_index_insert` calls, including their
-   hash computation, growth checks, and capacity tuning. **Shipped.**
+   hash computation, growth checks, and capacity tuning.
 2. **Tagged scalar runs.** `[1, 2, 3, ...]` (1000 longs) emits as a
    single `PACKED_LONGS` header + N zigzag varints, not 1000 `(tag,
    varint)` pairs. Decode is one tight loop with no per-element tag
-   dispatch. **Shipped.**
+   dispatch.
 3. **O(1) pointer-hash intern.** Open-addressed `zend_string* → slot`
    hash, grown without eviction. Hit rate near 100% on literal rowset shapes (PHP
    interns literals; the same `"id"` zend_string pointer flows through
    every row), and unique value strings (names, emails) hit a single-probe
    miss instead of a linear scan. Separately allocated low-cardinality table
    columns use a bounded content scan, which puts encode ahead of igbinary on
-   every measured shape. Skips the byte-hash entirely on pointer hits.
-   **Shipped.**
+   every measured shape. Pointer hits skip the byte-hash entirely.
 4. **Eager dict materialization with warm hashes.** All dict slots are
    resolved up front during header parse, against the engine's
    interned-string table first. Property names, class names, and hot
    literals come back as the engine's own interned strings (no
    allocation, no refcount traffic, pointer-equality hash lookups),
    with a regular allocation as the fallback. Hashes are set on both
-   paths; `zend_hash_add_new` reuses the cached hash. **Shipped.**
+   paths; `zend_hash_add_new` reuses the cached hash.
 5. **Invariant-gated `add_new` on assoc decode.** Wire-controlled duplicate
    keys must collapse to last-write-wins rather than produce phantom buckets
    (`count($arr) != count(array_unique(array_keys($arr)))`), and canonical
@@ -222,7 +219,7 @@ measurable perf to take, and that this project targets, are:
    possession, not that the bytes came from phpser's encoder: a key holder can
    sign a handcrafted frame. `TAG_ASSOC` therefore always uses update
    semantics; schema-based paths use `add_new` only after validating distinct,
-   non-numeric keys once at schema read. **Shipped.**
+   non-numeric keys once at schema read.
 6. **Inline-short-string tag with upgrade-on-second-encounter.**
    `TAG_STR_INLINE` (0x0c) and `KEY_STR_INLINE` (0x02) are emitted on a
    string's first occurrence; the next occurrence triggers an in-place
@@ -233,14 +230,12 @@ measurable perf to take, and that this project targets, are:
    `INLINE_EMITTED` from `DICT_IDX`. No pre-pass; single walk of the
    zval tree as before.
 
-   A count-then-emit variant was tried first: pre-walk the zval tree
-   to tag occurrences, then emit inline for singletons and dict for
-   repeats. The pre-pass cost ~200 ns per string and ate the
-   per-singleton savings, so the single-walk upgrade-on-second-encounter
-   version above is what ships. That step moved `rowset_1000` encode to
-   25% faster than igbinary (up from 8% in the pre-upgrade implementation);
-   the later columnar `TAG_TABLE` format and delta id columns took rowsets
-   further still, to -45% size and -58% encode versus igbinary.
+   A count-then-emit pre-pass (tag occurrences first, then emit inline
+   for singletons and dict for repeats) cost ~200 ns per string and ate
+   the per-singleton savings. The single-walk upgrade moved `rowset_1000`
+   encode from 8% to 25% faster than igbinary; the later columnar
+   `TAG_TABLE` format and delta id columns reached -45% size and -58%
+   encode versus igbinary.
 7. **Skip refcount machinery during build.** All zvals built during decode
    are fresh and unshared until handed back to PHP. Internal writes can
    skip `Z_TRY_ADDREF` guards.
@@ -248,8 +243,8 @@ measurable perf to take, and that this project targets, are:
 ## Local dev build
 
 The hand-rolled `Makefile` builds against an in-tree `~/php-src-8.4-opt`
-checkout without `phpize`/`autoconf`. Useful for hacking on the extension
-while also hacking on PHP itself:
+checkout without `phpize`/`autoconf`, for working on the extension and PHP
+at the same time:
 
 ```sh
 make -j$(nproc)           # builds modules/phpser.so
@@ -272,8 +267,8 @@ as a `session.serialize_handler` when available.
 ## Limitations / known gaps
 
 - **The three entry points signal corrupt input differently.** `phpser_unserialize()`
-  returns `null` on malformed, truncated, or over-deep input — silently, and
-  indistinguishably from a successfully-decoded `null`. Trailing bytes after
+  silently returns `null` on malformed, truncated, or over-deep input,
+  indistinguishable from a successfully decoded `null`. Trailing bytes after
   a complete top-level value are tolerated on this path (prefix read).
   `phpser_unserialize_signed()` throws instead (since 0.4.0), so a
   legitimately-signed `null` still decodes cleanly, and both the signed and
@@ -286,12 +281,10 @@ as a `session.serialize_handler` when available.
   anything deeper than 512 nested containers / refs is rejected (returns
   `null`) to bound stack consumption against adversarial wire payloads. On
   encode, input deeper than 512 throws an `Exception` rather than silently
-  shipping a truncated payload. Object cycles are
-  preserved correctly via the id-table machinery and don't count against
-  this cap for shared-graph cases; the cap only fires on genuinely deep
-  trees. Cache workloads typically nest 5-10 deep, so the cap is many
-  orders of magnitude past any legitimate payload.
-- **Closures and resources encode as `NULL`.** This behavior differs from
+  shipping a truncated payload. Object cycles go through the id table and
+  don't count against the cap; only genuinely deep trees hit it. Cache
+  workloads typically nest 5-10 deep.
+- **Closures and resources encode as `NULL`.** This differs from
   native `serialize()` by design: PHP throws when serializing a `Closure` and
   serializes a resource as its numeric resource id. phpser treats both as
   unsupported cache values and writes `NULL`.
@@ -325,7 +318,7 @@ as a `session.serialize_handler` when available.
   common shapes never regrow mid-encode). A value with N unique strings
   holds N entries until the encode returns; nothing is retained between
   calls. Unusually string-diverse values cost temporary memory proportional
-  to their diversity — chunk the value if that matters.
+  to their diversity; chunk the value if that matters.
 - **Wire integers outside the target `zend_long` range are rejected on 32-bit
   builds.** A payload written by a 64-bit process can carry values a 32-bit
   `zend_long` cannot hold. Decode returns `null` instead of narrowing them, so
@@ -422,16 +415,15 @@ key tags:
 Varints are LEB128 (unsigned); signed values use zigzag encoding. Tags
 0x0a/0x0d/0x0e/0x0f/0x11/0x12 each claim the next id in encounter
 order, so the decoder reconstructs back-refs by counting
-container tags as it parses. 0x10 REF never claims — it is lookup-only.
+container tags as it parses. 0x10 REF never claims an id; it is lookup-only.
 
 The version byte is emitted as `0x02` only when the body actually uses a
 v2-only tag (`0x12`–`0x17`); otherwise it stays `0x01`. On decode it is a
 *minimum-reader* signal, not a gate: the tag dispatch is version-agnostic,
 so a hand-built frame carrying a v2 tag under a `0x01` header still decodes.
-This tolerance keeps the version byte additive. Don't rely on it alone to
-reject a future format; a
-backwards-incompatible change gets a new version constant *and* explicit tag
-rejection.
+This keeps the version byte additive. Don't rely on it alone to reject a
+future format; a backwards-incompatible change gets a new version constant
+*and* explicit tag rejection.
 
 ## 🔗 Native PHP extensions
 

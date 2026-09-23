@@ -85,7 +85,7 @@ $rt = phpser_unserialize(phpser_serialize(Color::Blue), ['allowed_classes' => [C
 echo ($rt === Color::Blue) ? "enum_array_allowed OK\n" : "enum_array_allowed FAIL\n";
 
 // --- Filter is recursive: nested object in __serialize data gets filtered too.
-// Untyped slot — a typed slot would reject the incomplete class at assignment
+// Untyped slot: a typed slot would reject the incomplete class at assignment
 // time (real-world allowed_classes pattern: don't use typed object props if
 // you want incomplete-class fallback to survive). ---
 class Container {

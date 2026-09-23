@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-006 failed session encode persists a loud tombstone, not empty
+phpser: failed session encode persists a loud tombstone, not empty
 --EXTENSIONS--
 phpser
 session
@@ -22,7 +22,7 @@ session_start();
 // Over-depth $_SESSION cannot be encoded. The handler must surface an
 // undecodable tombstone marker (not NULL/empty): the engine persists empty
 // for NULL, which the next request would read as a brand-new SUCCESS-empty
-// session — silent data loss.
+// session: silent data loss.
 $deep = "leaf";
 for ($i = 0; $i < 1000; $i++) $deep = [$deep];
 $_SESSION = ["deep" => $deep];

@@ -1,5 +1,5 @@
 --TEST--
-phpser: session handler error arms — encode hook throws, non-array root fails the read
+phpser: session handler error arms: encode hook throws, non-array root fails the read
 --EXTENSIONS--
 phpser
 session
@@ -20,7 +20,7 @@ session_save_path(sys_get_temp_dir());
 session_start();
 
 // (1) A serialization hook that throws during session encode. The phpser encode
-// handler flags PHPSER_ENC_EXCEPTION and emits this specific E_WARNING — asserted
+// handler flags PHPSER_ENC_EXCEPTION and emits this specific E_WARNING, asserted
 // below (not suppressed) so a regression of THIS arm is observable: the
 // __serialize exception propagates whether phpser returns NULL or a partial
 // frame, so the warning is the only thing that pins the arm. The exception then
@@ -42,7 +42,7 @@ $_SESSION = [];   // clear so the request-shutdown auto-save doesn't re-encode i
 // returns FAILURE, so the engine warns, destroys the session, and
 // session_decode() returns false. The stale session is gone (not silently
 // replaced by an empty one) and no session id survives the destroy.
-$scalar_payload = phpser_serialize(42);   // decodes to int(42) — non-array root
+$scalar_payload = phpser_serialize(42);   // decodes to int(42): non-array root
 $_SESSION = ['stale' => 1];
 $r = session_decode($scalar_payload);
 echo "nonarray_root_decode: ",

@@ -1,5 +1,5 @@
 --TEST--
-phpser: __sleep selects its member set at return time — a property created while an earlier member serializes is not included (matches native)
+phpser: __sleep selects its member set at return time; a property created while an earlier member serializes is not included (matches native)
 --EXTENSIONS--
 phpser
 --FILE--

@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-001 class-typed slots always verify (wrong-class object rejected)
+phpser: class-typed slots always verify (wrong-class object rejected)
 --EXTENSIONS--
 phpser
 --FILE--

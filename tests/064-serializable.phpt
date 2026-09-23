@@ -48,7 +48,7 @@ $ok = count($rt) === 3
     && $rt[2]->get() === "c";
 echo $ok ? "array_of_legacy OK\n" : "array_of_legacy FAIL\n";
 
-// A subclass of a Serializable class — should still round-trip via the
+// A subclass of a Serializable class should still round-trip via the
 // inherited ce->serialize hook.
 class LegacySerSub extends LegacySer {
     public function tag(): string { return "sub:" . $this->get(); }
@@ -56,7 +56,7 @@ class LegacySerSub extends LegacySer {
 $rt = phpser_unserialize(phpser_serialize(new LegacySerSub("hi")));
 echo ($rt instanceof LegacySerSub && $rt->tag() === "sub:hi") ? "subclass OK\n" : "subclass FAIL\n";
 
-// Throwing from serialize() — PHP wraps the throw; phpser should
+// Throwing from serialize(): PHP wraps the throw; phpser should
 // propagate it via the exception PHP raises into the calling scope.
 class ThrowsOnSer implements Serializable {
     public function serialize(): string { throw new RuntimeException("serialize boom"); }
@@ -84,9 +84,9 @@ try {
 }
 echo $caught ? "unserialize_throws OK\n" : "unserialize_throws FAIL\n";
 
-// SplPriorityQueue / SplMinHeap — PHP's own serialize() returns empty
+// SplPriorityQueue / SplMinHeap: PHP's own serialize() returns empty
 // O:N:"Class":0:{} for these (their internal heap data isn't accessible
-// to a serializer). We expect to match that behavior — class survives,
+// to a serializer). phpser matches: the class survives,
 // contents lost.
 $pq = new SplPriorityQueue();
 $pq->insert("a", 1);

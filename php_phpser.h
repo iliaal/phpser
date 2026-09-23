@@ -11,12 +11,11 @@
 */
 
 /*
- * phpser — module entry header.
+ * phpser module entry header.
  *
- * Exports only the zend_module_entry needed by the PHP extension loader.
- * The encode/decode paths are not part of a stable C API and stay static
- * in phpser.c — call phpser_serialize() / phpser_unserialize() from PHP
- * userland, or the session.serialize_handler when HAVE_PHP_SESSION.
+ * Exports only the zend_module_entry. The encode/decode paths are not a
+ * stable C API; use phpser_serialize() / phpser_unserialize() from PHP, or
+ * the session.serialize_handler when HAVE_PHP_SESSION.
  */
 #ifndef PHP_PHPSER_H
 #define PHP_PHPSER_H

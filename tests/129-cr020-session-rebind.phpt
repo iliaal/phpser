@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-020 repeated session decodes rebind cleanly (no refcount drift)
+phpser: repeated session decodes rebind cleanly (no refcount drift)
 --EXTENSIONS--
 phpser
 session

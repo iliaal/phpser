@@ -25,8 +25,8 @@
  * Trusted-store assumption: the backend bytes are decoded with no HMAC and
  * ALLOWED_ALL (arbitrary classes instantiate + __wakeup/__unserialize run),
  * so the store must be trusted; app-level signing is a docs-level decision
- * (see SECURITY.md). Exact consumption IS enforced here (CR-002): the store
- * framing is authoritative, so a suffix is corruption, not data. */
+ * (see SECURITY.md). Exact consumption is enforced: the store framing is
+ * authoritative, so trailing bytes are corruption. */
 static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
     return phpser_decode_buf_opts(str, str_len, out, ALLOWED_ALL, NULL, true);
 }
@@ -38,11 +38,9 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
     if (Z_TYPE_P(session_vars) == IS_REFERENCE) {
         session_vars = Z_REFVAL_P(session_vars);
     }
-    /* throw_on_overflow=false: the session auto-save runs at request
-     * shutdown with no execution frame, where a thrown exception surfaces as
-     * an uncaught fatal the hook can't intercept. So encode reports failure
-     * via status without throwing on over-depth; we degrade to the E_WARNING
-     * that session.c itself uses for write failures. */
+    /* throw_on_overflow=false: auto-save runs at request shutdown with no
+     * execution frame, where an exception becomes an uncaught fatal. Degrade
+     * to the E_WARNING session.c uses for write failures. */
     phpser_enc_status status = PHPSER_ENC_OK;
     zend_string *out = phpser_encode_zval_ex(session_vars,
                                              /* throw_on_overflow */ false, &status);

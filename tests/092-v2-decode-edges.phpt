@@ -1,5 +1,5 @@
 --TEST--
-phpser: wire-v2 decode edges — SLOTS __unserialize routing, no-autoload on deny, typed-slot reject, ASSOC_DICT dup/numeric keys
+phpser: wire-v2 decode edges: SLOTS __unserialize routing, no-autoload on deny, typed-slot reject, ASSOC_DICT dup/numeric keys
 --SKIPIF--
 <?php if (!extension_loaded("phpser")) die("skip phpser not loaded"); ?>
 --FILE--
@@ -7,9 +7,9 @@ phpser: wire-v2 decode edges — SLOTS __unserialize routing, no-autoload on den
 // Adversarial / regression coverage for the wire-v2 tags. These frames are
 // hand-crafted: TAG_OBJECT_SLOTS (0x12) and TAG_ASSOC_DICT (0x13) are never
 // emitted for the shapes below by the encoder, so only crafted bytes exercise
-// these decoder branches. See findings CR-001, CR-002, CR-010.
+// these decoder branches.
 
-// --- CR-001: a crafted SLOTS frame for a class that HAS __unserialize must
+// --- A crafted SLOTS frame for a class that HAS __unserialize must
 // route to __unserialize (like TAG_OBJECT), not install raw slots + __wakeup.
 // The encoder never emits SLOTS for such a class, so this is adversarial wire
 // or a class that gained __unserialize after the payload was written. ---
@@ -28,7 +28,7 @@ echo (TU::$received === ['x' => 42]) ? "unser_called OK\n"
     : "unser_called FAIL " . var_export(TU::$received, true) . "\n";
 echo (TU::$woke === false) ? "unser_no_wakeup OK\n" : "unser_no_wakeup FAIL\n";
 
-// --- CR-002: a denied SLOTS class must NOT be autoloaded. The filter exists
+// --- A denied SLOTS class must NOT be autoloaded. The filter exists
 // to prevent instantiating (and here, even loading) attacker-named classes.
 // Craft a SLOTS frame naming a class that is not defined, register a recording
 // autoloader, decode with allowed_classes disabled, and assert the autoloader
@@ -48,7 +48,7 @@ echo (!$hit) ? "deny_no_autoload OK\n" : "deny_no_autoload FAIL\n";
 echo ($r instanceof __PHP_Incomplete_Class) ? "deny_incomplete OK\n"
     : "deny_incomplete FAIL " . var_export($r, true) . "\n";
 
-// --- CR-010.2b: a SLOTS frame planting a wrong-typed value into a declared
+// --- A SLOTS frame planting a wrong-typed value into a declared
 // typed slot must fail-fast (TypeError), not corrupt the object or crash. ---
 class Typed { public int $n = 0; }
 // [0x02][ndict=1][len=5]"Typed"[0x12][class_idx=0][nprops=1][0x00 NULL] → null into int
@@ -60,10 +60,9 @@ try {
     echo "typed_reject OK\n";
 }
 
-// --- CR-010.3a / BUG-R2-C2-A1-H1: ASSOC_DICT with duplicate dict-key indices
-// must be REJECTED. An honest array can never carry a duplicate schema key, so
-// this shape exists only in handcrafted wire; the old symtable_update fallback
-// walked an unbudgeted integer-domain hash chain (quadratic decode, CWE-400).
+// --- ASSOC_DICT with duplicate dict-key indices must be REJECTED. An honest
+// array never carries a duplicate schema key, and a symtable_update fallback
+// would walk an unbudgeted integer-domain hash chain (quadratic decode, CWE-400).
 // dec_read_schema_keys rejects at schema-parse time, before any cell decode. ---
 // [0x02][ndict=1][len=1]"k"[0x13 ASSOC_DICT][n=2][idx=0][idx=0][0x03 zz(1)=2][0x03 zz(2)=4]
 $dup = "\x02\x01\x01k\x13\x02\x00\x00\x03\x02\x03\x04";
@@ -71,19 +70,19 @@ $rd = phpser_unserialize($dup);
 echo ($rd === null) ? "assocdict_dup OK\n"
     : "assocdict_dup FAIL " . var_export($rd, true) . "\n";
 
-// --- CR-010.3b / BUG-R2-C2-A1-H1: ASSOC_DICT with a numeric-string dict key
+// --- ASSOC_DICT with a numeric-string dict key
 // must be REJECTED. A canonical numeric string can never be a real array
 // string key (the engine coerces it to an int key at insert), so the encoder
 // never emits it as a schema key; routing crafted numeric keys through
 // zend_symtable_update coerces them to integer keys whose bucket assignment is
-// h & (T-1) with no hash budget — the quadratic-decode DoS. ---
+// h & (T-1) with no hash budget: the quadratic-decode DoS. ---
 // [0x02][ndict=1][len=1]"7"[0x13][n=1][idx=0][0x03 zz(99)=198 → 0xC6 0x01]
 $num = "\x02\x01\x017\x13\x01\x00\x03\xc6\x01";
 $rn = phpser_unserialize($num);
 echo ($rn === null) ? "assocdict_numkey OK\n"
     : "assocdict_numkey FAIL " . var_export($rn, true) . "\n";
 
-// --- CR-010.2a residual: an eligible typed DTO must actually take the SLOTS
+// --- An eligible typed DTO must actually take the SLOTS
 // path (tag 0x12), so 073's allowed_classes coverage can't silently slide onto
 // the keyed TAG_OBJECT path. Assert the emitted wire byte. ---
 class Dto { public int $a = 1; public string $b = "x"; }
@@ -100,11 +99,10 @@ for ($i = 0; $i < $ndict; $i++) {
 echo (ord($enc[$pos]) === 0x12) ? "dto_slots_tag OK\n"
     : "dto_slots_tag FAIL (got " . dechex(ord($enc[$pos])) . ")\n";
 
-// --- CR-010: the TAG_OBJECT_SLOTS nprops integrity gate. An older prefix is
-// accepted so properties appended to the effective slot table keep their class
-// defaults; a newer payload with more slots than this class knows still rejects.
-// (087's historical "bad_slots" craft rejected at dict parsing instead, never
-// reaching this check.) Real class + correct dict here. ---
+// --- The TAG_OBJECT_SLOTS nprops integrity gate. An older prefix is accepted
+// so properties appended to the effective slot table keep their class defaults;
+// a payload with more slots than this class knows still rejects. Real class +
+// correct dict here, so the frame reaches this check. ---
 class Dto2 { public int $a = 0; public string $b = ""; }  // slot_count = 2
 $np_low  = "\x02\x01\x04Dto2\x12\x00\x01\x03\x02";                  // nprops=1 (older prefix)
 $np_high = "\x02\x01\x04Dto2\x12\x00\x03\x03\x02\x0c\x01x\x03\x02"; // nprops=3 (too many)
@@ -117,7 +115,7 @@ $np_c = phpser_unserialize($np_ok);
 echo ($np_c instanceof Dto2 && $np_c->a === 1 && $np_c->b === "x")
     ? "nprops_ok OK\n" : "nprops_ok FAIL " . var_export($np_c, true) . "\n";
 
-// --- CR-008: signed decode of a body that fails to decode (valid HMAC, corrupt
+// --- Signed decode of a body that fails to decode (valid HMAC, corrupt
 // frame) must THROW, not return a silent null a caller can't tell from a
 // legitimately-signed null. A real signed null still decodes cleanly. ---
 $key = "cr008-key";

@@ -1,5 +1,5 @@
 --TEST--
-phpser: string round-trip (binary-safe, multibyte, long, exotic) — ext/standard 006, igbinary_006
+phpser: string round-trip (binary-safe, multibyte, long, exotic): ext/standard 006, igbinary_006
 --EXTENSIONS--
 phpser
 --FILE--

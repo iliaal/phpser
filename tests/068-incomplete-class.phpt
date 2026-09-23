@@ -1,5 +1,5 @@
 --TEST--
-phpser: unknown class fallback (incomplete_class_*.phpt — divergence from PHP)
+phpser: unknown class fallback (incomplete_class_*.phpt; divergence from PHP)
 --EXTENSIONS--
 phpser
 --FILE--

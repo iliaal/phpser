@@ -1,5 +1,5 @@
 --TEST--
-phpser: encoder string cache — __serialize temporaries with non-interned repeated keys/values round-trip without corruption
+phpser: encoder string cache: __serialize temporaries with non-interned repeated keys/values round-trip without corruption
 --EXTENSIONS--
 phpser
 --FILE--

@@ -1,5 +1,5 @@
 --TEST--
-phpser: TAG_TABLE wire v2 — columnar homogeneous rowset with typed column runs
+phpser: TAG_TABLE wire v2: columnar homogeneous rowset with typed column runs
 --EXTENSIONS--
 phpser
 --FILE--

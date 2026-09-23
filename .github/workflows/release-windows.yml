@@ -6,15 +6,12 @@ name: Release Windows binaries
 # uploads each .dll as a release asset following the PIE-compatible
 # naming convention (php_phpser-<version>-<php_x.y>-<ts|nts>-vs17-<arch>.zip).
 #
-# Tests are off in this lane -- the test workflow already validated the
-# same arch/ts/php combinations on master.
+# Tests are off here; the test workflow covers the same combinations.
 #
-# workflow_dispatch runs the build matrix without the upload job, so the
-# release toolsets can be exercised on a candidate commit BEFORE the tag
-# exists. A break that only shows up on the release runners (an MSVC
-# toolset the push-CI matrix does not cover, say) then fails here instead
-# of after the tag is live, where the all-or-nothing upload job would ship
-# the release with zero Windows assets.
+# workflow_dispatch runs the build matrix without the upload job, so a break
+# that only shows on the release runners (e.g. an MSVC toolset push CI does
+# not cover) fails before the tag is live, not after, when the all-or-nothing
+# upload job would ship zero Windows assets.
 
 on:
   release:
@@ -70,15 +67,13 @@ jobs:
     name: Upload binaries to the release
     runs-on: ubuntu-latest
     needs: build
-    # Only the real release event has a tag to upload into. A dispatch run
-    # stops after `build`, which is the point: it validates the toolsets
-    # and publishes nothing.
+    # Only the release event has a tag to upload into; a dispatch run stops
+    # after `build`.
     if: github.event_name == 'release'
     # GITHUB_TOKEN defaults to read-only for `contents:` on newer repos.
     # The release/asset-upload API needs write access; without this block
     # `gh release upload` returns HTTP 403 "Resource not accessible by
-    # integration". See ~/ai/wiki/architecture/php-extensions.md, the
-    # "Windows binary releases" section, for the full backstory.
+    # integration".
     permissions:
       contents: write # Uploads Windows binaries to the published release.
     steps:

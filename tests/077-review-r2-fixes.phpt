@@ -1,16 +1,16 @@
 --TEST--
-phpser: round-2 review regressions — CR-001 dup-key UAF, CR-002 dict UAF
+phpser: decode dup-key UAF and encode dict borrowed-string UAF regressions
 --EXTENSIONS--
 phpser
 --FILE--
 <?php
 
 // =====================================================================
-// CR-001: decoder id_table holds raw zend_object*/zend_reference* without
+// Decoder id_table held raw zend_object*/zend_reference* without
 // refcount bump. A crafted payload with a duplicate assoc key collapses
 // to the last value; zend_hash_update destroys the bucket holding the
 // previously-registered object, freeing it. A subsequent TAG_REF to that
-// id then deref's freed memory — observable as zend_mm_heap corrupted.
+// id then deref'd freed memory, observable as zend_mm_heap corrupted.
 //
 // Repro:
 //   TAG_PACKED_MIXED count=2
@@ -31,7 +31,7 @@ $payload = "\x01"                       // version
          . "\x10" . "\x00";             //   TAG_REF id=0
 $rt = phpser_unserialize($payload);
 // Critical: must survive. Either a sane decoded value (back-ref resolves
-// to the still-alive object) or a controlled NULL — but not a crash.
+// to the still-alive object) or a controlled NULL, never a crash.
 echo is_array($rt) ? "cr001_dupkey_no_uaf OK\n" : "cr001_dupkey_no_uaf FAIL\n";
 
 // Repeat under a stress loop to give the allocator a chance to reuse the
@@ -45,7 +45,7 @@ for ($i = 0; $i < 200; $i++) {
 }
 echo "cr001_dupkey_stress OK\n";
 
-// Same vuln via TAG_OBJECT dup-prop on a typed slot — decoder uses
+// Same vuln via TAG_OBJECT dup-prop on a typed slot; the decoder uses
 // zval_ptr_dtor(slot) on overwrite, which would free a registered obj.
 // Hand-craft: a stdClass with two writes to the same prop key.
 class T_dup { public $p; }
@@ -59,12 +59,12 @@ $buf = "\x01"                    // version
      . "\x0a" . "\x01" . "\x00"  //     val = TAG_OBJECT class=1 nprops=0 (claims id 1)
      . "\x01"                    //     key_idx=1 ("p") DUP
      . "\x03" . "\x02"           //     val = TAG_LONG 1 (destroys the id-1 stdClass)
-     . "\x10" . "\x01";          //   TAG_REF id=1 — second element, would UAF without fix
+     . "\x10" . "\x01";          //   TAG_REF id=1, second element; UAFs without the pin
 $rt = phpser_unserialize($buf);
 echo is_array($rt) ? "cr001_dupprop_no_uaf OK\n" : "cr001_dupprop_no_uaf FAIL\n";
 
 // =====================================================================
-// CR-002: encode dict borrows zend_string pointers. Magic-method paths
+// Encode dict borrowed zend_string pointers. Magic-method paths
 // (__sleep, __serialize) destroy temporaries mid-encode; if the dict
 // borrowed a string from one of those temps, the header emission later
 // reads freed memory and writes corrupted bytes into the wire frame.
@@ -93,7 +93,7 @@ $expect = "val_" . str_repeat("y", 32);
 echo ($rt->got_k1 === $expect && $rt->got_k2 === $expect)
     ? "cr002_serialize_dict OK\n" : "cr002_serialize_dict FAIL\n";
 
-// Same shape with __sleep — dynamic property names landing in the dict.
+// Same shape with __sleep: dynamic property names landing in the dict.
 #[\AllowDynamicProperties]
 class S_sleep {
     public function __sleep(): array {
@@ -123,7 +123,7 @@ for ($i = 0; $i < 500; $i++) {
 echo "cr002_stress OK\n";
 
 // Confirm interned-literal fast path still works (zend_string_copy on
-// IS_STR_INTERNED is a no-op — should produce identical bytes for the
+// IS_STR_INTERNED is a no-op; should produce identical bytes for the
 // common case).
 class C_lit { public $a = "hello"; public $b = "world"; }
 $rt = phpser_unserialize(phpser_serialize(new C_lit()));

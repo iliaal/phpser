@@ -169,40 +169,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Object encode emits properties in a single pass with a back-patched
   count instead of a count walk plus an emit walk; DTO encode ~4% faster,
   wire bytes unchanged.
-- Packed-array encode (numeric, double, and typed-string runs) now reserves
-  the whole run's worst-case output capacity once, then writes elements raw,
-  instead of running a `smart_str` capacity check per element. On small
-  numeric arrays — where that per-element check was a large fraction of the
-  total work — this cuts encode time ~26% (`packed_1k`); rowsets, whose
-  tag-arrays travel the typed-string run, encode ~2% faster. The mixed-run
-  path is unchanged (its recursion can reallocate the buffer mid-loop). Wire
-  format and decode output are identical.
-- The typed-string packed run now reads each element's dictionary index
-  straight from the intern-cache slot rather than re-walking the intern
-  path, which `detect_packed_run` has already shown is unnecessary (every
-  element is proven dict-bound before the run is chosen). Rowset encode is
-  a further ~5-6% faster on top of the reserve-once change. Decode and wire
+- Packed-array encode (numeric, double, and typed-string runs) reserves the
+  run's worst-case output capacity once instead of a `smart_str` capacity
+  check per element: `packed_1k` encode ~26% faster, rowsets ~2% faster.
+  The mixed-run path is unchanged because its recursion can reallocate the
+  buffer mid-loop. Wire format and decode output are identical.
+- The typed-string packed run reads each element's dictionary index straight
+  from the intern-cache slot, since `detect_packed_run` already proved every
+  element dict-bound. Rowset encode a further ~5-6% faster; decode and wire
   bytes unchanged.
 
 ### Fixed
 
 - `allowed_classes` options carrying PHP references now behave like native
-  `unserialize()`. Previously a reference-wrapped option value
+  `unserialize()`. A reference-wrapped option value
   (`['allowed_classes' => &$flag]`) or an allowlist entry left referenced by
-  a `foreach (... as &$c)` loop threw a spurious ValueError/TypeError instead
-  of applying the filter. Both cases failed closed (the decode never ran), so
-  this is a compatibility fix, not a security one.
+  a `foreach (... as &$c)` loop used to throw a spurious ValueError/TypeError
+  instead of applying the filter. Both cases failed closed (the decode never
+  ran), so this is a compatibility fix.
 - A crafted payload with a canonical numeric string array key (`"5"`) now
   decodes to the integer key `5`, matching native `unserialize()` and every
-  PHP array write. The untrusted decode path previously preserved it as a
-  string key, a HashTable state no PHP code can produce — letting an attacker
+  PHP array write. The untrusted decode path used to keep it as a string
+  key, a HashTable state no PHP code can produce, which let an attacker
   smuggle a value past `isset()` / `array_key_exists()` checks that assume
   the key was already coerced. The HMAC-signed path was never affected (the
-  encoder only ever emits integer keys for numeric strings).
+  encoder only emits integer keys for numeric strings).
 - A `__serialize()` that returns a non-array without throwing now raises a
   `TypeError`, matching native PHP, instead of silently encoding the object
-  as `null`. The previous behavior shipped a valid payload that decoded to
-  `null` in the object's place with no error at write time.
+  as `null` with no error at write time.
 - Decoding a payload whose deferred `__wakeup()` / `__unserialize()` throws
   no longer leaks the decoded object graph. The session decode handler now
   receives a cleared result on this error path, restoring the decoder's
@@ -216,8 +210,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   empty signing key instead of accepting it. An empty key reduces HMAC-SHA256
   to a fixed, keyless tag that anyone can recompute, so a misconfigured caller
   (e.g. `getenv('SECRET') ?: ''` with the variable unset) would silently emit
-  and accept forgeable payloads — defeating the signed path's only purpose.
-  Both entry points now throw before any HMAC work.
+  and accept forgeable payloads. Both entry points now throw before any HMAC
+  work.
 
 ### Changed
 
@@ -236,13 +230,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of re-emitting inline on every row.
 - Plain objects with no dynamic-property table now serialize directly from
   their declared property slots instead of materializing a properties
-  HashTable, the way native `serialize()` does — faster one-shot (fresh
+  HashTable, as native `serialize()` does, for faster one-shot (fresh
   object) encode. PHP 8.4 lazy objects fall back to `get_properties()` so
   their initializer runs before serialization.
 - `phpser_unserialize_signed()` began decoding associative arrays with
   `add_new` instead of `update`, based on the assumption that signed bodies
   came from this extension's encoder. The unsigned path kept
-  last-write-wins collapse. The Unreleased security fixes remove that
+  last-write-wins collapse. The 0.5.0 security fixes remove that
   provenance assumption and validate key invariants on signed frames too.
 
 ## [0.1.1] - 2026-06-01

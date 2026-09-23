@@ -1,5 +1,5 @@
 --TEST--
-phpser: TAG_ROWSET wire v2 — homogeneous assoc rows with schema emitted once
+phpser: TAG_ROWSET wire v2: homogeneous assoc rows with schema emitted once
 --EXTENSIONS--
 phpser
 --FILE--
@@ -25,7 +25,7 @@ $data = mk_rowset(5);
 $blob = phpser_serialize($data);
 
 echo ($blob[0] === "\x02") ? "version_v2 OK\n" : "version_v2 FAIL\n";
-// TAG_ROWSET (0x14) decode compat — encoder-produced row-major wire.
+// TAG_ROWSET (0x14) decode compat: encoder-produced row-major wire.
 $rowset_wire = hex2bin('0202026964046e616d65140202000103000c05726f775f3003020c05726f775f31');
 $rw = phpser_unserialize($rowset_wire);
 echo (is_array($rw) && $rw[0]['id'] === 0 && $rw[1]['name'] === 'row_1')

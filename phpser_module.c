@@ -234,9 +234,7 @@ static PHP_MINIT_FUNCTION(phpser) {
 #endif
 #ifdef HAVE_PHP_SESSION
     PS_SERIALIZER_FUNCS(phpser);
-    /* Register session.serialize_handler = phpser. Best-effort: the session
-     * extension may not be loaded (rare in shared-build setups), and we
-     * tolerate that case silently. */
+    /* Best-effort: silently skip when the session extension isn't loaded. */
     php_session_register_serializer(
         PHP_PHPSER_EXTNAME,
         PS_SERIALIZER_ENCODE_NAME(phpser),

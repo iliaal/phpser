@@ -1,5 +1,5 @@
 --TEST--
-phpser: signed (trusted) forged duplicate keys — object prop + back-ref UAF and assoc dup/numeric coercion
+phpser: signed (trusted) forged duplicate keys: object prop + back-ref UAF and assoc dup/numeric coercion
 --EXTENSIONS--
 phpser
 --FILE--
@@ -10,7 +10,7 @@ function v($n){ $o=""; while($n>=0x80){ $o.=chr(($n&0x7f)|0x80); $n>>=7;} return
 $key = str_repeat("k", 32);
 function sign($body,$key){ return $body . hash_hmac('sha256',$body,$key,true); }
 
-// --- CR-001: PACKED_MIXED[ OBJECT stdClass{ "a"=>OBJECT stdClass(id1), "a"=>null }, REF(id1) ] ---
+// --- PACKED_MIXED[ OBJECT stdClass{ "a"=>OBJECT stdClass(id1), "a"=>null }, REF(id1) ] ---
 $body =
     "\x01" . v(2) . v(8)."stdClass" . v(1)."a" .   // v1, dict = [stdClass, a]
     "\x07" . v(2) .                                // PACKED_MIXED, 2 elems
@@ -23,7 +23,7 @@ var_dump(is_array($r) && count($r) === 2);        // no crash, well-formed
 var_dump($r[0]->a);                               // last-write-wins: null
 var_dump($r[1] instanceof stdClass);              // back-ref resolves to the pinned object
 
-// --- CR-003: signed TAG_ASSOC with a duplicate key and a canonical-numeric key ---
+// --- Signed TAG_ASSOC with a duplicate key and a canonical-numeric key ---
 $body2 =
     "\x01" . v(0) .                                // v1, empty dict
     "\x06" . v(3) .                                // TAG_ASSOC, 3 entries

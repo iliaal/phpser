@@ -69,7 +69,7 @@ echo ($rt->parent->name === "B1") ? "ref_cycle OK\n" : "ref_cycle FAIL\n";
 
 // --- Failed-serialize object referenced twice: PHP emits N; for both slots.
 // Our equivalent: NOT_SERIALIZABLE classes emit TAG_NULL, no id claimed. ---
-$f = function() {};  // closure — NOT_SERIALIZABLE
+$f = function() {};  // closure: NOT_SERIALIZABLE
 $arr = [$f, $f];
 $rt = phpser_unserialize(phpser_serialize($arr));
 echo ($rt[0] === null && $rt[1] === null) ? "fail_ser_refs OK\n" : "fail_ser_refs FAIL\n";

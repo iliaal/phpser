@@ -28,13 +28,10 @@ jobs:
           coverage: none
       - run: composer validate --strict
 
-  # PIE 1.5+ install-path smoke: builds the extension via the same
-  # phpize/configure/make pipeline that `pie install iliaal/phpser` would
-  # take for an end user, against a path repository pointing at this checkout.
-  # Catches composer.json php-ext metadata drift, configure-options the
-  # config.m4 doesn't actually understand, and PIE 1.4-style build-tools
-  # regressions (bison, libtool-bin). Single PHP version is enough — the
-  # full matrix already covers the underlying phpize+make path.
+  # PIE 1.5+ install-path smoke test against a path repository pointing at
+  # this checkout. Catches composer.json php-ext metadata drift, configure
+  # options config.m4 doesn't understand, and build-tool regressions (bison,
+  # libtool-bin). One PHP version is enough; the matrix covers phpize+make.
   pie-smoke:
     name: PIE install smoke
     runs-on: ubuntu-latest
@@ -101,10 +98,8 @@ jobs:
   linux-zts-canary:
     name: PHP 8.4 ZTS Linux (canary)
     runs-on: ubuntu-latest
-    # Build canary: catches ZTS compilation regressions without committing
-    # to ZTS as an installable target (NTS is the fleet baseline for
-    # Linux/macOS prebuilts). Tests still run so this also serves as a
-    # smoke check for the TLS-cache-update wiring on shared builds.
+    # ZTS build canary (Linux/macOS prebuilts are NTS only). Tests also
+    # smoke-check the TLS-cache-update wiring on shared builds.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -165,10 +160,8 @@ jobs:
           export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
           php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/
 
-  # Windows extension builds need the official PHP SDK + matching MSVC
-  # toolset, not the autotools phpize/configure flow. The php-org composite
-  # action below bundles SDK download, VS detection, phpize / configure /
-  # nmake invocation, and the .phpt test run.
+  # Windows builds need the PHP SDK and matching MSVC toolset. The composite
+  # action handles SDK download, VS detection, the nmake build, and tests.
   windows-matrix:
     name: Resolve Windows matrix
     runs-on: ubuntu-latest

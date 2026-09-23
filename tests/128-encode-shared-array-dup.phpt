@@ -1,5 +1,5 @@
 --TEST--
-phpser: encode duplicates a shared nested array without reading past a compacted dup (BUG-R2-C4 hole-compaction guard)
+phpser: encode duplicates a shared nested array without reading past a compacted dup (hole-compaction guard)
 --DESCRIPTION--
 The generic array walk copies a shared (refcount>1) nested table before it
 dispatches per-element hooks (enc_pin_walk). zend_array_dup preserves a packed

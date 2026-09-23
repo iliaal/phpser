@@ -1,5 +1,5 @@
 --TEST--
-phpser: round-3 review regressions — varint overflow + TAG_OBJECT_MAGIC data fallback
+phpser: varint overflow + TAG_OBJECT_MAGIC data fallback
 --EXTENSIONS--
 phpser
 --FILE--
@@ -21,7 +21,7 @@ echo ($rt === null) ? "r3_varint_overflow_rejected OK\n"
                     : "r3_varint_overflow_rejected FAIL aliased=$rt\n";
 
 // In-range 10-byte varint with byte_10=0x01 (encoding 2^63) must still
-// be accepted — it's the maximum representable uint64 value bit.
+// be accepted: it's the maximum representable uint64 value bit.
 // Actually 2^63 = 0x80×9 + 0x01. dict_idx 2^63 is out-of-bounds for
 // our 1-entry dict, so we expect a clean "index out of range" reject,
 // not a 2^64-aliased acceptance. Either rejection path is fine; the
@@ -69,7 +69,7 @@ echo ($rt->x === 42 && $rt->tag === 'serialized')
     ? "r3_magic_no_unser OK\n"
     : "r3_magic_no_unser FAIL x={$rt->x} tag={$rt->tag}\n";
 
-// Same shape but with __unserialize present — must still defer to it.
+// Same shape but with __unserialize present: must still defer to it.
 class Bag2 {
     public int $x = 0;
     public function __serialize(): array { return ['x' => 100, '__seen' => true]; }

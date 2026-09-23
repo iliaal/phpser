@@ -1,5 +1,5 @@
 --TEST--
-phpser: depth cap (512) — encode round-trips at the boundary, throws past it, decode rejects over-deep
+phpser: depth cap (512): encode round-trips at the boundary, throws past it, decode rejects over-deep
 --EXTENSIONS--
 phpser
 --FILE--
@@ -7,7 +7,7 @@ phpser
 
 // Nest a scalar inside $d arrays. The innermost single-LONG array [42] encodes
 // as TAG_PACKED_LONGS, so the scalar 42 never takes its own depth-guarded
-// encode_value — the deepest guarded call is the innermost ARRAY. That array
+// encode_value; the deepest guarded call is the innermost ARRAY. That array
 // sits at depth $d-1, so $d = MAX_DEPTH (512) is the last value that fits and
 // $d = 513 pushes the innermost array to depth 512 and trips the cap. (A
 // non-packable leaf would shift this boundary by one; the point of the test is
@@ -55,7 +55,7 @@ echo (phpser_unserialize($deep_bad) === null) ? "decode_deep_reject OK\n" : "dec
 // 5. String-leaf encode boundary: leaf packability shifts the fit/throw edge
 //    by one vs the int leaf above (nest(512) fits there). A non-packable
 //    "leaf" string nests one level less before the innermost array trips
-//    the cap — pin the empirical edge, not the mechanism.
+//    the cap. Pin the empirical edge, not the mechanism.
 function snest(int $d) {
     $a = "leaf";
     for ($i = 0; $i < $d; $i++) { $a = [$a]; }
@@ -74,7 +74,7 @@ try {
         ? "strleaf512 throw OK\n" : "strleaf512 throw FAIL: {$e->getMessage()}\n";
 }
 
-// 6. Decode-side cap under a v2 header: same fit/reject shape as (4) — the
+// 6. Decode-side cap under a v2 header: same fit/reject shape as (4); the
 //    version byte is a minimum-reader signal, not a second depth budget.
 $H2 = "\x02\x00";
 $v2_ok  = $H2 . str_repeat("\x07\x01", 400) . "\x00";
@@ -83,7 +83,7 @@ echo (phpser_unserialize($v2_ok) !== null) ? "decode_v2_deep_ok OK\n" : "decode_
 echo (phpser_unserialize($v2_bad) === null) ? "decode_v2_deep_reject OK\n" : "decode_v2_deep_reject FAIL\n";
 
 // 7. NEW_REF chains collapse to their inner value, so a shallow chain is no
-//    depth workout at all — but a 1000-deep chain over a LONG must still
+//    depth workout at all, but a 1000-deep chain over a LONG must still
 //    reject to NULL (decode cap) warning-free, never a partial ref chain.
 echo (phpser_unserialize("\x01\x00\x11\x03\x02") === 1) ? "newref_single OK\n" : "newref_single FAIL\n";
 $warn097 = [];

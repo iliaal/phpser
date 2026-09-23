@@ -1,11 +1,11 @@
 --TEST--
 phpser: a throwing lazy-object initializer persists nothing to the session store
 --DESCRIPTION--
-The CR-003 guard converts a pending exception from zend_get_properties_for
-into e->failed. tests/099 cannot observe it: on the userland path the pending
-exception wins over the return value either way. The session handler is where
-it matters — before the guard, phpser handed session.c a complete frame with
-the lazy object encoded as an empty object, and session.c wrote it.
+The encoder converts a pending exception from zend_get_properties_for into
+e->failed. tests/099 cannot observe it: on the userland path the pending
+exception wins over the return value either way. Without the guard, the
+session handler would hand session.c a complete frame with the lazy object
+encoded as an empty object, and session.c would write it.
 --EXTENSIONS--
 phpser
 session

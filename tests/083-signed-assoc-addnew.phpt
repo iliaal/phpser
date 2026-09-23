@@ -1,5 +1,5 @@
 --TEST--
-phpser: signed (trusted) decode of assoc arrays — all key shapes round-trip == native
+phpser: signed (trusted) decode of assoc arrays: all key shapes round-trip == native
 --EXTENSIONS--
 phpser
 --FILE--
@@ -35,7 +35,7 @@ foreach ($cases as $name => $v) {
     echo $name, ': ', rt_ok($v) ? 'OK' : 'MISMATCH', "\n";
 }
 
-// Key invariant: no phantom buckets — count matches unique keys.
+// Key invariant: no phantom buckets; count matches unique keys.
 $m = phpser_unserialize_signed(phpser_serialize_signed($cases['big_map'], $key), $key);
 echo 'big_map count: ', count($m), "\n";
 echo 'big_map keys unique: ', (count($m) === count(array_unique(array_keys($m)))) ? 'yes' : 'no', "\n";

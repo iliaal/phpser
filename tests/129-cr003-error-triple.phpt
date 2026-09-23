@@ -1,5 +1,5 @@
 --TEST--
-phpser: CR-003 same corrupt bytes across unsigned/signed/session entries
+phpser: same corrupt bytes across unsigned/signed/session entries
 --EXTENSIONS--
 phpser
 session

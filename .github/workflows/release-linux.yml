@@ -2,31 +2,24 @@ name: Release Linux & macOS binaries
 
 # Triggered when a GitHub Release is published. Builds .so binaries for
 # Linux glibc (x86_64 + arm64) and macOS (arm64) at the PHP versions in
-# the matrix (NTS only -- ZTS lives in the Windows lane), uploads each
+# the matrix (NTS only; ZTS lives in the Windows lane), uploads each
 # as a release asset via php/pie-ext-binary-builder using PIE's
 # pre-packaged-binary naming convention.
 #
-# macOS Intel (macos-13) is intentionally absent -- GitHub's Intel
-# runner pool is too contended to ship reliably (jobs queue 30+ min on
-# busy days, blocking release closeout), and macOS 26 drops Intel
-# support anyway. Intel-Mac users source-build via PIE's
-# composer-default fallback.
-#
-# Linux musl (Alpine) is intentionally absent -- shivammathur/setup-php
-# in Alpine containers needs more setup, and Alpine users get install via
-# PIE's composer-default source-build fallback in the meantime. Add a
-# musl lane only if user demand surfaces.
+# macOS Intel (macos-13) is absent: GitHub's Intel runner pool queues 30+
+# min on busy days, and macOS 26 drops Intel. Linux musl (Alpine) is absent
+# because setup-php in Alpine containers needs more setup. Both source-build
+# via PIE's composer-default fallback.
 #
 # composer.json declares:
 #   "download-url-method": ["pre-packaged-binary", "composer-default"]
 # so PIE prefers the prebuilt asset and falls back to source-build when
 # no asset matches.
 
-# workflow_dispatch compiles the same matrix and asserts the module loads,
-# without uploading -- php/pie-ext-binary-builder builds and uploads in one
-# step and requires a release tag, so the dispatch path runs a plain
-# phpize/configure/make instead. That exercises each runner's toolchain and
-# glibc/macOS baseline on a candidate commit before the tag exists.
+# workflow_dispatch compiles the same matrix and asserts the module loads
+# without uploading. php/pie-ext-binary-builder builds and uploads in one
+# step and needs a release tag, so the dispatch path runs a plain
+# phpize/configure/make on a candidate commit before the tag exists.
 
 on:
   release:
@@ -56,10 +49,8 @@ jobs:
       fail-fast: false
       matrix:
         # ubuntu-24.04 (x86_64), ubuntu-24.04-arm (arm64),
-        # macos-14 (Apple Silicon arm64). Pinned over `*-latest` to
-        # avoid silent runner shifts that would change the toolchain /
-        # glibc baseline on published release assets without a repo
-        # diff.
+        # macos-14 (Apple Silicon arm64). Pinned over `*-latest` so the
+        # toolchain and glibc baseline can't shift without a repo diff.
         os:
           - ubuntu-24.04
           - ubuntu-24.04-arm

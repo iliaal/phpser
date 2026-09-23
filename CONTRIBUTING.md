@@ -8,8 +8,7 @@
 - `phpize` and `php-config` (from `php-dev` or `php8.x-dev`)
 - GNU Make (Unix) or Visual Studio (Windows)
 
-phpser is a single-`.c` extension with no external library
-dependencies.
+phpser has no external library dependencies.
 
 ## Bug reports
 
@@ -34,7 +33,7 @@ Before filing, try to reproduce against the latest `master` branch.
 1. Fork and clone the repo.
 2. Create a topic branch off `master`.
 3. Make your changes.
-4. Add or update tests in `tests/` (PHPT format — see existing files
+4. Add or update tests in `tests/` (PHPT format; see existing files
    for examples).
 5. Build and run the full suite:
 
@@ -49,8 +48,8 @@ Before filing, try to reproduce against the latest `master` branch.
      php run-tests.php tests/
    ```
 
-6. Verify zero compiler warnings — CI treats any warning as a build
-   failure — and that all PHPT tests pass.
+6. Verify zero compiler warnings (CI treats any warning as a build
+   failure) and that all PHPT tests pass.
 7. Push and open a PR against `master`.
 
 ### Commit message conventions
@@ -59,9 +58,8 @@ Before filing, try to reproduce against the latest `master` branch.
   "Update baz".
 - Body wraps at 72 columns, explains **why** not **what**.
 - No `Co-Authored-By` lines. No AI attribution.
-- Audit the message against `git show --stat HEAD` before pushing —
-  if the subject claims a fix is in X file, the diff had better show
-  X.
+- Check the message against `git show --stat HEAD` before pushing:
+  if the subject claims a fix in file X, the diff must touch X.
 
 ### Test guidelines
 
@@ -88,8 +86,8 @@ Function signatures are declared in `phpser.stub.php`. Don't hand-edit
 php $PHP_SRC/build/gen_stub.php phpser.stub.php
 ```
 
-(where `$PHP_SRC` is a PHP source checkout matching your target PHP
-minor — the gen_stub script lives under `build/`).
+`$PHP_SRC` is a PHP source checkout matching your target PHP minor.
+
 
 ### Code style
 
@@ -98,9 +96,8 @@ minor — the gen_stub script lives under `build/`).
   `PHP_MINIT` / etc. for Zend entry points.
 - Memory: use PHP's `emalloc`/`efree` at the Zend boundary;
   `zend_string_*` helpers for refcounted strings.
-- No comments explaining *what* the code does — the identifiers
-  already say that. Comments should explain *why* (a hidden constraint,
-  workaround, or surprising behavior).
+- Comments explain *why* (a hidden constraint, workaround, or
+  surprising behavior), not *what* the code does.
 - Wire-format changes need a corresponding update to the "Wire format"
   section in `README.md`. Additive tags bump the emitted wire byte to
   `PHPSER_VERSION_V2` (`0x02`); a backwards-incompatible change needs a new
@@ -121,8 +118,7 @@ target. Always:
 
 Folklore optimizations (`computed-goto`, "skip the interned-string
 branch", etc.) get rejected if the bench doesn't move. Branch
-predictor / cache / inline-cache effects swamp the things that
-*should* matter on paper.
+predictor and cache effects often swamp what should matter on paper.
 
 ## Release workflow
 
@@ -133,7 +129,7 @@ For maintainers cutting a new version:
    `[Unreleased]` entries become the new version section with a
    release date and a compare link. Update the **Supported versions**
    table in `SECURITY.md` to the new minor (pre-1.0: latest minor
-   only) — it does not track the version automatically.
+   only); it does not track the version automatically.
 2. Commit + push to master. CI (Tests workflow, all jobs green) is
    required before tagging.
 3. `git tag -a X.Y.Z -m "phpser X.Y.Z"` with a release-note body,

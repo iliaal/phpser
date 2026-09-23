@@ -128,7 +128,7 @@ echo "crafted OK\n";
 
 // 5. Numeric-string assoc keys must coerce to int exactly as native
 //    unserialize. PHP arrays collapse a canonical numeric string key ("5")
-//    to integer 5, so this state is unreachable from PHP code — only a
+//    to integer 5, so this state is unreachable from PHP code; only a
 //    crafted payload can carry KEY_STR_INLINE "5". A raw zend_hash_update on
 //    the untrusted path would preserve it as a string key, letting an
 //    attacker smuggle a value past isset()/array_key_exists checks that
@@ -148,7 +148,7 @@ $rd = phpser_unserialize($dual);
 echo (count($rd) === 1 && $rd[5] === 2) ? "numkey_dual_collapse OK\n" : "numkey_dual_collapse FAIL\n";
 
 // Non-canonical numeric strings ("05", leading zero) stay string keys, as
-// native unserialize keeps them — confirms real coercion, not naive atoi.
+// native unserialize keeps them. Confirms real coercion, not naive atoi.
 $lead = phpser_serialize(["ZZ" => 9]);
 $lead = str_replace("ZZ", "05", $lead);
 $rl = phpser_unserialize($lead);
@@ -157,7 +157,7 @@ echo is_string(array_key_first($rl)) ? "numkey_leadzero_string OK\n" : "numkey_l
 // 6. Wire v2 tags (0x12 OBJECT_SLOTS, 0x13 ASSOC_DICT, 0x14 ROWSET,
 //    0x15 TABLE). Header version 0x02; dict ["a"] makes index 0 valid and 99
 //    (0x63) an out-of-range dict reference. Every crafted payload must
-//    fail-fast to NULL — no crash, no read past the buffer.
+//    fail fast to NULL: no crash, no read past the buffer.
 $H = "\x02\x01\x01a";
 $v2 = [
     // OBJECT_SLOTS: class_idx varint missing
@@ -187,16 +187,16 @@ echo (phpser_unserialize($dos) === null) ? "table_nrows_dos OK\n" : "table_nrows
 
 // 6a'. OBJECT_SLOTS naming an undefined class is NOT a frame failure: the
 //      value slot is still claimed (later back-refs resolve), but with no
-//      class there is no schema — decode yields __PHP_Incomplete_Class
+//      class there is no schema, so decode yields __PHP_Incomplete_Class
 //      carrying the name and zero properties.
 $rt = phpser_unserialize("\x02\x01\x03Foo\x12\x00\x00");
 $ok = $rt instanceof __PHP_Incomplete_Class
     && ((array) $rt) === ['__PHP_Incomplete_Class_Name' => 'Foo'];
 echo $ok ? "slots_undef_incomplete OK\n" : "slots_undef_incomplete FAIL\n";
 
-// 6b. Duplicate rowset/table schema keys must be REJECTED (BUG-R2-C2-A1-H1).
+// 6b. Duplicate rowset/table schema keys must be REJECTED.
 //     An honest array never carries a duplicate schema key, so this shape is
-//     handcrafted wire only; the old symtable_update collapse walked an
+//     handcrafted wire only; a symtable_update collapse would walk an
 //     unbudgeted integer-domain hash chain (quadratic decode, CWE-400).
 //     dec_read_schema_keys rejects at schema-parse time, before any cell decode.
 $HD = "\x02\x02\x01a\x01a";
@@ -205,12 +205,12 @@ $dup_table  = "{$HD}\x15\x01\x02\x00\x01\x08\x02\x08\x04"; // same, columnar
 echo (phpser_unserialize($dup_rowset) === null) ? "rowset_dup_schema OK\n" : "rowset_dup_schema FAIL\n";
 echo (phpser_unserialize($dup_table) === null) ? "table_dup_schema OK\n" : "table_dup_schema FAIL\n";
 
-// 6b'. A canonical integer-string schema key must be REJECTED (BUG-R2-C2-A1-H1).
+// 6b'. A canonical integer-string schema key must be REJECTED.
 //      The engine coerces a numeric string to an int array key at insert, so a
 //      real string-keyed bucket is never canonical-numeric and the encoder never
 //      emits "5" as a schema key. A crafted numeric schema key would coerce
 //      through zend_symtable_update to an integer key whose bucket slot is
-//      h & (T-1) with no hash budget — the quadratic-decode DoS. Reject it.
+//      h & (T-1) with no hash budget: the quadratic-decode DoS. Reject it.
 $HN = "\x02\x01\x015"; // dict ["5"]
 $num_rowset = "{$HN}\x14\x01\x01\x00\x03\x02"; // forged [['5'=>...]]
 $num_table  = "{$HN}\x15\x01\x01\x00\x08\x02"; // same, columnar LONGS
@@ -223,7 +223,7 @@ echo (phpser_unserialize($num_table) === null) ? "table_num_schema OK\n" : "tabl
 $HKV = "\x02\x02\x01k\x01v"; // dict ["k","v"]
 $trunc_col = "{$HKV}\x15\x02\x01\x00\x0b\x01"; // nrows=2, ncols=1, STRINGS col: 1 cell then EOF
 echo (phpser_unserialize($trunc_col) === null) ? "table_trunc_column OK\n" : "table_trunc_column FAIL\n";
-// 6b'''. A TAG_ROWSET truncated mid-values must fail cleanly, not crash —
+// 6b'''. A TAG_ROWSET truncated mid-values must fail cleanly, not crash;
 //       the row-major counterpart to table_trunc_column above. nrows=2,
 //       ncols=1 holds one LONG cell where two belong, then EOF.
 $rowset_trunc = "{$HKV}\x14\x02\x01\x00\x03\x02"; // nrows=2, ncols=1, idx=[0], 1 cell then EOF
@@ -238,9 +238,8 @@ echo (phpser_unserialize($bad_coltag) === null) ? "table_bad_coltag OK\n" : "tab
 // 6c. Trusted (signed) TAG_TABLE whose 2nd column index is out of range fails
 //     after column 0's cell was already moved into the row. The error path
 //     must not release that moved cell twice (release-silent; ASAN-detectable).
-//     Since CR-008 the signed decoder throws on an undecodable body (rather than
-//     returning null); the memory-safety intent is unchanged — the moved-cell
-//     path still runs, now unwinding through the throw.
+//     The signed decoder throws on an undecodable body; the moved-cell path
+//     still runs, unwinding through the throw.
 $key = "phpser-060-key";
 $body = "{$H}\x15\x01\x02\x00\x63\x07\x0c\x03xyz\x07\x0c\x03pqr"; // nrows=1, ncols=2, idx=[0,99]
 $frame = $body . hash_hmac('sha256', $body, $key, true);
@@ -252,8 +251,8 @@ try {
         ? "table_trusted_badidx OK\n" : "table_trusted_badidx FAIL\n";
 }
 
-// 7. TAG_OBJECT_LEGACY (0x0f) adversarial cases (CR-001). The decode path reads
-//    an attacker-controlled blen then hands the bytes to ce->unserialize — the
+// 7. TAG_OBJECT_LEGACY (0x0f) adversarial cases. The decode path reads
+//    an attacker-controlled blen then hands the bytes to ce->unserialize, the
 //    classic native-unserialize CVE surface. Every shape must reject/NULL, no
 //    crash, no OOB read.
 $HL = "\x02\x01\x08stdClass"; // dict ["stdClass"]
@@ -278,24 +277,22 @@ echo (phpser_unserialize($legacy_null) === null) ? "legacy_no_unser OK\n" : "leg
 $legacy_ref = "{$HL}\x07\x02\x0f\x00\x00\x10\x00";     // [LEGACY(null id0), REF id0] -> [null,null]
 echo (phpser_unserialize($legacy_ref) === [null, null]) ? "legacy_null_slot_ref OK\n" : "legacy_null_slot_ref FAIL\n";
 
-// 8. TAG_ROWSET nrows DoS (CR-014): the ROWSET counterpart to table_nrows_dos.
+// 8. TAG_ROWSET nrows DoS: the ROWSET counterpart to table_nrows_dos.
 //    A 12-byte payload claiming 2^28 rows must reject, not emalloc gigabytes.
 $rowset_dos = "\x02\x01\x01a\x14\x80\x80\x80\x80\x01\x01\x00"; // nrows=2^28, ncols=1, idx=0
 echo (phpser_unserialize($rowset_dos) === null) ? "rowset_nrows_dos OK\n" : "rowset_nrows_dos FAIL\n";
 
-// 8a. TAG_ENUM (0x0d) naming a resident NON-enum class (CR-008). The decode
+// 8a. TAG_ENUM (0x0d) naming a resident NON-enum class. The decode
 //     guard rejects before zend_enum_get_case (which asserts enum-ness and
 //     would type-confuse under NDEBUG). dict ["stdClass","x"].
 $enum_nonenum = "\x02\x02\x08stdClass\x01x\x0d\x00\x01"; // ENUM class_idx=0, case_idx=1
 echo (phpser_unserialize($enum_nonenum) === null) ? "enum_nonenum OK\n" : "enum_nonenum FAIL\n";
 
 // 9. Trusted (signed) TAG_ASSOC_DICT with a crafted duplicate key
-//    (CR-014 / BUG-R2-C2-A1-H1). A valid HMAC does not prove the schema keys
-//    are distinct; a duplicate schema key is handcrafted-wire only and the
-//    old symtable_update collapse was an unbudgeted integer-domain hash walk
-//    (quadratic decode, CWE-400). The frame is now rejected at schema-parse
-//    time (before the values are decoded, so nothing is leaked) and the signed
-//    decoder throws (CR-008).
+//    A valid HMAC does not prove the schema keys are distinct, and a
+//    symtable_update collapse would be an unbudgeted integer-domain hash walk
+//    (quadratic decode, CWE-400). The frame is rejected at schema-parse time,
+//    before the values are decoded, and the signed decoder throws.
 $dkey = "phpser-060-adk";
 $dbody = "\x02\x01\x01k\x13\x02\x00\x00\x03\x02\x03\x04"; // ASSOC_DICT n=2 keys[0,0] vals 1,2
 $dframe = $dbody . hash_hmac('sha256', $dbody, $dkey, true);

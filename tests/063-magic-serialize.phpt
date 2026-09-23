@@ -1,5 +1,5 @@
 --TEST--
-phpser: __serialize / __unserialize magic methods (PHP 7.4+) — incl. SPL classes
+phpser: __serialize / __unserialize magic methods (PHP 7.4+), incl. SPL classes
 --EXTENSIONS--
 phpser
 --SKIPIF--
@@ -41,7 +41,7 @@ $sos[$k2] = "value-2";
 $rt = phpser_unserialize(phpser_serialize($sos));
 echo ($rt instanceof SplObjectStorage && $rt->count() === 2) ? "spl_obj_storage OK\n" : "spl_obj_storage FAIL\n";
 
-// --- DateTime — uses __serialize/__unserialize since PHP 7.4 ---
+// --- DateTime uses __serialize/__unserialize since PHP 7.4 ---
 $dt = new DateTime("2026-05-20 12:00:00", new DateTimeZone("UTC"));
 $rt = phpser_unserialize(phpser_serialize($dt));
 echo ($rt instanceof DateTime && $rt->format("Y-m-d H:i:s") === "2026-05-20 12:00:00")
@@ -66,7 +66,7 @@ $out = [];
 foreach ($rt as $v) $out[] = $v;
 echo ($rt instanceof SplDoublyLinkedList && $out === ['a','b','c']) ? "spl_dll OK\n" : "spl_dll FAIL\n";
 
-// --- Class with __serialize that THROWS — exception must propagate ---
+// --- Class with __serialize that THROWS: exception must propagate ---
 class ThrowsOnSerialize {
     public function __serialize(): array { throw new RuntimeException("boom"); }
     public function __unserialize(array $d): void {}

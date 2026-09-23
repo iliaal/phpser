@@ -45,9 +45,8 @@ typedef enum {
     PHPSER_ENC_EXCEPTION,
 } phpser_enc_status;
 
-/* Cached at MINIT (defined in phpser_hmac.c). ext/hash is mandatory since
- * PHP 7.4 and lookup never fails for a builtin algo; callers still
- * null-check defensively. */
+/* Cached at MINIT (defined in phpser_hmac.c). ext/hash is always present, but
+ * callers still null-check. */
 extern const php_hash_ops *phpser_sha256_ops;
 
 /* HMAC-SHA256 of `data` under `key`. Writes a 32-byte tag to `out`.
