@@ -95,6 +95,62 @@ jobs:
           export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
           php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/
 
+  # setup-php's '8.6' tracks php-src master, so build the PHP-8.6 branch
+  # directly. Release-mode (non-debug) to mirror the setup-php lanes.
+  linux-src:
+    name: PHP ${{ matrix.php }} - Linux (PHP-${{ matrix.php }} branch)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.6']
+
+    env:
+      PHP_VERSION: ${{ matrix.php }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y re2c bison autoconf
+
+      - name: Build PHP from source
+        run: |
+          git clone --depth=1 --branch="PHP-${PHP_VERSION}" https://github.com/php/php-src.git /tmp/php-src
+          cd /tmp/php-src
+          ./buildconf --force
+          ./configure \
+            --disable-debug \
+            --disable-zts \
+            --disable-all \
+            --enable-cli \
+            --enable-session \
+            --prefix=/tmp/php-release
+          make -j"$(nproc)"
+          make install
+
+      - name: Build extension
+        run: |
+          export PATH="/tmp/php-release/bin:$PATH"
+          phpize
+          ./configure --enable-phpser --with-php-config=/tmp/php-release/bin/php-config
+          WARNINGS=$(make -j"$(nproc)" 2>&1 | tee /dev/stderr | grep -c 'warning:' || true)
+          if [ "$WARNINGS" -gt 0 ]; then
+            echo "::error::Build produced $WARNINGS warning(s)"
+            exit 1
+          fi
+
+      - name: Run tests
+        env:
+          NO_INTERACTION: 1
+        run: |
+          export TEST_PHP_EXECUTABLE=/tmp/php-release/bin/php
+          TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
+          export TEST_PHP_ARGS
+          /tmp/php-release/bin/php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/
+
   linux-zts-canary:
     name: PHP 8.4 ZTS Linux (canary)
     runs-on: ubuntu-latest
@@ -201,7 +257,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.4']
+        php: ['8.4', '8.6']
 
     env:
       ASAN_OPTIONS: exitcode=139:verify_asan_link_order=0:detect_odr_violation=0:detect_leaks=1
