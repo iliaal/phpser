@@ -13,6 +13,7 @@ if (@ini_set('session.serialize_handler', 'phpser') === false) {
 session.serialize_handler=phpser
 session.save_handler=files
 session.use_cookies=0
+session.use_strict_mode=0
 session.cache_limiter=
 --FILE--
 <?php
@@ -35,6 +36,7 @@ session_id('cleanup-test');
 session_start();
 $_SESSION = ['old' => 1];
 session_write_close();
+$old_frame = file_get_contents($dir . '/sess_cleanup-test');
 
 session_id('cleanup-test');
 session_start();
@@ -46,8 +48,11 @@ try {
     echo ($e->getMessage() === 'cleanup-boom') ? "exception OK\n" : "exception FAIL\n";
 }
 
+// session.c truncates the store when the serializer returns NULL; PHP 8.6
+// skips the write instead, so the prior frame survives.
 $stored = file_get_contents($dir . '/sess_cleanup-test');
-echo $stored === '' ? "partial_commit OK\n" : "partial_commit FAIL\n";
+$expected = PHP_VERSION_ID >= 80600 ? $old_frame : '';
+echo ($old_frame !== '' && $stored === $expected) ? "partial_commit OK\n" : "partial_commit FAIL\n";
 
 @unlink($dir . '/sess_cleanup-test');
 @rmdir($dir);
