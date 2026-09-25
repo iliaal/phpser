@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Encode snapshots shared `ArrayObject`/`ArrayIterator` storage before user
+  `__serialize` hooks can mutate or free the table, including nested and
+  columnar reference aliases, so re-entrant serialization is stable.
+
 ## [0.6.2] - 2026-09-04
 
 ### Security
