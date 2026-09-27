@@ -747,7 +747,8 @@ static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
 /* zend_array_dup() preserves the array layout but flattens a sole-owner
  * IS_REFERENCE bucket. Repair each copied reference from the source bucket so
  * aliases introduced by a later hook still resolve to the source's reference.
- * This copies one table only; nested values retain their normal lazy walk. */
+ * This copies one table only; nested values retain their normal lazy walk.
+ * The source owns each repaired value: skip GC while its buckets are live. */
 static HashTable *enc_array_snapshot(HashTable *source) {
     HashTable *snapshot = zend_array_dup(source);
     if (HT_IS_PACKED(source)) {
@@ -755,7 +756,7 @@ static HashTable *enc_array_snapshot(HashTable *source) {
             zval *src = &source->arPacked[i];
             if (Z_TYPE_P(src) != IS_REFERENCE) continue;
             zval *dst = &snapshot->arPacked[i];
-            zval_ptr_dtor(dst);
+            zval_ptr_dtor_nogc(dst);
             ZVAL_COPY_VALUE(dst, src);
             Z_TRY_ADDREF_P(src);
         }
@@ -772,7 +773,7 @@ static HashTable *enc_array_snapshot(HashTable *source) {
             ? zend_hash_find(snapshot, src->key)
             : zend_hash_index_find(snapshot, src->h);
         ZEND_ASSERT(dst != NULL);
-        zval_ptr_dtor(dst);
+        zval_ptr_dtor_nogc(dst);
         ZVAL_COPY_VALUE(dst, &src->val);
         Z_TRY_ADDREF_P(&src->val);
     }
