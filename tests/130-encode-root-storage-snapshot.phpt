@@ -43,6 +43,26 @@ $ok = is_string($payload)
     && !isset($decoded['grown0']);
 echo $ok ? "root_generic_snapshot OK\n" : "root_generic_snapshot FAIL\n";
 
+foreach (['packed', 'string_fallback', 'sparse_packed'] as $shape) {
+    $hook = new RootAppend();
+    $source = $shape === 'string_fallback' ? ['lead', $hook, 2] : [$hook, 1, 2];
+    if ($shape === 'sparse_packed') unset($source[1]);
+    $keys = array_keys($source);
+    $packedOwner = new ArrayObject($source);
+    unset($source);
+    RootAppend::$owner = $packedOwner;
+    $packedRoot = $packedOwner->__serialize()[1];
+    $packedDecoded = phpser_unserialize(phpser_serialize($packedRoot));
+    RootAppend::$owner = null;
+    $hookKey = $shape === 'string_fallback' ? 1 : 0;
+    $packedOk = is_array($packedDecoded)
+        && array_keys($packedDecoded) === $keys
+        && $packedDecoded[2] === 2
+        && $packedDecoded[$hookKey] instanceof RootAppend
+        && $packedDecoded[$hookKey]->value === 1;
+    echo "root_$shape ", $packedOk ? "OK\n" : "FAIL\n";
+}
+
 class RootAlias {
     public static ?ArrayObject $owner = null;
     public $alias = null;
@@ -170,6 +190,9 @@ echo $columnOk ? "root_column_snapshot OK\n" : "root_column_snapshot FAIL\n";
 ?>
 --EXPECT--
 root_generic_snapshot OK
+root_packed OK
+root_string_fallback OK
+root_sparse_packed OK
 root_reference_alias OK
 generic_descendant_alias OK
 column_descendant_alias OK

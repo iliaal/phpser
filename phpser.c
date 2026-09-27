@@ -923,23 +923,12 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             bool ht_shared =
                 !(GC_FLAGS(ht) & GC_IMMUTABLE) && GC_REFCOUNT(ht) > 1;
             bool children_in_rcn_array = in_rcn_array || ht_shared;
-            /* A top-level shared array can be the live storage handed out by
-             * ArrayObject/ArrayIterator::__serialize(). Its owner may mutate it
-             * in place while a nested hook runs, so the root needs the same
-             * private pre-mutation snapshot as a nested shared table. */
-            HashTable *root_snapshot = NULL;
-            HashTable *walk_ht = ht;
-            if (ht_shared && e->depth == 1) {
-                root_snapshot = enc_array_snapshot(ht);
-                walk_ht = root_snapshot;
-            }
             /* Hooks may mutate this array through aliases. An extra reference forces
              * zval writes to COW-separate, preserving cached bucket pointers.
              * SPL's internal storage writes bypass COW; the snapshot and the
              * columnar gather separately protect those paths. */
             GC_TRY_ADDREF(ht);
-            encode_hashtable(body, e, walk_ht, children_in_rcn_array, ht_shared);
-            if (root_snapshot) zend_array_destroy(root_snapshot);
+            encode_hashtable(body, e, ht, children_in_rcn_array, ht_shared);
             if (!(GC_FLAGS(ht) & GC_IMMUTABLE) && !GC_DELREF(ht)) {
                 zend_array_destroy(ht);
             }
@@ -1565,11 +1554,22 @@ static void enc_free_row_pins(HashTable **row_pin, uint32_t n_used) {
 }
 
 static zend_never_inline int enc_try_table(
-    smart_str *body, encode_ctx *e, zval *zp, uint32_t n_used)
+    smart_str *body, encode_ctx *e, HashTable *outer, bool ht_shared)
 {
+    zval *zp = outer->arPacked;
+    uint32_t n_used = outer->nNumUsed;
     uint32_t ncols, *key_idx;
     if (!enc_match_rowset_schema(e, zp, n_used, &key_idx, &ncols)) {
         return 0;
+    }
+
+    /* A shared root may be live SPL storage. Snapshot before hooks can delete
+     * rows; sharing the rows also preserves descendant reference identity when
+     * the gather snapshots them below. */
+    HashTable *root_snapshot = NULL;
+    if (ht_shared && e->depth == 1) {
+        root_snapshot = enc_array_snapshot(outer);
+        zp = root_snapshot->arPacked;
     }
 
     /* Gather row-major into column-major storage: the validated schema gives
@@ -1609,6 +1609,7 @@ static zend_never_inline int enc_try_table(
         if (UNEXPECTED(c != ncols)) {
             efree(col_cells);
             if (row_pin) enc_free_row_pins(row_pin, n_used);
+            if (root_snapshot) zend_array_destroy(root_snapshot);
             efree(key_idx);
             return 0;
         }
@@ -1633,6 +1634,7 @@ static zend_never_inline int enc_try_table(
     }
     efree(col_cells);
     if (row_pin) enc_free_row_pins(row_pin, n_used);
+    if (root_snapshot) zend_array_destroy(root_snapshot);
     return 1;
 }
 
@@ -1693,13 +1695,11 @@ static uint8_t detect_packed_run(encode_ctx *e, HashTable *ht, uint32_t n_used,
 }
 
 /* Hooks can mutate shared SPL storage through refcount-blind C APIs.
- * Walk a private copy for shared nested arrays; scalar runs need none.
- * ht_shared is measured before the caller's protective addref. A shared
- * root table is snapshotted by encode_value_inner before dispatch, so this
- * helper remains limited to the nested-table paths. */
-static zend_always_inline HashTable *enc_pin_walk(encode_ctx *e, HashTable *ht,
-                                                  bool ht_shared, HashTable **dup) {
-    if (ht_shared && e->depth > 1) {
+ * Walk a private copy for shared arrays; scalar runs need none.
+ * ht_shared is measured before the caller's protective addref. */
+static zend_always_inline HashTable *enc_pin_walk(HashTable *ht,
+                                                 bool ht_shared, HashTable **dup) {
+    if (ht_shared) {
         *dup = enc_array_snapshot(ht);
         return *dup;
     }
@@ -1733,7 +1733,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
                     ZSTR_VAL(body->s)[tag_off] = (char)TAG_PACKED_MIXED;
                     ZSTR_LEN(body->s) = run_start;
                     HashTable *dup;
-                    zval *wzp = enc_pin_walk(e, ht, ht_shared, &dup)->arPacked;
+                    zval *wzp = enc_pin_walk(ht, ht_shared, &dup)->arPacked;
                     for (uint32_t j = 0; j < n_used; j++) {
                         encode_value_ex(body, e, &wzp[j], in_rcn_array);
                     }
@@ -1751,7 +1751,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
         /* enc_try_table covers every homogeneous string-keyed rowset, including
          * all-MIXED columns, so TAG_ROWSET is never encoded. Its decoder stays
          * for older payloads. */
-        if (tag == TAG_PACKED_MIXED && enc_try_table(body, e, zp, n_used)) {
+        if (tag == TAG_PACKED_MIXED && enc_try_table(body, e, ht, ht_shared)) {
             return;
         }
         if (tag == TAG_PACKED_AFFINE || tag == TAG_PACKED_DELTA) {
@@ -1794,7 +1794,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
             ZSTR_LEN(body->s) = pos;
         } else {
             HashTable *dup;
-            zval *wzp = enc_pin_walk(e, ht, ht_shared, &dup)->arPacked;
+            zval *wzp = enc_pin_walk(ht, ht_shared, &dup)->arPacked;
             for (uint32_t i = 0; i < n_used; i++) {
                 encode_value_ex(body, e, &wzp[i], in_rcn_array);
             }
@@ -1808,7 +1808,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
         smart_str_appendc(body, TAG_ASSOC);
         varint_write_u64(body, n_elems);
         HashTable *dup;
-        zval *zp = enc_pin_walk(e, ht, ht_shared, &dup)->arPacked;
+        zval *zp = enc_pin_walk(ht, ht_shared, &dup)->arPacked;
         for (uint32_t i = 0; i < n_used; i++) {
             if (Z_TYPE(zp[i]) == IS_UNDEF) continue;
             smart_str_appendc(body, KEY_LONG);
@@ -1853,7 +1853,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
              * tables to isolate mutation; use the duplicate's nNumUsed because
              * enc_array_snapshot compacts holes while preserving order. */
             HashTable *dup;
-            HashTable *vwht = enc_pin_walk(e, ht, ht_shared, &dup);
+            HashTable *vwht = enc_pin_walk(ht, ht_shared, &dup);
             Bucket *vb = vwht->arData;
             Bucket *vend = vb + vwht->nNumUsed;
             for (; vb < vend; vb++) {
@@ -1868,7 +1868,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
         /* enc_array_snapshot compacts an assoc table's UNDEF holes, so iterate the
          * walked table's own nNumUsed rather than the original's. */
         HashTable *dup;
-        HashTable *awht = enc_pin_walk(e, ht, ht_shared, &dup);
+        HashTable *awht = enc_pin_walk(ht, ht_shared, &dup);
         b = awht->arData;
         Bucket *wend = b + awht->nNumUsed;
         for (; b < wend; b++) {
