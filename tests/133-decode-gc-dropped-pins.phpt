@@ -17,6 +17,8 @@ class A { public $b; public function __destruct() { $GLOBALS['destroyed'][] = 'A
 class B { public $a; public function __destruct() { $GLOBALS['destroyed'][] = 'B'; } }
 class Holder { public $p; public $z; }
 class TypedHolder { public mixed $p; public mixed $z; }
+#[AllowDynamicProperties]
+class DynHolder { public $p; public $z; }
 
 spl_autoload_register(function ($c) {
     if ($c === 'Trig') gc_collect_cycles();
@@ -30,7 +32,8 @@ function vi(int $n): string {
 
 // Dict slots shared by every payload.
 const DICT = ['p', 'A', 'b', 'B', 'a', 'z', 'Trig', 'Holder', 'TypedHolder',
-              'stdClass', 'Gone', '__PHP_Incomplete_Class_Name', 'Denied'];
+              'stdClass', 'Gone', '__PHP_Incomplete_Class_Name', 'Denied',
+              'x', 'DynHolder'];
 function d(string $s): string { return vi(array_search($s, DICT, true)); }
 
 function frame(string $body): string {
@@ -60,6 +63,13 @@ $payloads = [
         . d('z') . $trig,
     // Declared typed slot written twice.
     'typed_slot_dup' => "\x0a" . d('TypedHolder') . "\x03"
+        . d('p') . cycle(1)
+        . d('p') . $long1
+        . d('z') . $trig,
+    // A leading dynamic key materializes the property table, so the declared
+    // slot's second write goes through its IS_INDIRECT entry.
+    'indirect_slot_dup' => "\x0a" . d('DynHolder') . "\x04"
+        . d('x') . $long1
         . d('p') . cycle(1)
         . d('p') . $long1
         . d('z') . $trig,
@@ -113,6 +123,7 @@ echo "done\n";
 assoc_dup: array, collected 2, destroyed [A,B]
 slot_dup: object, collected 2, destroyed [A,B]
 typed_slot_dup: object, collected 2, destroyed [A,B]
+indirect_slot_dup: object, collected 2, destroyed [A,B]
 dynamic_dup: object, collected 2, destroyed [A,B]
 slots_unknown: array, collected 2, destroyed [A,B]
 incomplete_reserved: array, collected 2, destroyed [A,B]

@@ -12,6 +12,10 @@ zend.enable_gc=1
 class Row { public $id; public $name; public $tags; }
 class TypedRow { public int $id; public string $name; public array $tags; }
 class Node { public $parent; public $children = []; public $n; }
+// Refcounted class defaults: the first slot write drops the object_init_ex copy.
+enum Status { case A; case B; }
+class WithEnum { public $id; public Status $s = Status::A; }
+class WithArr { public $id; public array $tags = ['x', 'y']; public $plain = ['p']; }
 
 function rows(string $cls, int $n): array {
     $out = [];
@@ -62,6 +66,20 @@ for ($i = 0; $i < 300; $i++) {
     $refs[] = $o;
 }
 $cases['refs_300'] = phpser_serialize($refs);
+$ws = [];
+$wa = [];
+for ($i = 0; $i < 1000; $i++) {
+    $o = new WithEnum();
+    $o->id = $i;
+    if ($i % 2) $o->s = Status::B;
+    $ws[] = $o;
+    $o = new WithArr();
+    $o->id = $i;
+    if ($i % 2) { $o->tags = ['t', (string)$i]; $o->plain = [$i]; }
+    $wa[] = $o;
+}
+$cases['enum_default_1000'] = phpser_serialize($ws);
+$cases['array_default_1000'] = phpser_serialize($wa);
 
 foreach ($cases as $name => $payload) {
     $d = roots_added(fn() => phpser_unserialize($payload), $keep);
@@ -99,6 +117,10 @@ cyclic_500 unsigned roots<10: true
 cyclic_500 signed roots<10: true
 refs_300 unsigned roots<10: true
 refs_300 signed roots<10: true
+enum_default_1000 unsigned roots<10: true
+enum_default_1000 signed roots<10: true
+array_default_1000 unsigned roots<10: true
+array_default_1000 signed roots<10: true
 tree intact: true
 tree collected>=501: true
 ref shared: true

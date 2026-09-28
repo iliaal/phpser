@@ -1895,9 +1895,12 @@ typedef struct {
     /* Elements already materialized under sub-linear tags; see
      * PHPSER_SUBLINEAR_MAX_ELEMS. */
     uint32_t sublinear_elems;
-    /* Set when a decoded container value was dropped or user code ran
-     * mid-decode, so a pinned entity may no longer be reachable from the
-     * result. decode_destroy then releases pins through the GC-root path. */
+    /* Set when a success path dropped a decoded value that can hold graph
+     * edges, or (conservatively) ran a legacy Serializable hook, so a pinned
+     * entity may no longer be reachable from the result. decode_destroy then releases pins
+     * through the GC-root path. Autoloaders, constant-expression evaluation,
+     * E_DEPRECATED handlers, and destructors of unrelated garbage never see a
+     * graph entity and leave it clear. */
     bool pins_may_orphan;
 } decode_ctx;
 
@@ -2054,11 +2057,29 @@ static inline int dec_class_allowed(decode_ctx *d, uint64_t class_idx,
 }
 
 /* Call before a success path destroys a value it no longer stores. Strings and
- * non-refcounted values hold no GC entity, so dropping them cannot orphan a pin. */
+ * non-refcounted values hold no GC entity, and enum cases are owned by their
+ * class constants with no edge into the graph, so dropping them cannot orphan a
+ * pin. */
 static zend_always_inline void dec_note_drop(decode_ctx *d, const zval *zv) {
-    if (Z_REFCOUNTED_P(zv) && Z_TYPE_P(zv) != IS_STRING) {
-        d->pins_may_orphan = true;
+    if (!Z_REFCOUNTED_P(zv) || Z_TYPE_P(zv) == IS_STRING) return;
+    if (Z_TYPE_P(zv) == IS_OBJECT
+        && (Z_OBJCE_P(zv)->ce_flags & ZEND_ACC_ENUM)) {
+        return;
     }
+    d->pins_may_orphan = true;
+}
+
+/* A declared slot's first write replaces the default object_init_ex copied
+ * from the class table. The class keeps its own reference to that value, which
+ * predates the decode and so cannot reach decoded entities. */
+static zend_always_inline void dec_note_slot_drop(decode_ctx *d, zend_object *obj,
+                                                  uint32_t num, const zval *slot) {
+    if (!Z_REFCOUNTED_P(slot)) return;
+    if (EXPECTED(num < (uint32_t)obj->ce->default_properties_count)) {
+        const zval *def = &CE_DEFAULT_PROPERTIES_TABLE(obj->ce)[num];
+        if (Z_REFCOUNTED_P(def) && Z_COUNTED_P(def) == Z_COUNTED_P(slot)) return;
+    }
+    dec_note_drop(d, slot);
 }
 
 /* Write a decoded value into a declared property slot (typed or untyped).
@@ -2080,14 +2101,14 @@ static int dec_install_declared_slot(decode_ctx *d, zend_object *obj,
         if (Z_ISREF_P(slot)) {
             ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
         }
-        dec_note_drop(d, slot);
+        dec_note_slot_drop(d, obj, OBJ_PROP_TO_NUM(info->offset), slot);
         zval_ptr_dtor(slot);
         ZVAL_COPY_VALUE(slot, tmp);
         if (Z_ISREF_P(slot)) {
             ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
         }
     } else {
-        dec_note_drop(d, slot);
+        dec_note_slot_drop(d, obj, OBJ_PROP_TO_NUM(info->offset), slot);
         zval_ptr_dtor(slot);
         ZVAL_COPY_VALUE(slot, tmp);
     }
@@ -2129,7 +2150,11 @@ static int dec_install_prop(decode_ctx *d, zend_object *obj, HashTable *obj_prop
                     ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
                 }
             }
-            dec_note_drop(d, slot);
+            /* Standard property tables point IS_INDIRECT entries into
+             * properties_table, as zend_get_typed_property_info_for_slot also
+             * assumes. */
+            dec_note_slot_drop(d, obj,
+                (uint32_t)(slot - obj->properties_table), slot);
             zval_ptr_dtor(slot);
             ZVAL_COPY_VALUE(slot, tmp);
             if (info != NULL && Z_ISREF_P(slot)) {
@@ -2329,16 +2354,21 @@ static void decode_destroy(decode_ctx *d, bool result_live) {
          * own nothing; ID_OBJ / ID_REF release via the type-specific
          * macro so destructors and ref-table teardown fire correctly. */
         if (result_live) {
+            /* Reachability from the result implies a holder besides the pin.
+             * Release builds still fall back to a full release if a missed
+             * drop site breaks that. */
             for (uint32_t i = 0; i < d->id_table_len; i++) {
                 id_slot *s = &d->id_table[i];
                 if (!s->pinned) continue;
                 if (s->kind == ID_OBJ) {
+                    ZEND_ASSERT(GC_REFCOUNT(s->u.obj) > 1);
                     if (EXPECTED(GC_REFCOUNT(s->u.obj) > 1)) {
                         GC_DELREF(s->u.obj);
                     } else {
                         OBJ_RELEASE(s->u.obj);
                     }
                 } else if (s->kind == ID_REF) {
+                    ZEND_ASSERT(GC_REFCOUNT(s->u.ref) > 1);
                     if (EXPECTED(GC_REFCOUNT(s->u.ref) > 1)) {
                         GC_DELREF(s->u.ref);
                     } else {
@@ -2847,7 +2877,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * encode side. */
             const unsigned char *payload = d->buf + d->pos;
             d->pos += blen;
-            /* The hook may run user code that retains or detaches graph values. */
+            /* Conservative: the hook receives only its own fresh object and a
+             * string, but it runs user code during the decode. */
             d->pins_may_orphan = true;
             if (ce->unserialize(out, ce, payload, (size_t)blen, NULL) != SUCCESS) {
                 if (Z_TYPE_P(out) != IS_UNDEF) zval_ptr_dtor(out);
@@ -3203,7 +3234,6 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 if (use_add_new) {
                     zend_hash_add_new(arr, keys[i], &tmp);
                 } else {
-                    d->pins_may_orphan = true;
                     zend_symtable_update(arr, keys[i], &tmp);
                 }
             }
@@ -3373,7 +3403,6 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
             }
         } else {
             zend_string *zs = keys[c];
-            d->pins_may_orphan = true;
             for (uint64_t r = 0; r < nrows; r++) {
                 zend_symtable_update(Z_ARR(outer->arPacked[r]), zs, &colbuf[r]);
             }
@@ -3430,7 +3459,6 @@ static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out) {
             if (use_add_new) {
                 zend_hash_add_new(row, zs, &tmp);
             } else {
-                d->pins_may_orphan = true;
                 zend_symtable_update(row, zs, &tmp);
             }
         }
