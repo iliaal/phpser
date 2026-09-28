@@ -127,26 +127,29 @@ PHP_FUNCTION(phpser_serialize_signed) {
         RETURN_THROWS();
     }
 
-    zend_string *frame = phpser_encode_zval(value, /* throw_on_overflow */ true);
+    zend_string *frame = phpser_encode_zval_ex(value, /* throw_on_overflow */ true,
+                                               NULL, PHPSER_HMAC_TAG_LEN);
     if (UNEXPECTED(!frame)) {
         RETURN_THROWS();
     }
+    /* The encoder allocated the tag slot past the frame; the tag covers the
+     * frame bytes only. */
     size_t frame_len = ZSTR_LEN(frame);
-    zend_string *signed_str = zend_string_extend(frame, frame_len + PHPSER_HMAC_TAG_LEN, 0);
-    unsigned char *tag = (unsigned char *)ZSTR_VAL(signed_str) + frame_len;
+    unsigned char *tag = (unsigned char *)ZSTR_VAL(frame) + frame_len;
     int hrc = phpser_hmac_sha256(
             (const unsigned char *)key, key_len,
-            (const unsigned char *)ZSTR_VAL(signed_str), frame_len,
+            (const unsigned char *)ZSTR_VAL(frame), frame_len,
             tag);
     if (hrc < 0) {
-        zend_string_release(signed_str);
+        zend_string_release(frame);
         zend_throw_exception(zend_ce_exception, hrc == -2
             ? "phpser: unsupported SHA256 block size"
             : "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
         RETURN_THROWS();
     }
-    ZSTR_VAL(signed_str)[frame_len + PHPSER_HMAC_TAG_LEN] = '\0';
-    RETURN_STR(signed_str);
+    ZSTR_LEN(frame) = frame_len + PHPSER_HMAC_TAG_LEN;
+    ZSTR_VAL(frame)[frame_len + PHPSER_HMAC_TAG_LEN] = '\0';
+    RETURN_STR(frame);
 }
 
 PHP_FUNCTION(phpser_unserialize_signed) {

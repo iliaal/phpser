@@ -43,7 +43,8 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
      * to the E_WARNING session.c uses for write failures. */
     phpser_enc_status status = PHPSER_ENC_OK;
     zend_string *out = phpser_encode_zval_ex(session_vars,
-                                             /* throw_on_overflow */ false, &status);
+                                             /* throw_on_overflow */ false, &status,
+                                             /* tail_reserve */ 0);
     if (UNEXPECTED(!out)) {
         switch (status) {
         case PHPSER_ENC_SIZE:

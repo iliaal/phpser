@@ -3497,7 +3497,7 @@ static zend_string *enc_finish_overflow(
 }
 
 zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
-                                          phpser_enc_status *status) {
+                                   phpser_enc_status *status, size_t tail_reserve) {
     encode_ctx ctx;
     enc_ctx_init(&ctx);
     if (status) *status = PHPSER_ENC_OK;
@@ -3565,42 +3565,55 @@ zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
     }
     size_t body_len = body.s ? ZSTR_LEN(body.s) : 0;
 
-    /* Frame: [version][varint ndict][per-entry varint(len)+bytes][body]. Pre-size
-     * for the header and body; smart_str still checks each append. */
-    size_t header_max = 1 + VARINT_MAX_BYTES_U32;
+    /* Frame: [version][varint ndict][per-entry varint(len)+bytes][body]. The
+     * header length is exact, so the result is allocated once at final size:
+     * a smart_str would round it up to a 256-byte or 4 KiB multiple, which a
+     * cache holding many small payloads pays for on every entry. */
+    size_t header_len = 1 + varint_len_u64(ctx.dict_len);
     for (uint32_t i = 0; i < ctx.dict_len; i++) {
-        header_max += VARINT_MAX_BYTES_U32 + ZSTR_LEN(ctx.dict[i]);
+        size_t elen = ZSTR_LEN(ctx.dict[i]);
+        header_len += varint_len_u64(elen) + elen;
+    }
+    size_t frame_len = header_len + body_len;
+    /* SIZE_MAX - 4096 leaves room for the zend_string header and allocator
+     * alignment. Unreachable on 64-bit; guards the 32-bit sum. */
+    if (UNEXPECTED(frame_len < body_len || tail_reserve > SIZE_MAX - 4096
+                   || frame_len > SIZE_MAX - 4096 - tail_reserve)) {
+        return enc_finish_overflow(
+            &body, &ctx, throw_on_overflow, status, PHPSER_ENC_SIZE);
     }
 
-    smart_str out = {0};
-    /* +1 for the smart_str_0 NUL terminator at the end. */
-    smart_str_alloc(&out, header_max + body_len + 1, 0);
-
-    smart_str_appendc(&out, ctx.wire_v2 ? PHPSER_VERSION_V2 : PHPSER_VERSION);
-    varint_write_u64(&out, ctx.dict_len);
+    zend_string *res = zend_string_alloc(frame_len + tail_reserve, 0);
+    char *base = ZSTR_VAL(res);
+    size_t pos = 0;
+    base[pos++] = ctx.wire_v2 ? PHPSER_VERSION_V2 : PHPSER_VERSION;
+    pos = varint_put(base, pos, ctx.dict_len);
     for (uint32_t i = 0; i < ctx.dict_len; i++) {
         zend_string *zs = ctx.dict[i];
-        varint_write_u64(&out, ZSTR_LEN(zs));
-        smart_str_appendl(&out, ZSTR_VAL(zs), ZSTR_LEN(zs));
+        pos = varint_put(base, pos, ZSTR_LEN(zs));
+        memcpy(base + pos, ZSTR_VAL(zs), ZSTR_LEN(zs));
+        pos += ZSTR_LEN(zs);
     }
+    ZEND_ASSERT(pos == header_len);
     if (body.s) {
-        smart_str_appendl(&out, ZSTR_VAL(body.s), body_len);
+        memcpy(base + pos, ZSTR_VAL(body.s), body_len);
         smart_str_free(&body);
     }
-    smart_str_0(&out);
+    base[frame_len] = '\0';
+    ZSTR_LEN(res) = frame_len;
 
     bool cleanup_can_throw = ctx.pins_active;
     enc_ctx_destroy(&ctx);
     if (UNEXPECTED(cleanup_can_throw && EG(exception))) {
-        zend_string_release(out.s);
+        zend_string_release(res);
         if (status) *status = PHPSER_ENC_EXCEPTION;
         return NULL;
     }
-    return out.s;
+    return res;
 }
 
 zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow) {
-    return phpser_encode_zval_ex(value, throw_on_overflow, NULL);
+    return phpser_encode_zval_ex(value, throw_on_overflow, NULL, 0);
 }
 
 int phpser_decode_buf_opts(

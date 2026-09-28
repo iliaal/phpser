@@ -67,9 +67,15 @@ int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n);
  * undecodable. With throw_on_overflow, the userland entry points turn limit
  * failures into exceptions; the session handler passes false and degrades
  * them to warnings, because request-shutdown auto-save may have no
- * execution frame to catch one. (phpser.c) */
+ * execution frame to catch one.
+ *
+ * The result is exactly sized: ZSTR_LEN is the frame length and the
+ * allocation holds tail_reserve further writable bytes past the NUL. A caller
+ * that appends a trailer (the signed entry point's HMAC tag) writes it at
+ * ZSTR_VAL + ZSTR_LEN, then raises ZSTR_LEN by tail_reserve and re-terminates,
+ * avoiding a realloc. Pass 0 when nothing is appended. (phpser.c) */
 zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
-                                   phpser_enc_status *status);
+                                   phpser_enc_status *status, size_t tail_reserve);
 zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow);
 
 /* Reusable decode: parse a framed payload into `out`. Returns 0 on success,
