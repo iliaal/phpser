@@ -61,6 +61,25 @@ foreach ($flips as $label => $off) {
     }
 }
 
+// A wrapper hides its payload one array level down and the encoder sizes its
+// intern cache by looking through that level (direct and by-reference
+// children). Sizing must never change the bytes: pinned against the encoding
+// produced before the sizing existed.
+$rows = [];
+for ($i = 0; $i < 300; $i++) {
+    $rows[] = ['id' => $i, 'name' => 'row_' . ($i % 37), 'email' => "u$i@example.com", 'tags' => ['a', 'b']];
+}
+$wrapped = [
+    'wrapped'   => [['data' => $rows, 'ttl' => 60], 9164, 'a37868d422bea14f40524f9cd180d689'],
+    'wrapref'   => [['data' => &$rows, 'ttl' => 60], 9165, '9f4c300b3fac2bd62d78364adbee012e'],
+    'wrapsmall' => [['data' => [1, 2, 3], 'ttl' => 60], 22, '07ee07acd91ff82816f58389a20916cd'],
+];
+foreach ($wrapped as $name => [$value, $len, $md5]) {
+    $p = phpser_serialize($value);
+    printf("%-9s %s\n", $name,
+        strlen($p) === $len && md5($p) === $md5 && phpser_unserialize($p) == $value ? 'ok' : 'FAIL');
+}
+
 // Signed output is an ordinary string: it survives copy-on-write and
 // concatenation with its length intact.
 $copy = $signed;
@@ -84,4 +103,7 @@ flip middle rejected
 flip frame-last rejected
 flip tag-first rejected
 flip tag-last rejected
+wrapped   ok
+wrapref   ok
+wrapsmall ok
 cow ok

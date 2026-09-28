@@ -3496,6 +3496,28 @@ static zend_string *enc_finish_overflow(
     return NULL;
 }
 
+/* Keyed top-level arrays up to this size are scanned for array children.
+ * Packed lists are skipped: a wrapper is string-keyed, and the scan costs
+ * about 1 ns per element on the small-payload path. */
+#define ENC_WRAPPER_MAX_KEYS 16
+
+/* A wrapper such as ['data' => $rows, 'ttl' => 60] hides the payload one level
+ * down: the top-level count says 2, so the intern cache would start at 32
+ * slots and pay the doubling-and-rehash cascade that the bare $rows skips.
+ * Returns the top-level count plus the counts of direct array children, so
+ * the wrapped payload is seeded like the bare one. */
+static uint32_t enc_wrapped_elems(HashTable *ht) {
+    uint64_t total = zend_hash_num_elements(ht);
+    zval *zv;
+    ZEND_HASH_FOREACH_VAL(ht, zv) {
+        ZVAL_DEREF(zv);
+        if (Z_TYPE_P(zv) == IS_ARRAY) {
+            total += zend_hash_num_elements(Z_ARRVAL_P(zv));
+        }
+    } ZEND_HASH_FOREACH_END();
+    return total > UINT32_MAX ? UINT32_MAX : (uint32_t)total;
+}
+
 zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
                                    phpser_enc_status *status, size_t tail_reserve) {
     encode_ctx ctx;
@@ -3514,8 +3536,10 @@ zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
         }
         /* Allow two distinct strings per element at <=50% load. Cap initial
          * zeroing; larger caches grow geometrically. */
-        if (n > 64) {
-            uint32_t want = n < 8192 ? n * 4 : 32768;
+        uint32_t n_seed = (n <= ENC_WRAPPER_MAX_KEYS && !HT_IS_PACKED(Z_ARRVAL_P(value)))
+            ? enc_wrapped_elems(Z_ARRVAL_P(value)) : n;
+        if (n_seed > 64) {
+            uint32_t want = n_seed < 8192 ? n_seed * 4 : 32768;
             uint32_t cap = 128;
             while (cap < want) cap <<= 1;
             ctx.icache_init_cap = cap;
