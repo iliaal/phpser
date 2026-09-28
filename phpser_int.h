@@ -50,12 +50,18 @@ typedef enum {
 extern const php_hash_ops *phpser_sha256_ops;
 
 /* HMAC-SHA256 of `data` under `key`. Writes a 32-byte tag to `out`.
- * Returns 0 on success, -1 if SHA256 ops aren't available, -2 if the
- * reported block size exceeds the stack pad. (phpser_hmac.c) */
+ * Returns 0 on success, -1 if SHA256 ops weren't resolved at MINIT.
+ * Callers still map -2 (unsupported block size) for older builds; it is no
+ * longer produced. (phpser_hmac.c) */
 int phpser_hmac_sha256(
     const unsigned char *key, size_t key_len,
     const unsigned char *data, size_t data_len,
     unsigned char out[PHPSER_HMAC_TAG_LEN]);
+
+/* Wipes the calling thread's cached HMAC key midstates. Call from
+ * MSHUTDOWN; ZTS worker threads that exit earlier release theirs unwiped.
+ * (phpser_hmac.c) */
+void phpser_hmac_mshutdown(void);
 
 /* Constant-time byte compare. Returns 1 if all `n` bytes are equal.
  * (phpser_hmac.c) */

@@ -10,6 +10,6 @@ if test "$PHP_PHPSER" != "no"; then
   dnl The optional dependency checks static/shared consistency and permits no session.
   PHP_ADD_EXTENSION_DEP(phpser, session, true)
 
-  PHP_NEW_EXTENSION(phpser, phpser.c phpser_hmac.c phpser_session.c phpser_module.c, $ext_shared,, -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1)
+  PHP_NEW_EXTENSION(phpser, phpser.c phpser_hmac.c phpser_sha256.c phpser_session.c phpser_module.c, $ext_shared,, -DZEND_ENABLE_STATIC_TSRMLS_CACHE=1)
   PHP_INSTALL_HEADERS([ext/phpser], [php_phpser.h])
 fi

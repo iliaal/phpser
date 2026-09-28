@@ -1,7 +1,7 @@
 ARG_ENABLE("phpser", "Enable phpser binary-serializer support", "no");
 
 if (PHP_PHPSER != "no") {
-    EXTENSION("phpser", "phpser.c phpser_hmac.c phpser_session.c phpser_module.c", null,
+    EXTENSION("phpser", "phpser.c phpser_hmac.c phpser_sha256.c phpser_session.c phpser_module.c", null,
         "/DZEND_ENABLE_STATIC_TSRMLS_CACHE=1");
 
     // php_config.h supplies HAVE_PHP_SESSION. Keep the dependency optional:
