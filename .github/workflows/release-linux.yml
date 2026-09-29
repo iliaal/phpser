@@ -43,18 +43,23 @@ jobs:
   build:
     name: ${{ matrix.os }} php ${{ matrix.php }}
     runs-on: ${{ matrix.os }}
+    env:
+      # Builds on macos-15 because setup-php's Homebrew install fails on
+      # macos-14 runners; the macOS asset still targets macOS 14 as its
+      # minimum. Linux compilers ignore the variable.
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
     permissions:
       contents: write # Uploads binary assets to the published release.
     strategy:
       fail-fast: false
       matrix:
         # ubuntu-24.04 (x86_64), ubuntu-24.04-arm (arm64),
-        # macos-14 (Apple Silicon arm64). Pinned over `*-latest` so the
+        # macos-15 (Apple Silicon arm64). Pinned over `*-latest` so the
         # toolchain and glibc baseline can't shift without a repo diff.
         os:
           - ubuntu-24.04
           - ubuntu-24.04-arm
-          - macos-14
+          - macos-15
         php: ['8.4', '8.5']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
