@@ -63,7 +63,9 @@ int phpser_hmac_sha256(
 void phpser_hmac_mshutdown(void);
 
 /* SHA-256 backend the HMAC selects on this CPU: "armv8", "sha-ni", or
- * "ext/hash". Reruns detection and the self-test. (phpser_sha256.c) */
+ * "ext/hash (not compiled)" / "ext/hash (cpu lacks feature)" /
+ * "ext/hash (self-test failed)". Reruns detection and the self-test.
+ * (phpser_sha256.c) */
 const char *phpser_sha256_backend(void);
 
 /* Constant-time byte compare. Returns 1 if all `n` bytes are equal.

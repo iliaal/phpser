@@ -281,19 +281,30 @@ static bool sha256_hw_accepted(phpser_sha256_blocks_fn fn, const char *name)
 
 phpser_sha256_blocks_fn phpser_sha256_select(const char **name)
 {
+    /* The fallback reason is reported so a test can tell a legitimate
+     * fallback (path not built, feature hidden) from a broken hardware path. */
+    const char *fallback = "ext/hash (not compiled)";
 #ifdef PHPSER_SHA256_ARMV8
-    if (sha256_cpu_has_armv8() && sha256_hw_accepted(sha256_blocks_armv8, "ARMv8")) {
+    if (!sha256_cpu_has_armv8()) {
+        fallback = "ext/hash (cpu lacks feature)";
+    } else if (sha256_hw_accepted(sha256_blocks_armv8, "ARMv8")) {
         *name = "armv8";
         return sha256_blocks_armv8;
+    } else {
+        fallback = "ext/hash (self-test failed)";
     }
 #endif
 #ifdef PHPSER_SHA256_SHANI
-    if (sha256_cpu_has_shani() && sha256_hw_accepted(sha256_blocks_shani, "SHA-NI")) {
+    if (!sha256_cpu_has_shani()) {
+        fallback = "ext/hash (cpu lacks feature)";
+    } else if (sha256_hw_accepted(sha256_blocks_shani, "SHA-NI")) {
         *name = "sha-ni";
         return sha256_blocks_shani;
+    } else {
+        fallback = "ext/hash (self-test failed)";
     }
 #endif
-    *name = "ext/hash";
+    *name = fallback;
     return sha256_blocks_exthash;
 }
 
