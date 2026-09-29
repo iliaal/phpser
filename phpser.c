@@ -1895,6 +1895,13 @@ typedef struct {
     /* Elements already materialized under sub-linear tags; see
      * PHPSER_SUBLINEAR_MAX_ELEMS. */
     uint32_t sublinear_elems;
+    /* Set when a success path dropped a decoded value that can hold graph
+     * edges, or (conservatively) ran a legacy Serializable hook, so a pinned
+     * entity may no longer be reachable from the result. decode_destroy then releases pins
+     * through the GC-root path. Autoloaders, constant-expression evaluation,
+     * E_DEPRECATED handlers, and destructors of unrelated garbage never see a
+     * graph entity and leave it clear. */
+    bool pins_may_orphan;
 } decode_ctx;
 
 /* Zend's string hash is deliberately stable and therefore craftable. Bound
@@ -2049,11 +2056,43 @@ static inline int dec_class_allowed(decode_ctx *d, uint64_t class_idx,
     return ok;
 }
 
+/* Call before a success path destroys a value it no longer stores. Strings and
+ * non-refcounted values hold no GC entity, and enum cases are owned by their
+ * class constants with no edge into the graph, so dropping them cannot orphan a
+ * pin. */
+static zend_always_inline void dec_note_drop(decode_ctx *d, const zval *zv) {
+    if (!Z_REFCOUNTED_P(zv) || Z_TYPE_P(zv) == IS_STRING) return;
+    if (Z_TYPE_P(zv) == IS_OBJECT
+        && (Z_OBJCE_P(zv)->ce_flags & ZEND_ACC_ENUM)) {
+        return;
+    }
+    d->pins_may_orphan = true;
+}
+
+/* A declared slot's first write replaces the default object_init_ex copied
+ * from the class table. The class keeps its own reference to that value, which
+ * predates the decode and so cannot reach decoded entities. */
+static zend_always_inline void dec_note_slot_drop(decode_ctx *d, zend_object *obj,
+                                                  uint32_t num, const zval *slot) {
+    if (!Z_REFCOUNTED_P(slot) || Z_TYPE_P(slot) == IS_STRING) return;
+    if (Z_TYPE_P(slot) == IS_OBJECT
+        && (Z_OBJCE_P(slot)->ce_flags & ZEND_ACC_ENUM)) {
+        return;
+    }
+    if (EXPECTED(num < (uint32_t)obj->ce->default_properties_count)) {
+        const zval *def = &CE_DEFAULT_PROPERTIES_TABLE(obj->ce)[num];
+        if (Z_REFCOUNTED_P(def) && Z_COUNTED_P(def) == Z_COUNTED_P(slot)) return;
+    }
+    d->pins_may_orphan = true;
+}
+
 /* Write a decoded value into a declared property slot (typed or untyped).
  * Takes ownership of *tmp: on success it's moved into the slot; on
- * type-mismatch it's dtor'd. Returns 0/-1. */
-static int dec_install_declared_slot(zend_object *obj, zend_property_info *info,
-                                     zval *tmp) {
+ * type-mismatch it's dtor'd. Returns 0/-1. slot_is_default promises the slot
+ * still holds its object_init_ex default, so replacing it needs no drop note. */
+static int dec_install_declared_slot(decode_ctx *d, zend_object *obj,
+                                     zend_property_info *info, zval *tmp,
+                                     bool slot_is_default) {
     zval *slot = OBJ_PROP(obj, info->offset);
     if (ZEND_TYPE_IS_SET(info->type)) {
         /* Scalar mask hits need no engine call. Objects must still verify class
@@ -2068,12 +2107,18 @@ static int dec_install_declared_slot(zend_object *obj, zend_property_info *info,
         if (Z_ISREF_P(slot)) {
             ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
         }
+        if (!slot_is_default) {
+            dec_note_slot_drop(d, obj, OBJ_PROP_TO_NUM(info->offset), slot);
+        }
         zval_ptr_dtor(slot);
         ZVAL_COPY_VALUE(slot, tmp);
         if (Z_ISREF_P(slot)) {
             ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
         }
     } else {
+        if (!slot_is_default) {
+            dec_note_slot_drop(d, obj, OBJ_PROP_TO_NUM(info->offset), slot);
+        }
         zval_ptr_dtor(slot);
         ZVAL_COPY_VALUE(slot, tmp);
     }
@@ -2084,13 +2129,14 @@ static int dec_install_declared_slot(zend_object *obj, zend_property_info *info,
  * IS_INDIRECT-vs-dynamic dispatch with typed-slot checking. Used by both
  * TAG_OBJECT and TAG_OBJECT_MAGIC's __unserialize-missing fallback.
  * Takes ownership of *tmp. Returns 0/-1. */
-static int dec_install_prop(zend_object *obj, HashTable *obj_props,
+static int dec_install_prop(decode_ctx *d, zend_object *obj, HashTable *obj_props,
                             zend_string *key, zval *tmp) {
     /* Reserve the original class-name marker: a wire overwrite could resurrect
      * another class after reserialization. The encoder omits this marker; rejecting
      * the overwrite is stricter than native. */
     if (UNEXPECTED(obj->ce == PHP_IC_ENTRY)
         && zend_string_equals_literal(key, MAGIC_MEMBER)) {
+        dec_note_drop(d, tmp);
         zval_ptr_dtor(tmp);
         return 0;
     }
@@ -2114,12 +2160,18 @@ static int dec_install_prop(zend_object *obj, HashTable *obj_props,
                     ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
                 }
             }
+            /* Standard property tables point IS_INDIRECT entries into
+             * properties_table, as zend_get_typed_property_info_for_slot also
+             * assumes. */
+            dec_note_slot_drop(d, obj,
+                (uint32_t)(slot - obj->properties_table), slot);
             zval_ptr_dtor(slot);
             ZVAL_COPY_VALUE(slot, tmp);
             if (info != NULL && Z_ISREF_P(slot)) {
                 ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
             }
         } else {
+            dec_note_drop(d, existing);
             zval_ptr_dtor(existing);
             ZVAL_COPY_VALUE(existing, tmp);
         }
@@ -2198,7 +2250,7 @@ static zend_always_inline int dec_dynamic_prop_forbidden(
 
 /* Without __unserialize, apply data as properties, including to incomplete classes.
  * Integer keys become string-named dynamic properties. */
-static int dec_apply_data_as_props(zend_object *obj, HashTable *data_ht) {
+static int dec_apply_data_as_props(decode_ctx *d, zend_object *obj, HashTable *data_ht) {
     HashTable *obj_props = zend_std_get_properties(obj);
     zend_string *key;
     zend_ulong h;
@@ -2209,12 +2261,12 @@ static int dec_apply_data_as_props(zend_object *obj, HashTable *data_ht) {
         if (key) {
             /* A typed-slot mismatch leaves a pending TypeError; fail the decode
              * instead of installing more props and queueing __wakeup under it. */
-            if (dec_install_prop(obj, obj_props, key, &tmp) < 0) return -1;
+            if (dec_install_prop(d, obj, obj_props, key, &tmp) < 0) return -1;
         } else {
             /* Int keys become string-named dynamic properties ("0", "1"), as
              * in PHP. */
             zend_string *str_key = zend_long_to_str((zend_long)h);
-            int rc = dec_install_prop(obj, obj_props, str_key, &tmp);
+            int rc = dec_install_prop(d, obj, obj_props, str_key, &tmp);
             zend_string_release(str_key);
             if (rc < 0) return -1;
         }
@@ -2294,7 +2346,13 @@ static int decode_header(decode_ctx *d) {
     return 0;
 }
 
-static void decode_destroy(decode_ctx *d) {
+/* result_live: the decoded value is being returned and every pinned entity is
+ * still reachable from it (no drop, no user code). A live entity cannot be
+ * cyclic garbage, and a later unset of the result roots it through the normal
+ * refcount path, so the pin release skips gc_possible_root. Otherwise each
+ * surviving entity must be offered as a root: it may now be orphaned in a
+ * cycle whose earlier root a mid-decode GC run already discarded. */
+static void decode_destroy(decode_ctx *d, bool result_live) {
     if (d->dict) {
         for (uint32_t i = 0; i < d->dict_len; i++) {
             if (d->dict[i]) zend_string_release(d->dict[i]);
@@ -2305,13 +2363,38 @@ static void decode_destroy(decode_ctx *d) {
         /* Release the refcount we took at registration. ID_NULL slots
          * own nothing; ID_OBJ / ID_REF release via the type-specific
          * macro so destructors and ref-table teardown fire correctly. */
-        for (uint32_t i = 0; i < d->id_table_len; i++) {
-            id_slot *s = &d->id_table[i];
-            if (!s->pinned) continue;
-            if (s->kind == ID_OBJ) {
-                OBJ_RELEASE(s->u.obj);
-            } else if (s->kind == ID_REF) {
-                GC_DTOR(s->u.ref);
+        if (result_live) {
+            /* Reachability from the result implies a holder besides the pin.
+             * Release builds still fall back to a full release if a missed
+             * drop site breaks that. */
+            for (uint32_t i = 0; i < d->id_table_len; i++) {
+                id_slot *s = &d->id_table[i];
+                if (!s->pinned) continue;
+                if (s->kind == ID_OBJ) {
+                    ZEND_ASSERT(GC_REFCOUNT(s->u.obj) > 1);
+                    if (EXPECTED(GC_REFCOUNT(s->u.obj) > 1)) {
+                        GC_DELREF(s->u.obj);
+                    } else {
+                        OBJ_RELEASE(s->u.obj);
+                    }
+                } else if (s->kind == ID_REF) {
+                    ZEND_ASSERT(GC_REFCOUNT(s->u.ref) > 1);
+                    if (EXPECTED(GC_REFCOUNT(s->u.ref) > 1)) {
+                        GC_DELREF(s->u.ref);
+                    } else {
+                        GC_DTOR(s->u.ref);
+                    }
+                }
+            }
+        } else {
+            for (uint32_t i = 0; i < d->id_table_len; i++) {
+                id_slot *s = &d->id_table[i];
+                if (!s->pinned) continue;
+                if (s->kind == ID_OBJ) {
+                    OBJ_RELEASE(s->u.obj);
+                } else if (s->kind == ID_REF) {
+                    GC_DTOR(s->u.ref);
+                }
             }
         }
         efree(d->id_table);
@@ -2470,7 +2553,7 @@ static zend_always_inline int decode_value_hot(decode_ctx *d, zval *out) {
  * walk zend_hash_update would perform internally. Returning -1 leaves `value`
  * owned by the caller. */
 static zend_always_inline int dec_assoc_update_bounded(
-    HashTable *ht, key_val *key, zval *value)
+    decode_ctx *d, HashTable *ht, key_val *key, zval *value)
 {
     zend_ulong h;
     zend_string *zs = NULL;
@@ -2490,6 +2573,7 @@ static zend_always_inline int dec_assoc_update_bounded(
             && ((zs == NULL && bucket->key == NULL)
                 || (zs != NULL && bucket->key != NULL
                     && zend_string_equals(bucket->key, zs)))) {
+            dec_note_drop(d, &bucket->val);
             zval_ptr_dtor(&bucket->val);
             ZVAL_COPY_VALUE(&bucket->val, value);
             return 0;
@@ -2803,6 +2887,9 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * encode side. */
             const unsigned char *payload = d->buf + d->pos;
             d->pos += blen;
+            /* Conservative: the hook receives only its own fresh object and a
+             * string, but it runs user code during the decode. */
+            d->pins_may_orphan = true;
             if (ce->unserialize(out, ce, payload, (size_t)blen, NULL) != SUCCESS) {
                 if (Z_TYPE_P(out) != IS_UNDEF) zval_ptr_dtor(out);
                 ZVAL_NULL(out);
@@ -2858,7 +2945,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             } else {
                 /* Without __unserialize, preserve decoded data as properties,
                  * including on incomplete classes. */
-                if (dec_apply_data_as_props(Z_OBJ_P(out), Z_ARRVAL(data)) < 0) {
+                if (dec_apply_data_as_props(d, Z_OBJ_P(out), Z_ARRVAL(data)) < 0) {
                     /* A typed slot rejected the data (pending TypeError). `out`
                      * is registered, so decode_destroy releases it. Do not
                      * queue __wakeup. */
@@ -2932,7 +3019,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                         if (info == NULL) continue;
                         zval tmp;
                         if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
-                        if (dec_install_prop(obj, obj_props, info->name, &tmp) < 0) {
+                        if (dec_install_prop(d, obj, obj_props, info->name, &tmp) < 0) {
                             goto slots_fail;
                         }
                     }
@@ -2942,6 +3029,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                     for (uint64_t i = 0; i < nprops; i++) {
                         zval tmp;
                         if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
+                        dec_note_drop(d, &tmp);
                         zval_ptr_dtor(&tmp);
                     }
                 }
@@ -2959,6 +3047,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 for (uint64_t i = 0; i < nprops; i++) {
                     zval tmp;
                     if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
+                    dec_note_drop(d, &tmp);
                     zval_ptr_dtor(&tmp);
                 }
                 return 0;
@@ -3002,12 +3091,17 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 return 0;
             }
 
+            /* properties_info_table is indexed by slot number, so each slot is
+             * written once and still holds its default. */
             for (int pi = 0; pi < pc; pi++) {
                 zend_property_info *info = ce->properties_info_table[pi];
                 if (info == NULL) continue;
                 zval tmp;
                 if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
-                if (dec_install_declared_slot(obj, info, &tmp) < 0) goto slots_fail;
+                if (dec_install_declared_slot(d, obj, info, &tmp,
+                        /* slot_is_default */ true) < 0) {
+                    goto slots_fail;
+                }
             }
             dec_maybe_defer_wakeup(d, ce, obj);
             return 0;
@@ -3113,7 +3207,9 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 if (EXPECTED(obj_props == NULL)) {
                     zend_property_info *info = dec_prop_info_for_key(ce, key);
                     if (EXPECTED(info != NULL)) {
-                        if (dec_install_declared_slot(obj, info, &tmp) < 0) {
+                        /* A duplicate wire key can rewrite a decoded value. */
+                        if (dec_install_declared_slot(d, obj, info, &tmp,
+                                /* slot_is_default */ false) < 0) {
                             goto obj_fail;
                         }
                         continue;
@@ -3127,7 +3223,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                  * IS_INDIRECT slots get typed-property verification, dynamic
                  * props go through zend_hash_update with overwrite semantics.
                  * On typed-mismatch tmp is dtor'd inside the helper. */
-                if (dec_install_prop(obj, obj_props, key, &tmp) < 0) goto obj_fail;
+                if (dec_install_prop(d, obj, obj_props, key, &tmp) < 0) goto obj_fail;
                 continue;
             obj_fail:
                 zval_ptr_dtor(out); ZVAL_NULL(out); return -1;
@@ -3184,7 +3280,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 /* TAG_ASSOC keeps update semantics for duplicate collapse and
                  * canonical numeric-string coercion on signed and unsigned
                  * frames; HMAC verification does not prove key uniqueness. */
-                if (UNEXPECTED(dec_assoc_update_bounded(arr, &k, &tmp) < 0)) {
+                if (UNEXPECTED(dec_assoc_update_bounded(d, arr, &k, &tmp) < 0)) {
                     zval_ptr_dtor(&tmp);
                     if (k.kind == KV_OWNED_STR) zend_string_release(k.str);
                     goto assoc_fail;
@@ -3651,14 +3747,14 @@ int phpser_decode_buf_opts(
     d.allowed_set = allowed_set;
 
     if (decode_header(&d) < 0) {
-        decode_destroy(&d);
+        decode_destroy(&d, false);
         ZVAL_NULL(out);
         return -1;
     }
     if (decode_value(&d, out) < 0) {
         zval_ptr_dtor(out);
         ZVAL_NULL(out);
-        decode_destroy(&d);
+        decode_destroy(&d, false);
         return -1;
     }
     /* Signed and session frames require exact consumption before hooks run. The
@@ -3666,7 +3762,7 @@ int phpser_decode_buf_opts(
     if (require_exact && UNEXPECTED(d.pos != d.len)) {
         zval_ptr_dtor(out);
         ZVAL_NULL(out);
-        decode_destroy(&d);
+        decode_destroy(&d, false);
         return -1;
     }
     /* The graph is fully stitched before any hook runs. Dispatch wakeup and
@@ -3690,9 +3786,12 @@ int phpser_decode_buf_opts(
         if (UNEXPECTED(EG(exception))) goto done;
     }
 done:
-    decode_destroy(&d);
+    /* Hooks run user code that can detach pinned entities from the result. */
+    decode_destroy(&d, !d.pins_may_orphan && d.deferred_len == 0
+                       && !EG(exception));
     /* The PHP entry point is not declared by-reference, so unwrap a top-level
-     * TAG_NEW_REF before returning to Zend. */
+     * TAG_NEW_REF before returning to Zend. The pin was released above while
+     * `out` still held the reference; this drop takes the normal root path. */
     if (Z_TYPE_P(out) == IS_REFERENCE) {
         zend_reference *ref = Z_REF_P(out);
         zval inner;
