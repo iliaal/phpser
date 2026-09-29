@@ -69,9 +69,12 @@ a decoded untrusted value without tracking identity (`json_encode()`,
 `var_export()`, `serialize()`, `array_walk_recursive()`,
 `count($v, COUNT_RECURSIVE)`, deep `==`) does work proportional to the
 logical size, so bound that work at the application layer. Re-encoding with
-phpser stays linear because the encoder emits each shared array once. The
-decoder registers a shared array only after its contents decode, so no
-back-reference can reach an array that is still being built.
+phpser stays linear because the encoder emits each shared array once. That
+holds only for arrays free of PHP references, which the encoder never shares,
+so the decoder rejects a shared array whose contents create or reuse a
+reference, including one behind an object property. The decoder registers a
+shared array only after its contents decode, so no back-reference can reach
+an array that is still being built.
 
 Class resolution is *not* memoized on a miss, so a payload naming an unknown
 class once per object triggers one autoloader invocation per object rather
@@ -186,6 +189,14 @@ semantics, with these intentional differences:
   engine (warning; a scalar-root payload fails the read rather than
   becoming an empty session). Prefer the signed entry point when you
   need to distinguish a decode failure from a legitimate `null`.
+
+- **A shared array is captured at its first visit.** Native `serialize()`
+  writes every occurrence of an array separately; phpser writes a
+  pointer-shared nested array once and back-references the rest. The only
+  observable difference is when a serialization hook mutates such an array
+  in place between two occurrences, which only SPL storage writes on release
+  builds can do (debug builds abort on `HT_ASSERT_RC1`): later occurrences
+  then decode to the first-visit contents, as they already do for objects.
 
 - **Unloaded, disallowed positional objects keep no slot state.**
   `TAG_OBJECT_SLOTS` carries values in class slot order without property names.

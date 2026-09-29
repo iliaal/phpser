@@ -48,11 +48,12 @@ echo ($d === [[1, 2], [1, 2], [1, 2]] && refcount_of($d[0]) === 3)
 $d = phpser_unserialize("\x01\x00" . substr($f, 2));
 echo $d === [[1, 2], [1, 2], [1, 2]] ? "v1 header OK\n" : "v1 header FAIL\n";
 
-// The id is claimed after the array's children: NEW_REF inside takes id 0,
-// the shared array id 1.
-$f = $H2 . "\x07\x03" . "\x18\x07\x01\x11\x03\x0e" . "\x10\x01" . "\x10\x00";
+// The id is claimed after the array's children: the object inside takes
+// id 0, the shared array id 1 (dict: stdClass).
+$f = "\x02\x01\x08stdClass" . "\x07\x03" . "\x18\x07\x01\x0a\x00\x00" . "\x10\x01" . "\x10\x00";
 $d = phpser_unserialize($f);
-echo ($d[0] === [7] && $d[1] === [7] && $d[2] === 7) ? "post-order id OK\n" : "post-order id FAIL\n";
+echo (is_array($d) && $d[0][0] instanceof stdClass && $d[1] === $d[0] && $d[2] === $d[0][0])
+    ? "post-order id OK\n" : "post-order id FAIL\n";
 
 // 3. A duplicate key drops the only owner of a shared array before a later
 //    TAG_REF reads it; the id-table pin keeps it alive (dict: k, j).

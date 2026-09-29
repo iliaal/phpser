@@ -114,6 +114,49 @@ $d = rt(['w' => $w, 'u' => new Unser137, 'plain' => [$shared_list]]);
 echo ($d['w']->list === ['s1', 's2', 'woke'] && $d['u']->got === ['s1', 's2', 'u']
       && $d['plain'][0] === ['s1', 's2'])
     ? "hooks separate OK\n" : "hooks separate FAIL\n";
+
+// 6. A cycle collection started by the encoder's own releases (the 30000
+//    children of a duplicated shared array overflow the root buffer) runs
+//    destructors of unrelated garbage before any hook activates pins. Such a
+//    destructor frees a claimed array through a reference alias and stores a
+//    fresh array into a later reference, where the freed address is reused.
+//    The later value must never decode as the freed array.
+class GcCtl137 {
+    public static bool $armed = false;
+    public static bool $fired = false;
+    public static function fire(): void {
+        if (!self::$armed || self::$fired) return;
+        self::$fired = true;
+        unset($GLOBALS['gc_ext']);
+        $GLOBALS['gc_alias'] = null;
+        $n = ['new-' . random_int(1, 1), 'y'];
+        $GLOBALS['gc_keep'] = $n;
+        $GLOBALS['gc_alias2'] = $n;
+    }
+}
+class GcJunk137 {
+    public static int $dtors = 0;
+    public $self;
+    public function __destruct() { self::$dtors++; GcCtl137::fire(); }
+}
+$gc_alias = ['old-' . random_int(1, 1), 'z'];
+$gc_ext = $gc_alias;
+$gc_alias2 = null;
+$gc_big = [];
+for ($i = 0; $i < 30000; $i++) $gc_big[] = [$i];
+$gc_big_keep = $gc_big;
+$gc_payload = [&$gc_alias, $gc_big, &$gc_alias2];
+gc_collect_cycles();
+for ($i = 0; $i < 10; $i++) { $j = new GcJunk137; $j->self = $j; unset($j); }
+GcCtl137::$armed = true;
+$s = phpser_serialize($gc_payload);
+GcCtl137::$armed = false;
+$fired_during_encode = GcCtl137::$fired;
+$d = phpser_unserialize($s);
+$want = $fired_during_encode ? ['new-1', 'y'] : null;
+echo ($d[2] === $want && $d[2] !== ['old-1', 'z']) ? "gc destructor aba OK\n" : "gc destructor aba FAIL\n";
+gc_collect_cycles();
+echo (gc_enabled() && GcJunk137::$dtors === 10) ? "gc resumed OK\n" : "gc resumed FAIL\n";
 ?>
 --EXPECT--
 hook append OK
@@ -121,3 +164,5 @@ aba OK
 serialize return OK
 snapshot not shared OK
 hooks separate OK
+gc destructor aba OK
+gc resumed OK

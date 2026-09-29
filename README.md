@@ -430,9 +430,14 @@ snapshots, or immutable) and whose walk reached no PHP reference; a later
 visit of the same `HashTable` emits REF. The top-level value never claims.
 An array holding a reference stays by-value on every visit: COW separation
 keeps a reference in each copy, and one shared decoded array would lose the
-aliasing a later write through either copy depends on. Arrays are pinned
-exactly like tracked objects, so a freed table's reused address cannot
-masquerade as a back-reference.
+aliasing a later write through either copy depends on. The decoder enforces
+the same rule and rejects a SHARED_ARRAY whose contents create or reuse a
+reference (NEW_REF, or a REF to a reference), including through an object
+property. Arrays are pinned exactly like tracked objects, and cycle
+collection stays suspended until the first hook pins them, so a freed
+table's reused address cannot masquerade as a back-reference. A shared array
+is captured at its first visit; see SECURITY.md for the one case where that
+differs from native.
 
 The version byte is emitted as `0x02` only when the body actually uses a
 v2-only tag (`0x12`–`0x18`); otherwise it stays `0x01`. On decode it is a

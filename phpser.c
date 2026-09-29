@@ -309,6 +309,13 @@ typedef struct {
     /* Once user code can run, every id-table entry owns a reference.
      * Activation pins existing entries; later inserts pin individually. */
     uint8_t pins_active;
+    /* A cycle collection triggered by the encoder's own releases (a private
+     * duplicate's destroy can fill the root buffer) runs destructors of
+     * unrelated garbage, which is user code before any pin exists. It could
+     * free an unpinned entry and reuse its address, so collection stays off
+     * until pins activate or the encode ends. */
+    uint8_t gc_suspended;
+    uint8_t gc_was_enabled;
     /* First-allocation capacity for icache (power of 2; 0 = default 32).
      * Seeded from the top-level element count so a large payload skips the
      * per-doubling ecalloc + rehash cascade on its way up from 32 slots. */
@@ -352,6 +359,8 @@ static void enc_ctx_init(encode_ctx *e) {
     e->failed = 0;
     e->wire_v2 = 0;
     e->pins_active = 0;
+    e->gc_was_enabled = gc_enable(false);
+    e->gc_suspended = 1;
     e->icache_init_cap = 0;
     e->sublinear_elems = 0;
     e->refs_seen = 0;
@@ -420,6 +429,13 @@ static zend_always_inline void enc_id_addref(uintptr_t ptr, uint8_t kind) {
     }
 }
 
+static zend_always_inline void enc_gc_resume(encode_ctx *e) {
+    if (e->gc_suspended) {
+        e->gc_suspended = 0;
+        gc_enable(e->gc_was_enabled);
+    }
+}
+
 /* First user-code boundary: pin every tracked entity before the hook runs,
  * so a hook (or a destructor it triggers) cannot destroy a table entry and
  * let a same-address reallocation masquerade as a back-reference. Called
@@ -434,6 +450,7 @@ static zend_never_inline void enc_pins_activate_slow(encode_ctx *e) {
             }
         }
     }
+    enc_gc_resume(e);
 }
 
 static zend_always_inline void enc_pins_activate(encode_ctx *e) {
@@ -441,6 +458,7 @@ static zend_always_inline void enc_pins_activate(encode_ctx *e) {
 }
 
 static void enc_ctx_destroy(encode_ctx *e) {
+    enc_gc_resume(e);
     if (e->icache) efree(e->icache);
     if (e->hash_map_inited) zend_hash_destroy(&e->hash_map);
     if (e->id_buckets) {
@@ -2063,6 +2081,9 @@ typedef struct {
     /* Elements already materialized under sub-linear tags; see
      * PHPSER_SUBLINEAR_MAX_ELEMS. */
     uint32_t sublinear_elems;
+    /* PHP references created or looked up so far; TAG_SHARED_ARRAY rejects a
+     * payload that moves it, mirroring the encoder's refs_seen rule. */
+    uint32_t refs_seen;
 } decode_ctx;
 
 /* Zend's string hash is deliberately stable and therefore craftable. Bound
@@ -2484,12 +2505,20 @@ static void decode_destroy(decode_ctx *d) {
         for (uint32_t i = 0; i < d->id_table_len; i++) {
             id_slot *s = &d->id_table[i];
             if (!s->pinned) continue;
-            if (s->kind == ID_OBJ) {
-                OBJ_RELEASE(s->u.obj);
-            } else if (s->kind == ID_REF) {
-                GC_DTOR(s->u.ref);
-            } else if (s->kind == ID_ARR) {
-                GC_DTOR(s->u.arr);
+            switch (s->kind) {
+                case ID_OBJ:
+                    OBJ_RELEASE(s->u.obj);
+                    break;
+                case ID_REF:
+                    GC_DTOR(s->u.ref);
+                    break;
+                case ID_ARR:
+                    GC_DTOR(s->u.arr);
+                    break;
+                case ID_NULL:
+                    break;
+                default:
+                    ZEND_UNREACHABLE();
             }
         }
         efree(d->id_table);
@@ -2803,7 +2832,11 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             id_slot *s = &d->id_table[id];
             switch (s->kind) {
                 case ID_OBJ:  ZVAL_OBJ_COPY(out, s->u.obj); return 0;
-                case ID_REF:  ZVAL_REF(out, s->u.ref); GC_ADDREF(s->u.ref); return 0;
+                case ID_REF:
+                    d->refs_seen++;
+                    ZVAL_REF(out, s->u.ref);
+                    GC_ADDREF(s->u.ref);
+                    return 0;
                 case ID_NULL: ZVAL_NULL(out); return 0;
                 case ID_ARR:  ZVAL_ARR(out, s->u.arr); GC_ADDREF(s->u.arr); return 0;
             }
@@ -2820,6 +2853,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             ZVAL_UNDEF(&ref->val);
             ZVAL_REF(out, ref);
             dec_register(d, out);
+            d->refs_seen++;
             if (decode_value(d, &ref->val) < 0) return -1;
             /* PHP cannot produce a reference directly wrapping another reference.
              * Crafted nested/self references recurse during teardown; reject and
@@ -3414,8 +3448,14 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
  * that is still being built: one from inside it is out of range. */
 static zend_never_inline int dec_decode_shared_array(decode_ctx *d, zval *out) {
     if (d->pos >= d->len || !dec_is_array_tag(d->buf[d->pos])) return -1;
+    uint32_t refs_before = d->refs_seen;
     if (decode_value_inner(d, out) < 0) return -1;
     if (UNEXPECTED(Z_TYPE_P(out) != IS_ARRAY)) return -1;
+    /* The encoder shares only arrays whose walk reached no PHP reference, even
+     * through an object property. A crafted frame that does would make every
+     * re-encode walk the array by value per holder, expanding the DAG to its
+     * full logical size. */
+    if (UNEXPECTED(d->refs_seen != refs_before)) return -1;
     /* Every decoded array is fresh and refcounted. */
     ZEND_ASSERT(!(GC_FLAGS(Z_ARR_P(out)) & GC_IMMUTABLE));
     dec_register(d, out);

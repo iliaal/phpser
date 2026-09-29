@@ -372,6 +372,12 @@ $sa_bad = [
     "\x02\x00\x07\x02\x18\x07\x00\x10\x81\x80\x80\x80\x10", // REF id 2^32 truncation alias
     "\x02\x00\x18\x07\x01\x11\x10\x01",          // NEW_REF inside pointing at the unclaimed array
     "\x02\x00\x07\x02\x18\x07\x01\x11\x10\x00\x10\x01", // NEW_REF wrapping itself inside the array
+    // The encoder never shares an array whose walk reaches a PHP reference;
+    // a payload that creates or reuses one rejects.
+    "\x02\x00\x18\x07\x01\x11\x03\x02",                 // NEW_REF element
+    "\x02\x00\x18\x07\x01\x07\x01\x11\x03\x02",         // NEW_REF in an unshared child
+    "\x02\x00\x07\x02\x11\x03\x02\x18\x07\x01\x10\x00", // REF to an earlier reference
+    "\x02\x02\x08stdClass\x01p\x18\x07\x01\x0a\x00\x01\x01\x11\x03\x02", // reference in an object property
 ];
 $sa_fail = 0;
 foreach ($sa_bad as $i => $bytes) {
@@ -401,6 +407,30 @@ foreach ($sa_bad as $i => $bytes) {
         }
     }
 }
+// Back-references to an object or a shared array inside, and a reference
+// holding a shared array outside, stay legal.
+$obj_ref = phpser_unserialize("\x02\x01\x08stdClass\x07\x02\x0a\x00\x00\x18\x07\x01\x10\x00");
+$arr_ref = phpser_unserialize("\x02\x00\x07\x03\x18\x08\x01\x02\x18\x07\x01\x10\x00\x10\x01");
+$ref_out = phpser_unserialize("\x02\x00\x07\x02\x11\x18\x08\x01\x02\x10\x01");
+if (!is_array($obj_ref) || $obj_ref[1][0] !== $obj_ref[0]
+    || $arr_ref !== [[1], [[1]], [[1]]] || $ref_out !== [[1], [1]]) {
+    echo "shared_array legal backrefs FAIL\n";
+    $sa_fail++;
+}
+// The encoder side of the same rule: a reference behind an object property
+// inside a pointer-shared array keeps the array by value, so the frame
+// carries no TAG_SHARED_ARRAY and decodes with the aliasing intact.
+$o = new stdClass;
+$shared_x = 1;
+$o->p = &$shared_x;
+$held = [$o, 'k'];
+$frame = phpser_serialize([$held, $held]);
+$back = phpser_unserialize($frame);
+if (strpos($frame, "\x18") !== false || $back[0][0] !== $back[1][0]) {
+    echo "shared_array object reference FAIL\n";
+    $sa_fail++;
+}
+unset($o, $shared_x, $held, $frame, $back);
 // A well-formed empty shared array (never emitted, but legal) decodes.
 if (phpser_unserialize("\x02\x00\x07\x02\x18\x07\x00\x10\x00") !== [[], []]) {
     echo "shared_array empty FAIL\n";
