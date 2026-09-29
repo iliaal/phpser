@@ -2619,8 +2619,9 @@ static void decode_destroy(decode_ctx *d, bool result_live) {
          * macro so destructors and ref-table teardown fire correctly. */
         if (result_live) {
             /* Reachability from the result implies a holder besides the pin.
-             * Release builds still fall back to a full release if a missed
-             * drop site breaks that. */
+             * If a missed drop site leaves the pin as the sole holder, the
+             * entity gets a full release; a missed drop still held by an
+             * orphaned cycle keeps refcount > 1 and leaks until shutdown. */
             for (uint32_t i = 0; i < d->id_table_len; i++) {
                 id_slot *s = &d->id_table[i];
                 if (!s->pinned) continue;
@@ -2632,10 +2633,16 @@ static void decode_destroy(decode_ctx *d, bool result_live) {
                     case ID_NULL: continue;
                     default: ZEND_UNREACHABLE(); continue;
                 }
-                ZEND_ASSERT(GC_REFCOUNT(rc) > 1);
                 if (EXPECTED(GC_REFCOUNT(rc) > 1)) {
                     GC_DELREF(rc);
-                } else if (s->kind == ID_OBJ) {
+                    continue;
+                }
+                /* Release builds turn ZEND_ASSERT into ZEND_ASSUME, which
+                 * would delete this fallback; only debug builds trip. */
+#if ZEND_DEBUG
+                ZEND_ASSERT(0 && "pin was the last holder; missed dec_note_drop");
+#endif
+                if (s->kind == ID_OBJ) {
                     OBJ_RELEASE(s->u.obj);
                 } else {
                     GC_DTOR(rc);
