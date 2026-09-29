@@ -349,7 +349,7 @@ final class CarbonLike {
 }
 
 function mk_carbon(int $offset): CarbonLike {
-    return new CarbonLike(fx_ts($offset) . sprintf('.%06d', ($offset * 7919) % 1000000));
+    return new CarbonLike(fx_ts($offset) . sprintf('.%06d', (int) fmod($offset * 7919, 1000000)));
 }
 
 enum WalletGroupType: string {
