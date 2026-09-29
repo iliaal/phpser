@@ -193,7 +193,8 @@ Regenerate it with `php ... bench.php --html > docs/index.html`.
   result instead of one per decoded object, so large object graphs don't
   trigger collector runs while the application holds them.
 - **Hardware HMAC**: signed payloads use ARMv8 Crypto Extensions or SHA-NI
-  when available and cache the per-key HMAC state.
+  when available and cache the per-key HMAC state. `php --ri phpser` shows
+  the backend in use (`armv8`, `sha-ni`, or `ext/hash` with the reason).
 - **HT_IS_PACKED flag check**: layout comes from the flag, without
   scanning buckets.
 - **`arPacked` stride awareness**: PHP 8+ packed arrays store zvals

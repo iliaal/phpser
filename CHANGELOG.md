@@ -7,50 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-29
+
 ### Performance
 
-- Decoding no longer adds one garbage-collector root per decoded object when the
-  result keeps them reachable. With GC enabled and decoded values retained,
-  same-class DTO batches decode 29-31% faster on aarch64 and phpser no longer
-  triggers collector runs; 1000 objects now add one root instead of 1000.
-- Pointer-shared nested arrays (a literal `tags` list on every row, or an
-  Eloquent model's `attributes` and `original`) are encoded once and shared by
-  refcount on decode, as igbinary does. A 1000-row rowset decodes to 429 KB
-  instead of 645 KB and decodes 30% faster; DTO batches decode 16% faster
-  and 40% smaller in memory. A model holding one array in two properties
-  encodes the second copy in one byte instead of 406.
-- Signed payloads compute HMAC-SHA256 with ARMv8 Crypto Extensions or SHA-NI
-  when the CPU has them, and cache the key-derived HMAC state per thread.
-  `phpser_unserialize_signed()` is 53-85% faster on aarch64, most on small
-  values. The signed wire format is unchanged.
-- Encoded payloads are allocated at their exact size. A held 19-byte payload
-  costs 48 bytes instead of 256, and payloads up to ~3 KB no longer occupy a
-  4 KB page.
-- Wrapped payloads such as `['data' => $rows, 'ttl' => 60]` encode 5-9% faster:
-  the intern cache is now sized from the wrapper's children.
-- Small values decode 3-16% faster: the first eight back-reference ids live on
-  the stack, and a payload without strings allocates no dictionary. Shuffled
-  integer arrays (`packed_rand_10k`) decode 15% faster with the delta-run loop
-  moved out of line.
+- Decode adds one GC root per result instead of one per object; retained DTO batches with GC on decode 29-31% faster.
+- Pointer-shared nested arrays encode once and decode as one refcounted table; a 1000-row rowset decodes 30% faster in 429 KB instead of 645 KB.
+- Signed payloads use ARMv8 or SHA-NI SHA-256 and a per-thread key cache; `phpser_unserialize_signed()` is 53-85% faster on aarch64.
+- Encoded payloads are allocated at exact size; a held 19-byte payload costs 48 bytes instead of 256.
+- Wrapped payloads (`['data' => $rows, 'ttl' => 60]`) encode 5-9% faster from a better-sized intern cache.
+- Small values decode 3-16% faster and shuffled integer arrays 15% faster from lower fixed decode costs.
 
 ### Changed
 
-- Wire format: new tag `0x18 SHARED_ARRAY` (v2), emitted only for nested arrays
-  shared by pointer and free of PHP references. 0.6.x readers reject payloads
-  that use it; 0.7.0 still reads every 0.6.x payload.
-- `phpinfo()` reports the HMAC SHA-256 backend in use (`armv8`, `sha-ni`, or
-  `ext/hash` with the reason it fell back).
+- New v2 wire tag `0x18 SHARED_ARRAY`; 0.6.x readers reject payloads that use it, 0.7.0 reads every 0.6.x payload.
+- `phpinfo()` reports the HMAC SHA-256 backend and, for `ext/hash`, why it fell back.
 
 ### For contributors
 
-- `bench.php --extended` adds single values, wrapped envelopes, signed payloads,
-  GC-on retained decode, and Laravel-shaped fixtures (Eloquent models, a
-  Carbon-like `__serialize` class, a document wallet, a queue job, a catalog,
-  JWKS). `ab.php` gains `BENCH_MODE=signed|gc` and `BENCH_APP=1`.
-- New regression tests 132-156: decode GC roots, shared arrays and their
-  malformed-frame cases in 060, HMAC vectors and backend selection, exact-size
-  frames, app-shaped round trips, schema evolution, and GC stability.
-- CI gains a Linux arm64 test lane.
+- `bench.php --extended` covers single values, wrapped and signed payloads, GC-on retained decode, and Laravel-app shapes.
+- Tests 132-157 cover decode GC roots, shared arrays, HMAC vectors, exact-size frames, and app-shaped round trips; CI adds a Linux arm64 lane.
 
 ## [0.6.2] - 2026-09-04
 
@@ -351,7 +327,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.6.2...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.7.0...HEAD
+[0.7.0]: https://github.com/iliaal/phpser/releases/tag/0.7.0
 [0.6.2]: https://github.com/iliaal/phpser/releases/tag/0.6.2
 [0.6.1]: https://github.com/iliaal/phpser/releases/tag/0.6.1
 [0.6.0]: https://github.com/iliaal/phpser/releases/tag/0.6.0
