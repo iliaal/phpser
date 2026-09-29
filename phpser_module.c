@@ -142,9 +142,8 @@ PHP_FUNCTION(phpser_serialize_signed) {
             tag);
     if (hrc < 0) {
         zend_string_release(frame);
-        zend_throw_exception(zend_ce_exception, hrc == -2
-            ? "phpser: unsupported SHA256 block size"
-            : "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
+        zend_throw_exception(zend_ce_exception,
+            "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
         RETURN_THROWS();
     }
     ZSTR_LEN(frame) = frame_len + PHPSER_HMAC_TAG_LEN;
@@ -184,9 +183,8 @@ PHP_FUNCTION(phpser_unserialize_signed) {
             (const unsigned char *)payload, frame_len,
             expected);
     if (vrc < 0) {
-        zend_throw_exception(zend_ce_exception, vrc == -2
-            ? "phpser: unsupported SHA256 block size"
-            : "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
+        zend_throw_exception(zend_ce_exception,
+            "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
         RETURN_THROWS();
     }
     if (!phpser_ct_eq(expected,
@@ -251,6 +249,7 @@ static PHP_MINIT_FUNCTION(phpser) {
 }
 
 static PHP_MSHUTDOWN_FUNCTION(phpser) {
+    phpser_hmac_mshutdown();
     phpser_sha256_ops = NULL;
     return SUCCESS;
 }
