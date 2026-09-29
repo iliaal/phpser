@@ -54,6 +54,25 @@ can never emit a frame the decoder refuses. The tag is also rejected as a
 table column, where the per-cell wire-byte bound is what limits row-table
 allocations.
 
+Shared arrays make the decoded value a DAG. `TAG_SHARED_ARRAY` lets a later
+`TAG_REF` reuse one decoded array by refcount, the way object and reference
+back-references already reuse one instance. Decoded memory stays linear in
+payload bytes: a back-reference costs at least two wire bytes and fills one
+zval slot the enclosing container already paid for, with a refcount
+increment and no allocation. The logical tree can still be exponentially
+larger than the payload: under 150 bytes describe an array whose recursive
+expansion has a million leaves. `TAG_NEW_REF`/`TAG_REF` on PHP references and
+shared objects (incomplete ones included) already allowed the same shape, so
+phpser adds no budget for it; one would have to reject legitimate cache values
+that repeat one lookup array thousands of times. Code that recursively walks
+a decoded untrusted value without tracking identity (`json_encode()`,
+`var_export()`, `serialize()`, `array_walk_recursive()`,
+`count($v, COUNT_RECURSIVE)`, deep `==`) does work proportional to the
+logical size, so bound that work at the application layer. Re-encoding with
+phpser stays linear because the encoder emits each shared array once. The
+decoder registers a shared array only after its contents decode, so no
+back-reference can reach an array that is still being built.
+
 Class resolution is *not* memoized on a miss, so a payload naming an unknown
 class once per object triggers one autoloader invocation per object rather
 than one per payload. This matches native `unserialize()`, which also calls

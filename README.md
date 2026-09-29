@@ -405,6 +405,10 @@ value tags:
                        v[i] = base + i*step mod 2^64 (ranges, constant fills).
                        Standalone only, never a TABLE column; both sides enforce
                        a shared 1M-element budget (see SECURITY.md).
+  0x18 SHARED_ARRAY    value  // wire v2 only; the value must be an array tag
+                       (0x06-0x09, 0x0b, 0x13-0x17). Claims the next id AFTER
+                       the array's contents, so later REFs share one decoded
+                       zend_array by refcount.
 
 key tags:
   0x00 LONG            varint(zigzag)
@@ -414,11 +418,24 @@ key tags:
 
 Varints are LEB128 (unsigned); signed values use zigzag encoding. Tags
 0x0a/0x0d/0x0e/0x0f/0x11/0x12 each claim the next id in encounter
-order, so the decoder reconstructs back-refs by counting
-container tags as it parses. 0x10 REF never claims an id; it is lookup-only.
+order, before their contents, so the decoder reconstructs back-refs by
+counting container tags as it parses. 0x18 SHARED_ARRAY claims its id once
+its array is complete, after every id claimed inside it; a REF from inside
+the array to its own id is out of range and rejects. 0x10 REF never claims
+an id; it is lookup-only.
+
+The encoder emits SHARED_ARRAY only for a non-empty nested array that is
+pointer-shared (refcount above one, not counting the encoder's own
+snapshots, or immutable) and whose walk reached no PHP reference; a later
+visit of the same `HashTable` emits REF. The top-level value never claims.
+An array holding a reference stays by-value on every visit: COW separation
+keeps a reference in each copy, and one shared decoded array would lose the
+aliasing a later write through either copy depends on. Arrays are pinned
+exactly like tracked objects, so a freed table's reused address cannot
+masquerade as a back-reference.
 
 The version byte is emitted as `0x02` only when the body actually uses a
-v2-only tag (`0x12`–`0x17`); otherwise it stays `0x01`. On decode it is a
+v2-only tag (`0x12`–`0x18`); otherwise it stays `0x01`. On decode it is a
 *minimum-reader* signal, not a gate: the tag dispatch is version-agnostic,
 so a hand-built frame carrying a v2 tag under a `0x01` header still decodes.
 This keeps the version byte additive. Don't rely on it alone to reject a

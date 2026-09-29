@@ -50,9 +50,9 @@
 #endif
 
 /* Wire format version. Bump on any incompatible change. v2 adds optional
- * container tags (0x12-0x17: TAG_OBJECT_SLOTS, TAG_ASSOC_DICT, TAG_ROWSET,
- * TAG_TABLE, TAG_PACKED_DELTA, TAG_PACKED_AFFINE); decoders accept both
- * bytes. */
+ * container tags (0x12-0x18: TAG_OBJECT_SLOTS, TAG_ASSOC_DICT, TAG_ROWSET,
+ * TAG_TABLE, TAG_PACKED_DELTA, TAG_PACKED_AFFINE, TAG_SHARED_ARRAY); decoders
+ * accept both bytes. */
 #define PHPSER_VERSION   0x01
 #define PHPSER_VERSION_V2 0x02
 
@@ -79,7 +79,9 @@
 #define TAG_REF             0x10   /* varint(id); back-reference to a previously-emitted container.
                                       id counts in encounter order on both sides; tags TAG_OBJECT,
                                       TAG_OBJECT_SLOTS, TAG_OBJECT_MAGIC, TAG_OBJECT_LEGACY, TAG_ENUM,
-                                      and TAG_NEW_REF each implicitly claim the next id. */
+                                      TAG_NEW_REF, and TAG_SHARED_ARRAY each implicitly claim the
+                                      next id (TAG_SHARED_ARRAY after its contents, the rest
+                                      before). */
 #define TAG_NEW_REF         0x11   /* inner value follows; claims the next id for an IS_REFERENCE wrap. */
 #define TAG_OBJECT_SLOTS    0x12   /* varint(class_idx), varint(nprops), N×val; declared-property
                                       values only, in ce->properties_info_table order (wire v2). */
@@ -107,6 +109,12 @@
                                       and the tag is valid ONLY standalone: as a table column it
                                       would defeat the nrows<=remaining/ncols row-allocation
                                       bound (a few wire bytes claiming millions of row HTs). */
+#define TAG_SHARED_ARRAY    0x18   /* array value follows (wire v2); claims the next id once the
+                                      array is complete, after every id claimed inside it, so
+                                      later TAG_REFs share the decoded zend_array by refcount.
+                                      The inner value must be an array container tag. The encoder
+                                      emits it only for pointer-shared, reference-free nested
+                                      arrays; the top level never claims. */
 
 /* Assoc key tags (one byte before the key's payload). */
 #define KEY_LONG        0x00
@@ -261,13 +269,28 @@ typedef struct {
 /* Tracked entities are pinned before user code runs, preventing address reuse from
  * masquerading as a back-reference. Unique plain objects still claim ids without
  * table entries or delayed destruction. */
-enum { ENC_ID_OBJECT, ENC_ID_REFERENCE };
+enum { ENC_ID_OBJECT, ENC_ID_REFERENCE, ENC_ID_ARRAY, ENC_ID_ARRAY_IMMUTABLE };
 
 typedef struct {
     uintptr_t ptr;   /* 0 = empty */
     uint32_t  id;
     uint8_t   kind;
+    uint8_t   arr_state;  /* ENC_ARR_ST_*; arrays only */
 } id_entry;
+
+/* An array entry is PENDING while its first walk runs (no id yet, so a revisit
+ * through an object or reference cycle emits by value), then CLAIMED with an id
+ * or UNSHARED. An UNSHARED walk reached a PHP reference: COW separation keeps a
+ * shared reference in each copy, so one decoded array for both owners would
+ * lose the aliasing a later write through either copy depends on. */
+enum { ENC_ARR_ST_CLAIMED, ENC_ARR_ST_PENDING, ENC_ARR_ST_UNSHARED };
+
+/* encode_value_ex flags. ENC_RCN: reached through a shared container, so
+ * object identity must be tracked. ENC_BORROWED: the encoder itself holds one
+ * reference to this zval's array (snapshot, private duplicate, hook return),
+ * which must not count as sharing. */
+#define ENC_RCN       1u
+#define ENC_BORROWED  2u
 
 typedef struct {
     /* Pointer-keyed cache; NULL marks an empty slot. No eviction. */
@@ -293,6 +316,9 @@ typedef struct {
     /* Elements already emitted under sub-linear tags; see
      * PHPSER_SUBLINEAR_MAX_ELEMS. */
     uint32_t sublinear_elems;
+    /* IS_REFERENCE values visited so far; an array walk that moves it cannot
+     * be shared (see ENC_ARR_ST_UNSHARED). */
+    uint32_t refs_seen;
     zend_string **dict;
     uint32_t dict_len;
     uint32_t dict_cap;
@@ -328,6 +354,7 @@ static void enc_ctx_init(encode_ctx *e) {
     e->pins_active = 0;
     e->icache_init_cap = 0;
     e->sublinear_elems = 0;
+    e->refs_seen = 0;
 }
 
 /* Live declared-property slots in properties_info_table order (NULL entries
@@ -360,19 +387,36 @@ static int ce_table_slot_prefix_limit(
     return pc;
 }
 
+/* Immutable arrays are never freed during a request, so they carry no pin. */
 static zend_always_inline void enc_id_release(id_entry *entry) {
-    if (entry->kind == ENC_ID_OBJECT) {
-        OBJ_RELEASE((zend_object *)entry->ptr);
-    } else {
-        GC_DTOR((zend_reference *)entry->ptr);
+    switch (entry->kind) {
+        case ENC_ID_OBJECT:
+            OBJ_RELEASE((zend_object *)entry->ptr);
+            break;
+        case ENC_ID_REFERENCE:
+            GC_DTOR((zend_reference *)entry->ptr);
+            break;
+        case ENC_ID_ARRAY:
+            GC_DTOR((zend_array *)entry->ptr);
+            break;
+        default:
+            break;
     }
 }
 
 static zend_always_inline void enc_id_addref(uintptr_t ptr, uint8_t kind) {
-    if (kind == ENC_ID_OBJECT) {
-        GC_ADDREF((zend_object *)ptr);
-    } else {
-        GC_ADDREF((zend_reference *)ptr);
+    switch (kind) {
+        case ENC_ID_OBJECT:
+            GC_ADDREF((zend_object *)ptr);
+            break;
+        case ENC_ID_REFERENCE:
+            GC_ADDREF((zend_reference *)ptr);
+            break;
+        case ENC_ID_ARRAY:
+            GC_ADDREF((zend_array *)ptr);
+            break;
+        default:
+            break;
     }
 }
 
@@ -461,10 +505,64 @@ static inline int enc_visit(encode_ctx *e, void *ptr, uint8_t kind,
     buckets[h].ptr = pp;
     buckets[h].id = id;
     buckets[h].kind = kind;
+    buckets[h].arr_state = ENC_ARR_ST_CLAIMED;
     if (UNEXPECTED(e->pins_active)) enc_id_addref(pp, kind);
     e->id_count++;
     *out_id = id;
     return 1;
+}
+
+enum { ENC_ARR_NEW, ENC_ARR_REPEAT, ENC_ARR_BY_VALUE };
+
+/* Array counterpart of enc_visit. ENC_ARR_NEW records a pending entry that
+ * enc_array_done resolves; ENC_ARR_REPEAT writes the id for a TAG_REF;
+ * ENC_ARR_BY_VALUE asks for a non-claiming walk. */
+static inline int enc_visit_array(encode_ctx *e, HashTable *ht, uint32_t *out_id) {
+    if (UNEXPECTED((e->id_count + 1) * 2 > e->id_mask + 1)) {
+        enc_id_grow(e);
+    }
+    uintptr_t pp = (uintptr_t)ht;
+    uint32_t h = id_hash(pp) & e->id_mask;
+    id_entry *buckets = e->id_buckets;
+    while (buckets[h].ptr) {
+        if (buckets[h].ptr == pp) {
+            ZEND_ASSERT(buckets[h].kind == ENC_ID_ARRAY
+                || buckets[h].kind == ENC_ID_ARRAY_IMMUTABLE);
+            if (buckets[h].arr_state != ENC_ARR_ST_CLAIMED) {
+                return ENC_ARR_BY_VALUE;
+            }
+            *out_id = buckets[h].id;
+            return ENC_ARR_REPEAT;
+        }
+        h = (h + 1) & e->id_mask;
+    }
+    uint8_t kind = (GC_FLAGS(ht) & GC_IMMUTABLE)
+        ? ENC_ID_ARRAY_IMMUTABLE : ENC_ID_ARRAY;
+    buckets[h].ptr = pp;
+    buckets[h].id = 0;
+    buckets[h].kind = kind;
+    buckets[h].arr_state = ENC_ARR_ST_PENDING;
+    if (UNEXPECTED(e->pins_active)) enc_id_addref(pp, kind);
+    e->id_count++;
+    return ENC_ARR_NEW;
+}
+
+/* Resolve a pending entry after its walk. A shareable array claims the next
+ * id now, after every id its children claimed, which is where the decoder
+ * registers it. The walk may have grown the table, so probe again. */
+static void enc_array_done(encode_ctx *e, HashTable *ht, bool shareable) {
+    uintptr_t pp = (uintptr_t)ht;
+    uint32_t h = id_hash(pp) & e->id_mask;
+    while (e->id_buckets[h].ptr != pp) {
+        h = (h + 1) & e->id_mask;
+    }
+    ZEND_ASSERT(e->id_buckets[h].arr_state == ENC_ARR_ST_PENDING);
+    if (shareable) {
+        e->id_buckets[h].id = e->next_id++;
+        e->id_buckets[h].arr_state = ENC_ARR_ST_CLAIMED;
+    } else {
+        e->id_buckets[h].arr_state = ENC_ARR_ST_UNSHARED;
+    }
 }
 
 /* TAG_NULL claims no decoder id, so undo speculative claims on hook failure.
@@ -699,11 +797,11 @@ static void enc_emit_str_key(smart_str *body, encode_ctx *e, zend_string *zs) {
 
 static void encode_value(smart_str *body, encode_ctx *e, zval *v);
 static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
-                            bool in_rcn_array);
+                            uint32_t flags);
 static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
-                               bool in_rcn_array);
-static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
-                             bool in_rcn_array, bool ht_shared);
+                               uint32_t flags);
+static zend_never_inline void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
+                                               bool in_rcn_array, bool ht_shared);
 
 /* Declared properties use IS_INDIRECT; uninitialized slots use IS_UNDEF. Skip
  * keyless and undefined buckets so emitted counts match values. */
@@ -716,11 +814,11 @@ static zend_always_inline zval *enc_obj_prop_val(Bucket *b) {
 }
 
 static void encode_value(smart_str *body, encode_ctx *e, zval *v) {
-    encode_value_ex(body, e, v, false);
+    encode_value_ex(body, e, v, 0);
 }
 
 static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
-                            bool in_rcn_array) {
+                            uint32_t flags) {
     /* After a hook throws, placeholders preserve container counts until the
      * caller discards the frame. */
     if (UNEXPECTED(e->failed)) {
@@ -740,7 +838,7 @@ static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
         return;
     }
     e->depth++;
-    encode_value_inner(body, e, v, in_rcn_array);
+    encode_value_inner(body, e, v, flags);
     e->depth--;
 }
 
@@ -843,7 +941,7 @@ static zend_always_inline void enc_encode_sleep_object(
     varint_write_u64(body, nprops);
     for (uint32_t i = 0; i < nprops; i++) {
         varint_write_u64(body, enc_intern_zstr(e, snap_keys[i]));
-        encode_value_ex(body, e, &snap_vals[i], true);
+        encode_value_ex(body, e, &snap_vals[i], ENC_RCN | ENC_BORROWED);
     }
     for (uint32_t i = 0; i < nprops; i++) {
         zend_string_release(snap_keys[i]);
@@ -855,7 +953,8 @@ static zend_always_inline void enc_encode_sleep_object(
 }
 
 static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
-                               bool in_rcn_array) {
+                               uint32_t flags) {
+    bool in_rcn_array = (flags & ENC_RCN) != 0;
     switch (Z_TYPE_P(v)) {
         case IS_UNDEF:
         case IS_NULL:
@@ -885,8 +984,37 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
              * so its object children need identity tracking too. */
             /* Measure sharing before our protective addref obscures external
              * ownership. */
-            bool ht_shared =
-                !(GC_FLAGS(ht) & GC_IMMUTABLE) && GC_REFCOUNT(ht) > 1;
+            bool ht_immutable = (GC_FLAGS(ht) & GC_IMMUTABLE) != 0;
+            bool ht_shared = !ht_immutable && GC_REFCOUNT(ht) > 1;
+            /* A pointer-shared nested array is emitted once; later visits
+             * become TAG_REF and decode to the same zend_array. The top level
+             * is never revisited except from inside its own walk. Discounting
+             * an encoder-held reference only skips a claim, which is always
+             * safe; identity tracking and enc_pin_walk keep the raw count. */
+            bool claimed = false;
+            if ((ht_immutable
+                    || (ht_shared && GC_REFCOUNT(ht)
+                        > ((flags & ENC_BORROWED) ? 2u : 1u)))
+                && e->depth > 1
+                && zend_hash_num_elements(ht) > 0) {
+                uint32_t id;
+                int visit = enc_visit_array(e, ht, &id);
+                if (visit == ENC_ARR_REPEAT) {
+                    emit_tag_and_varint(body, TAG_REF, id);
+                    return;
+                }
+                if (visit == ENC_ARR_NEW) {
+                    claimed = true;
+                }
+            }
+            /* Emit the prefix speculatively; removing it on the rare unshared
+             * outcome is cheaper than a reference pre-scan on every claim. */
+            size_t prefix_off = 0;
+            uint32_t refs_before = e->refs_seen;
+            if (claimed) {
+                prefix_off = body->s ? ZSTR_LEN(body->s) : 0;
+                smart_str_appendc(body, TAG_SHARED_ARRAY);
+            }
             bool children_in_rcn_array = in_rcn_array || ht_shared;
             /* Hooks may mutate this array through aliases. An extra reference forces
              * zval writes to COW-separate, preserving cached bucket pointers.
@@ -894,7 +1022,22 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
              * columnar gather separately protect those paths. */
             GC_TRY_ADDREF(ht);
             encode_hashtable(body, e, ht, children_in_rcn_array, ht_shared);
-            if (!(GC_FLAGS(ht) & GC_IMMUTABLE) && !GC_DELREF(ht)) {
+            if (claimed) {
+                bool shareable = e->refs_seen == refs_before;
+                enc_array_done(e, ht, shareable);
+                if (shareable) {
+                    e->wire_v2 = 1;
+                } else {
+                    /* No enclosing frame holds an offset past its own start,
+                     * so dropping this byte cannot stale a saved position. */
+                    char *base = ZSTR_VAL(body->s);
+                    size_t end = ZSTR_LEN(body->s);
+                    memmove(base + prefix_off, base + prefix_off + 1,
+                            end - prefix_off - 1);
+                    ZSTR_LEN(body->s) = end - 1;
+                }
+            }
+            if (!ht_immutable && !GC_DELREF(ht)) {
                 zend_array_destroy(ht);
             }
             return;
@@ -904,6 +1047,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
              * id and emits TAG_NEW_REF + inner value. */
             zend_reference *ref = Z_REF_P(v);
             uint32_t id;
+            e->refs_seen++;
             if (!enc_visit(e, ref, ENC_ID_REFERENCE, &id)) {
                 emit_tag_and_varint(body, TAG_REF, id);
                 return;
@@ -912,7 +1056,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             /* The decoder registers the reference at next_id++ before
              * decoding the inner value, so a back-ref inside it resolves to
              * this reference. */
-            encode_value_ex(body, e, Z_REFVAL_P(v), true);
+            encode_value_ex(body, e, Z_REFVAL_P(v), ENC_RCN);
             return;
         }
         case IS_OBJECT: {
@@ -1022,7 +1166,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                 }
                 uint32_t class_idx = enc_intern_zstr(e, obj->ce->name);
                 emit_tag_and_varint(body, TAG_OBJECT_MAGIC, class_idx);
-                encode_value(body, e, &retval);
+                encode_value_ex(body, e, &retval, ENC_BORROWED);
                 zval_ptr_dtor(&retval);
                 return;
             }
@@ -1109,7 +1253,12 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                             }
                             ZEND_ASSERT(k == snap_n);
                         }
-                        encode_value_ex(body, e, snap ? &snap[snap_i++] : pv, true);
+                        if (snap) {
+                            encode_value_ex(body, e, &snap[snap_i++],
+                                            ENC_RCN | ENC_BORROWED);
+                        } else {
+                            encode_value_ex(body, e, pv, ENC_RCN);
+                        }
                         emitted++;
                     }
                     enc_patch_nprops(body, nprops_off, fp_nprops);
@@ -1133,7 +1282,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                     zval *p = OBJ_PROP(obj, info->offset);
                     if (Z_TYPE_P(p) == IS_UNDEF) continue;
                     varint_write_u64(body, enc_intern_zstr(e, info->name));
-                    encode_value_ex(body, e, p, true);
+                    encode_value_ex(body, e, p, ENC_RCN);
                     fp_nprops++;
                 }
                 enc_patch_nprops(body, nprops_off, fp_nprops);
@@ -1185,7 +1334,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                         continue;
                     }
                     varint_write_u64(body, enc_intern_zstr(e, b->key));
-                    encode_value_ex(body, e, pv, true);
+                    encode_value_ex(body, e, pv, ENC_RCN);
                     nprops++;
                 }
             }
@@ -1444,9 +1593,10 @@ static uint8_t enc_detect_column_tag(
     return TAG_PACKED_MIXED;
 }
 
+/* row_dup marks rows gathered from a private duplicate (NULL: none). */
 static void enc_emit_table_column(
     smart_str *body, encode_ctx *e, zval **cells, uint32_t nrows, uint8_t col_tag,
-    int same_value, uint32_t *string_idx)
+    int same_value, uint32_t *string_idx, const uint8_t *row_dup)
 {
     smart_str_appendc(body, col_tag);
     if (col_tag == TAG_PACKED_LONGS) {
@@ -1499,7 +1649,8 @@ static void enc_emit_table_column(
         ZSTR_LEN(body->s) = pos;
     } else {
         for (uint32_t r = 0; r < nrows; r++) {
-            encode_value_ex(body, e, cells[r], true);
+            encode_value_ex(body, e, cells[r],
+                (row_dup && row_dup[r]) ? (ENC_RCN | ENC_BORROWED) : ENC_RCN);
         }
     }
 }
@@ -1534,6 +1685,7 @@ static zend_never_inline int enc_try_table(
      * RC-1 rows against deletion from the outer storage. Top-level RC-1 rows
      * and immutable rows need no pin. Gather reads zp before any hook runs. */
     HashTable **row_pin = NULL;
+    uint8_t *row_dup = NULL;
     for (uint32_t r = 0; r < n_used; r++) {
         HashTable *ht = Z_ARRVAL(zp[r]);
         HashTable *pinned = NULL;
@@ -1541,6 +1693,8 @@ static zend_never_inline int enc_try_table(
             if (GC_REFCOUNT(ht) > 1) {
                 pinned = zend_array_dup(ht);   /* private copy, refcount 1 */
                 ht = pinned;
+                if (!row_dup) row_dup = (uint8_t *)ecalloc(n_used, 1);
+                row_dup[r] = 1;
             } else if (e->depth > 1) {
                 GC_ADDREF(ht);                 /* pin a nested RC-1 row against free */
                 pinned = ht;
@@ -1563,6 +1717,7 @@ static zend_never_inline int enc_try_table(
         if (UNEXPECTED(c != ncols)) {
             efree(col_cells);
             if (row_pin) enc_free_row_pins(row_pin, n_used);
+            if (row_dup) efree(row_dup);
             efree(key_idx);
             return 0;
         }
@@ -1582,11 +1737,12 @@ static zend_never_inline int enc_try_table(
             e, &col_cells[c * n_used], n_used, &same_value, &string_idx);
         enc_emit_table_column(
             body, e, &col_cells[c * n_used], n_used, col_tag, same_value,
-            string_idx);
+            string_idx, row_dup);
         if (string_idx) efree(string_idx);
     }
     efree(col_cells);
     if (row_pin) enc_free_row_pins(row_pin, n_used);
+    if (row_dup) efree(row_dup);
     return 1;
 }
 
@@ -1660,8 +1816,14 @@ static zend_always_inline HashTable *enc_pin_walk(encode_ctx *e, HashTable *ht,
     return ht;
 }
 
-static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
-                             bool in_rcn_array, bool ht_shared) {
+/* A private duplicate holds one reference to every element it copied. */
+static zend_always_inline uint32_t enc_walk_flags(bool in_rcn_array,
+                                                  HashTable *dup) {
+    return (in_rcn_array ? ENC_RCN : 0u) | (dup ? ENC_BORROWED : 0u);
+}
+
+static zend_never_inline void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
+                                               bool in_rcn_array, bool ht_shared) {
     uint32_t n_used = ht->nNumUsed;
     uint32_t n_elems = ht->nNumOfElements;
     int is_packed = HT_IS_PACKED(ht);
@@ -1687,8 +1849,9 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
                     ZSTR_LEN(body->s) = run_start;
                     HashTable *dup;
                     zval *wzp = enc_pin_walk(e, ht, ht_shared, &dup)->arPacked;
+                    uint32_t wflags = enc_walk_flags(in_rcn_array, dup);
                     for (uint32_t j = 0; j < n_used; j++) {
-                        encode_value_ex(body, e, &wzp[j], in_rcn_array);
+                        encode_value_ex(body, e, &wzp[j], wflags);
                     }
                     if (dup) zend_array_destroy(dup);
                     return;
@@ -1748,8 +1911,9 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
         } else {
             HashTable *dup;
             zval *wzp = enc_pin_walk(e, ht, ht_shared, &dup)->arPacked;
+            uint32_t wflags = enc_walk_flags(in_rcn_array, dup);
             for (uint32_t i = 0; i < n_used; i++) {
-                encode_value_ex(body, e, &wzp[i], in_rcn_array);
+                encode_value_ex(body, e, &wzp[i], wflags);
             }
             if (dup) zend_array_destroy(dup);
         }
@@ -1762,11 +1926,12 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
         varint_write_u64(body, n_elems);
         HashTable *dup;
         zval *zp = enc_pin_walk(e, ht, ht_shared, &dup)->arPacked;
+        uint32_t wflags = enc_walk_flags(in_rcn_array, dup);
         for (uint32_t i = 0; i < n_used; i++) {
             if (Z_TYPE(zp[i]) == IS_UNDEF) continue;
             smart_str_appendc(body, KEY_LONG);
             varint_write_i64(body, (int64_t)i);
-            encode_value_ex(body, e, &zp[i], in_rcn_array);
+            encode_value_ex(body, e, &zp[i], wflags);
         }
         if (dup) zend_array_destroy(dup);
         return;
@@ -1807,11 +1972,12 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
              * zend_array_dup compacts holes while preserving order. */
             HashTable *dup;
             HashTable *vwht = enc_pin_walk(e, ht, ht_shared, &dup);
+            uint32_t wflags = enc_walk_flags(in_rcn_array, dup);
             Bucket *vb = vwht->arData;
             Bucket *vend = vb + vwht->nNumUsed;
             for (; vb < vend; vb++) {
                 if (Z_TYPE(vb->val) == IS_UNDEF) continue;
-                encode_value_ex(body, e, &vb->val, in_rcn_array);
+                encode_value_ex(body, e, &vb->val, wflags);
             }
             if (dup) zend_array_destroy(dup);
             return;
@@ -1822,6 +1988,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
          * walked table's own nNumUsed rather than the original's. */
         HashTable *dup;
         HashTable *awht = enc_pin_walk(e, ht, ht_shared, &dup);
+        uint32_t wflags = enc_walk_flags(in_rcn_array, dup);
         b = awht->arData;
         Bucket *wend = b + awht->nNumUsed;
         for (; b < wend; b++) {
@@ -1833,7 +2000,7 @@ static void encode_hashtable(smart_str *body, encode_ctx *e, HashTable *ht,
                     body, KEY_LONG,
                     zigzag_encode64((int64_t)(zend_long)b->h));
             }
-            encode_value_ex(body, e, &b->val, in_rcn_array);
+            encode_value_ex(body, e, &b->val, wflags);
         }
         if (dup) zend_array_destroy(dup);
     }
@@ -1848,7 +2015,7 @@ typedef struct {
 } deferred_event;
 
 /* Store GC entities, not zval pointers: HashTable growth can move zval slots. */
-enum { ID_OBJ, ID_REF, ID_NULL };
+enum { ID_OBJ, ID_REF, ID_NULL, ID_ARR };
 
 typedef struct {
     uint8_t kind;
@@ -1856,6 +2023,7 @@ typedef struct {
     union {
         zend_object    *obj;
         zend_reference *ref;
+        zend_array     *arr;
     } u;
 } id_slot;
 
@@ -1926,10 +2094,11 @@ static zend_always_inline int dec_string_hash_chain_exhausted(
     return dec_hash_chain_exhausted(ht, zend_string_hash_val(key));
 }
 
-/* Claim ids in the encoder's encounter order, before decoding children.
- * Every id-claiming tag must register here; TAG_NULL claims none.
- * Pin objects and references until decode_destroy: overwriting a duplicate
- * key can drop the graph's last reference before a later TAG_REF uses it. */
+/* Claim ids in the encoder's encounter order, before decoding children
+ * (TAG_SHARED_ARRAY alone registers after them). Every id-claiming tag must
+ * register here; TAG_NULL claims none. Pin every entity until decode_destroy:
+ * overwriting a duplicate key can drop the graph's last reference before a
+ * later TAG_REF uses it. */
 static void dec_register(decode_ctx *d, zval *z) {
     if (d->id_table_len == d->id_table_cap) {
         d->id_table_cap = d->id_table_cap ? d->id_table_cap * 2 : 16;
@@ -1947,6 +2116,12 @@ static void dec_register(decode_ctx *d, zval *z) {
         s->kind = ID_REF;
         s->u.ref = Z_REF_P(z);
         GC_ADDREF(s->u.ref);
+        s->pinned = 1;
+    } else if (Z_TYPE_P(z) == IS_ARRAY) {
+        /* Only TAG_SHARED_ARRAY registers arrays, after the array is complete. */
+        s->kind = ID_ARR;
+        s->u.arr = Z_ARR_P(z);
+        GC_ADDREF(s->u.arr);
         s->pinned = 1;
     } else {
         /* The encoder claimed an id here; register a NULL slot to keep ids
@@ -2266,6 +2441,7 @@ static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *us
 static int dec_schema_keys_are_unique(zend_string **keys, uint64_t nkeys);
 static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out);
 static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out);
+static zend_never_inline int dec_decode_shared_array(decode_ctx *d, zval *out);
 
 /* Eagerly materialize every dict slot with a precomputed hash: one less branch
  * in the per-string hot path, and zend_hash_add_new skips hashing. */
@@ -2312,6 +2488,8 @@ static void decode_destroy(decode_ctx *d) {
                 OBJ_RELEASE(s->u.obj);
             } else if (s->kind == ID_REF) {
                 GC_DTOR(s->u.ref);
+            } else if (s->kind == ID_ARR) {
+                GC_DTOR(s->u.arr);
             }
         }
         efree(d->id_table);
@@ -2391,6 +2569,26 @@ static int decode_value_inner(decode_ctx *d, zval *out);
  * `tag <= TAG_STR_INLINE` range check would misclassify them. */
 static zend_always_inline int dec_is_scalar_tag(uint8_t tag) {
     return tag <= TAG_DOUBLE || tag == TAG_STR_DICT || tag == TAG_STR_INLINE;
+}
+
+/* Tags whose decoded value is always an array: the only legal TAG_SHARED_ARRAY
+ * payloads. */
+static zend_always_inline int dec_is_array_tag(uint8_t tag) {
+    switch (tag) {
+        case TAG_ASSOC:
+        case TAG_PACKED_MIXED:
+        case TAG_PACKED_LONGS:
+        case TAG_PACKED_DOUBLES:
+        case TAG_PACKED_STRINGS:
+        case TAG_ASSOC_DICT:
+        case TAG_ROWSET:
+        case TAG_TABLE:
+        case TAG_PACKED_DELTA:
+        case TAG_PACKED_AFFINE:
+            return 1;
+        default:
+            return 0;
+    }
 }
 
 /* Decode a tag whose leading byte was already consumed. Caller must only pass
@@ -2607,6 +2805,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 case ID_OBJ:  ZVAL_OBJ_COPY(out, s->u.obj); return 0;
                 case ID_REF:  ZVAL_REF(out, s->u.ref); GC_ADDREF(s->u.ref); return 0;
                 case ID_NULL: ZVAL_NULL(out); return 0;
+                case ID_ARR:  ZVAL_ARR(out, s->u.arr); GC_ADDREF(s->u.arr); return 0;
             }
             return -1;
         }
@@ -3202,9 +3401,25 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             return dec_decode_table(d, out);
         case TAG_ROWSET:
             return dec_decode_rowset(d, out);
+        case TAG_SHARED_ARRAY:
+            return dec_decode_shared_array(d, out);
         default:
             return -1;
     }
+}
+
+/* The inner value decodes at the wrapper's depth, matching the encoder, which
+ * emits the prefix inside the array's own encode_value_ex frame. The id is
+ * claimed only after the array is complete, so no TAG_REF can reach an array
+ * that is still being built: one from inside it is out of range. */
+static zend_never_inline int dec_decode_shared_array(decode_ctx *d, zval *out) {
+    if (d->pos >= d->len || !dec_is_array_tag(d->buf[d->pos])) return -1;
+    if (decode_value_inner(d, out) < 0) return -1;
+    if (UNEXPECTED(Z_TYPE_P(out) != IS_ARRAY)) return -1;
+    /* Every decoded array is fresh and refcounted. */
+    ZEND_ASSERT(!(GC_FLAGS(Z_ARR_P(out)) & GC_IMMUTABLE));
+    dec_register(d, out);
+    return 0;
 }
 
 static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {

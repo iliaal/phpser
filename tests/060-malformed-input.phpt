@@ -59,6 +59,13 @@ $valid_payloads = [
     phpser_serialize(range(0, 50)),                        // TAG_PACKED_AFFINE
     phpser_serialize([100, 160, 221, 283, 346, 410]),      // TAG_PACKED_DELTA
 ];
+// TAG_SHARED_ARRAY (0x18) + TAG_REF to the shared array, including a shared
+// array holding an object and a nested shared array.
+$shared_inner = ['p', 'q', 7];
+$shared_outer = [$shared_inner, (object)['o' => 1], $shared_inner];
+$valid_payloads[] = phpser_serialize(['a' => $shared_inner, 'b' => [$shared_inner, $shared_inner]]);
+$valid_payloads[] = phpser_serialize([$shared_outer, $shared_outer, $shared_inner]);
+unset($shared_inner, $shared_outer);
 
 $truncate_fail = 0;
 foreach ($valid_payloads as $payload_i => $bytes) {
@@ -346,6 +353,61 @@ if (!is_array($one_big) || count($one_big) !== 550000 || $one_big[549999] !== 0)
 }
 echo $da_fail ? "delta_affine FAIL $da_fail\n" : "delta_affine OK\n";
 
+// TAG_SHARED_ARRAY (0x18): the payload must be an array container tag, and
+// its id is claimed only after the array completes, so no back-reference can
+// reach an unfinished array.
+$sa_bad = [
+    "\x02\x00\x18",                              // truncated: no payload tag
+    "\x02\x00\x18\x07",                          // truncated: PACKED_MIXED, no len
+    "\x02\x00\x18\x07\x02\x03\x02",              // truncated: one of two elements
+    "\x02\x00\x18\x03\x02",                      // scalar payload (LONG)
+    "\x02\x00\x18\x00",                          // NULL payload
+    "\x02\x01\x08stdClass\x18\x0a\x00\x00",      // object payload
+    "\x02\x00\x18\x11\x07\x00",                  // NEW_REF payload
+    "\x02\x00\x18\x18\x07\x00",                  // nested prefix with no array between
+    "\x02\x00\x18\x10\x00",                      // REF payload
+    "\x02\x00\x18\x07\x01\x10\x00",              // self-reference: its id is not claimed yet
+    "\x02\x00\x18\x07\x01\x18\x07\x01\x10\x00",  // nested self-reference to the outer id
+    "\x02\x00\x07\x02\x18\x07\x00\x10\x01",      // REF one past the only claimed id
+    "\x02\x00\x07\x02\x18\x07\x00\x10\x81\x80\x80\x80\x10", // REF id 2^32 truncation alias
+    "\x02\x00\x18\x07\x01\x11\x10\x01",          // NEW_REF inside pointing at the unclaimed array
+    "\x02\x00\x07\x02\x18\x07\x01\x11\x10\x00\x10\x01", // NEW_REF wrapping itself inside the array
+];
+$sa_fail = 0;
+foreach ($sa_bad as $i => $bytes) {
+    $rt = phpser_unserialize($bytes);
+    if ($rt !== null) {
+        echo "shared_array case $i expected NULL, got " . get_debug_type($rt) . "\n";
+        $sa_fail++;
+    }
+}
+// The same frames under a valid signature reject in the decoder, not at the
+// HMAC check; a hand-signed well-formed frame is the positive control.
+$sa_good = "\x02\x00\x07\x02\x18\x08\x01\x02\x10\x00";
+if (phpser_unserialize_signed($sa_good . hash_hmac('sha256', $sa_good, 'k', true), 'k') !== [[1], [1]]) {
+    echo "shared_array signed control FAIL\n";
+    $sa_fail++;
+}
+foreach ($sa_bad as $i => $bytes) {
+    $mac = hash_hmac('sha256', $bytes, 'k', true);
+    try {
+        phpser_unserialize_signed($bytes . $mac, 'k');
+        echo "shared_array signed case $i did not throw\n";
+        $sa_fail++;
+    } catch (\Exception $e) {
+        if (strpos($e->getMessage(), 'signature verification failed') !== false) {
+            echo "shared_array signed case $i failed the HMAC check\n";
+            $sa_fail++;
+        }
+    }
+}
+// A well-formed empty shared array (never emitted, but legal) decodes.
+if (phpser_unserialize("\x02\x00\x07\x02\x18\x07\x00\x10\x00") !== [[], []]) {
+    echo "shared_array empty FAIL\n";
+    $sa_fail++;
+}
+echo $sa_fail ? "shared_array FAIL $sa_fail\n" : "shared_array OK\n";
+
 ?>
 --EXPECT--
 static OK
@@ -374,3 +436,4 @@ enum_nonenum OK
 signed_assoc_dict_dup OK
 invalid_class_name OK
 delta_affine OK
+shared_array OK
