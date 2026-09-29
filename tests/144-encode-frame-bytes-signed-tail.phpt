@@ -64,14 +64,15 @@ foreach ($flips as $label => $off) {
 // A wrapper hides its payload one array level down and the encoder sizes its
 // intern cache by looking through that level (direct and by-reference
 // children). Sizing must never change the bytes: pinned against the encoding
-// produced before the sizing existed.
+// produced without the sizing (the shared 'tags' literal is a SHARED_ARRAY
+// back-reference).
 $rows = [];
 for ($i = 0; $i < 300; $i++) {
     $rows[] = ['id' => $i, 'name' => 'row_' . ($i % 37), 'email' => "u$i@example.com", 'tags' => ['a', 'b']];
 }
 $wrapped = [
-    'wrapped'   => [['data' => $rows, 'ttl' => 60], 9164, 'a37868d422bea14f40524f9cd180d689'],
-    'wrapref'   => [['data' => &$rows, 'ttl' => 60], 9165, '9f4c300b3fac2bd62d78364adbee012e'],
+    'wrapped'   => [['data' => $rows, 'ttl' => 60], 8562, '5d47cec50b4f78852f845405ed01bf6d'],
+    'wrapref'   => [['data' => &$rows, 'ttl' => 60], 8563, 'e1bffca6473e0018fe41747fc7d1bda4'],
     'wrapsmall' => [['data' => [1, 2, 3], 'ttl' => 60], 22, '07ee07acd91ff82816f58389a20916cd'],
 ];
 foreach ($wrapped as $name => [$value, $len, $md5]) {

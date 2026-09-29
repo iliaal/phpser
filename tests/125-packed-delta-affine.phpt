@@ -65,8 +65,10 @@ echo phpser_unserialize_signed($signed, 'k') === $cases['range_1']
 // Budget symmetry: past PHPSER_SUBLINEAR_MAX_ELEMS (1M) the encoder degrades
 // to linear tags, and the decoder accepts what the encoder emitted. Two 600k
 // affine chunks: the first rides the budget, the second must fall back.
+// Separate allocations: a pointer-shared second chunk would encode as a
+// TAG_SHARED_ARRAY back-reference and never reach the budget.
 $chunk = range(0, 599999);
-$two = [$chunk, $chunk];
+$two = [$chunk, range(0, 599999)];
 $tb = phpser_serialize($two);
 $back = phpser_unserialize($tb);
 echo $back === $two ? "budget fallback OK\n" : "budget fallback FAIL\n";
