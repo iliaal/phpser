@@ -56,14 +56,15 @@ foreach ($cases as $label => $value) {
         // frees a batch's worth of cycles grows the GC buffer once (native
         // unserialize and igbinary show the same one-off growth), and that is
         // not a per-decode leak.
-        for ($i = 0; $i < 600; $i++) $decode();
+        $batches = [300, 600];
+        for ($i = 0; $i < max($batches); $i++) $decode();
         gc_collect_cycles();
         $before = memory_get_usage();
         $collected_before = gc_status()['collected'];
         // Two batches: 300 decodes, then 600 more. Growth is 0 once warm, so
         // a 4 KiB cumulative bound over 900 decodes catches ~4.5 B/decode.
         $growth = [];
-        foreach ([300, 600] as $batch) {
+        foreach ($batches as $batch) {
             for ($i = 0; $i < $batch; $i++) {
                 $v = $decode();
                 unset($v);
