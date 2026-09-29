@@ -16,7 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Signed payloads use ARMv8 or SHA-NI SHA-256 and a per-thread key cache; `phpser_unserialize_signed()` is 53-85% faster on aarch64.
 - Encoded payloads are allocated at exact size; a held 19-byte payload costs 48 bytes instead of 256.
 - Wrapped payloads (`['data' => $rows, 'ttl' => 60]`) encode 5-9% faster from a better-sized intern cache.
-- Small values decode 3-16% faster and shuffled integer arrays 15% faster from lower fixed decode costs.
+- Scalars and small arrays decode 3-16% faster and shuffled integer arrays 15% faster from lower fixed decode costs.
 
 ### Changed
 
