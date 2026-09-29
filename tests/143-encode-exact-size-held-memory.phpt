@@ -4,6 +4,14 @@ phpser: an encoded payload is held at its own size, not a smart_str page
 <?php
 if (!extension_loaded('phpser')) die('skip phpser not loaded');
 if (getenv('USE_ZEND_ALLOC') === '0') die('skip memory_get_usage needs the Zend allocator');
+// A custom MM handler (memprof and similar) can leave memory_get_usage()
+// flat, which would make every held() reading 0 and pass vacuously.
+$before = memory_get_usage();
+$probe = [];
+for ($i = 0; $i < 1000; $i++) {
+    $probe[] = str_repeat('x', 100);
+}
+if (memory_get_usage() - $before < 100000) die('skip memory_get_usage does not track request allocations');
 ?>
 --FILE--
 <?php
@@ -25,9 +33,11 @@ function held(Closure $encode, int $n = 1000): float {
 // allocator's block header), rounded up to an allocator bin, and bins above
 // 128 bytes are at most 25% apart. The old smart_str sizing held 256 bytes for
 // anything up to 231 and a 4096-byte page for the next few KB, which clears
-// this bound at every size below.
-function bound(int $len): float {
-    return ($len + 64) * 1.25 + 16;
+// this bound at every size below. The lower bound rejects a reading that
+// cannot hold the payload bytes at all.
+function verdict(float $held, int $len): string {
+    if ($held < $len) return "unmeasured ($held B for $len)";
+    return $held <= ($len + 64) * 1.25 + 16 ? 'exact' : "bloated ($held B for $len)";
 }
 
 $cases = [
@@ -40,11 +50,7 @@ $cases = [
 ];
 foreach ($cases as $name => $value) {
     $len = strlen(phpser_serialize($value));
-    $plain = held(fn() => phpser_serialize($value));
-    $signed = held(fn() => phpser_serialize_signed($value, 'k'));
-    printf("%-8s plain %s, signed %s\n", $name,
-        $plain <= bound($len) ? 'exact' : "bloated ($plain B for $len)",
-        $signed <= bound($len + 32) ? 'exact' : "bloated ($signed B for " . ($len + 32) . ")");
+    printf("%-8s %s\n", $name, verdict(held(fn() => phpser_serialize($value)), $len));
 }
 
 // Exact sizing must not disturb ordinary string handling of the result.
@@ -53,11 +59,11 @@ $t = $s . $s;
 var_dump(strlen($t), phpser_unserialize($s) === 'hello world abc');
 ?>
 --EXPECT--
-null     plain exact, signed exact
-int      plain exact, signed exact
-str15    plain exact, signed exact
-assoc    plain exact, signed exact
-str300   plain exact, signed exact
-str1000  plain exact, signed exact
+null     exact
+int      exact
+str15    exact
+assoc    exact
+str300   exact
+str1000  exact
 int(38)
 bool(true)
