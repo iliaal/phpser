@@ -52,10 +52,11 @@ foreach ($cases as $label => $value) {
         $decode = $mode === 'signed'
             ? fn() => phpser_unserialize_signed($blob, $key)
             : fn() => phpser_unserialize($blob);
-        // A full warm batch first: decode can grow the GC root buffer once
-        // (~113 KiB for cyclic_tree unsigned), and that one-off growth is not
-        // a per-decode leak.
-        for ($i = 0; $i < 300; $i++) $decode();
+        // Warm up with the largest measured batch: the first collection that
+        // frees a batch's worth of cycles grows the GC buffer once (native
+        // unserialize and igbinary show the same one-off growth), and that is
+        // not a per-decode leak.
+        for ($i = 0; $i < 600; $i++) $decode();
         gc_collect_cycles();
         $before = memory_get_usage();
         $collected_before = gc_status()['collected'];
