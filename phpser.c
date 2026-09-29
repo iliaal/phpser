@@ -2074,19 +2074,25 @@ static zend_always_inline void dec_note_drop(decode_ctx *d, const zval *zv) {
  * predates the decode and so cannot reach decoded entities. */
 static zend_always_inline void dec_note_slot_drop(decode_ctx *d, zend_object *obj,
                                                   uint32_t num, const zval *slot) {
-    if (!Z_REFCOUNTED_P(slot)) return;
+    if (!Z_REFCOUNTED_P(slot) || Z_TYPE_P(slot) == IS_STRING) return;
+    if (Z_TYPE_P(slot) == IS_OBJECT
+        && (Z_OBJCE_P(slot)->ce_flags & ZEND_ACC_ENUM)) {
+        return;
+    }
     if (EXPECTED(num < (uint32_t)obj->ce->default_properties_count)) {
         const zval *def = &CE_DEFAULT_PROPERTIES_TABLE(obj->ce)[num];
         if (Z_REFCOUNTED_P(def) && Z_COUNTED_P(def) == Z_COUNTED_P(slot)) return;
     }
-    dec_note_drop(d, slot);
+    d->pins_may_orphan = true;
 }
 
 /* Write a decoded value into a declared property slot (typed or untyped).
  * Takes ownership of *tmp: on success it's moved into the slot; on
- * type-mismatch it's dtor'd. Returns 0/-1. */
+ * type-mismatch it's dtor'd. Returns 0/-1. slot_is_default promises the slot
+ * still holds its object_init_ex default, so replacing it needs no drop note. */
 static int dec_install_declared_slot(decode_ctx *d, zend_object *obj,
-                                     zend_property_info *info, zval *tmp) {
+                                     zend_property_info *info, zval *tmp,
+                                     bool slot_is_default) {
     zval *slot = OBJ_PROP(obj, info->offset);
     if (ZEND_TYPE_IS_SET(info->type)) {
         /* Scalar mask hits need no engine call. Objects must still verify class
@@ -2101,14 +2107,18 @@ static int dec_install_declared_slot(decode_ctx *d, zend_object *obj,
         if (Z_ISREF_P(slot)) {
             ZEND_REF_DEL_TYPE_SOURCE(Z_REF_P(slot), info);
         }
-        dec_note_slot_drop(d, obj, OBJ_PROP_TO_NUM(info->offset), slot);
+        if (!slot_is_default) {
+            dec_note_slot_drop(d, obj, OBJ_PROP_TO_NUM(info->offset), slot);
+        }
         zval_ptr_dtor(slot);
         ZVAL_COPY_VALUE(slot, tmp);
         if (Z_ISREF_P(slot)) {
             ZEND_REF_ADD_TYPE_SOURCE(Z_REF_P(slot), info);
         }
     } else {
-        dec_note_slot_drop(d, obj, OBJ_PROP_TO_NUM(info->offset), slot);
+        if (!slot_is_default) {
+            dec_note_slot_drop(d, obj, OBJ_PROP_TO_NUM(info->offset), slot);
+        }
         zval_ptr_dtor(slot);
         ZVAL_COPY_VALUE(slot, tmp);
     }
@@ -3081,12 +3091,17 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 return 0;
             }
 
+            /* properties_info_table is indexed by slot number, so each slot is
+             * written once and still holds its default. */
             for (int pi = 0; pi < pc; pi++) {
                 zend_property_info *info = ce->properties_info_table[pi];
                 if (info == NULL) continue;
                 zval tmp;
                 if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
-                if (dec_install_declared_slot(d, obj, info, &tmp) < 0) goto slots_fail;
+                if (dec_install_declared_slot(d, obj, info, &tmp,
+                        /* slot_is_default */ true) < 0) {
+                    goto slots_fail;
+                }
             }
             dec_maybe_defer_wakeup(d, ce, obj);
             return 0;
@@ -3192,7 +3207,9 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 if (EXPECTED(obj_props == NULL)) {
                     zend_property_info *info = dec_prop_info_for_key(ce, key);
                     if (EXPECTED(info != NULL)) {
-                        if (dec_install_declared_slot(d, obj, info, &tmp) < 0) {
+                        /* A duplicate wire key can rewrite a decoded value. */
+                        if (dec_install_declared_slot(d, obj, info, &tmp,
+                                /* slot_is_default */ false) < 0) {
                             goto obj_fail;
                         }
                         continue;

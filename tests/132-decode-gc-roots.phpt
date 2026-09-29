@@ -16,6 +16,10 @@ class Node { public $parent; public $children = []; public $n; }
 enum Status { case A; case B; }
 class WithEnum { public $id; public Status $s = Status::A; }
 class WithArr { public $id; public array $tags = ['x', 'y']; public $plain = ['p']; }
+// An uninitialized typed property routes these through TAG_OBJECT, whose slot
+// writes may repeat and so compare against the class default.
+class ObjEnum { public $id; public int $late; public Status $s = Status::A; }
+class ObjArr { public $id; public int $late; public array $tags = ['x', 'y']; public $plain = ['p']; }
 
 function rows(string $cls, int $n): array {
     $out = [];
@@ -80,6 +84,20 @@ for ($i = 0; $i < 1000; $i++) {
 }
 $cases['enum_default_1000'] = phpser_serialize($ws);
 $cases['array_default_1000'] = phpser_serialize($wa);
+$oe = [];
+$oa = [];
+for ($i = 0; $i < 1000; $i++) {
+    $o = new ObjEnum();
+    $o->id = $i;
+    if ($i % 2) $o->s = Status::B;
+    $oe[] = $o;
+    $o = new ObjArr();
+    $o->id = $i;
+    if ($i % 2) { $o->tags = ['t', (string)$i]; $o->plain = [$i]; }
+    $oa[] = $o;
+}
+$cases['enum_default_obj_1000'] = phpser_serialize($oe);
+$cases['array_default_obj_1000'] = phpser_serialize($oa);
 
 foreach ($cases as $name => $payload) {
     $d = roots_added(fn() => phpser_unserialize($payload), $keep);
@@ -121,6 +139,10 @@ enum_default_1000 unsigned roots<10: true
 enum_default_1000 signed roots<10: true
 array_default_1000 unsigned roots<10: true
 array_default_1000 signed roots<10: true
+enum_default_obj_1000 unsigned roots<10: true
+enum_default_obj_1000 signed roots<10: true
+array_default_obj_1000 unsigned roots<10: true
+array_default_obj_1000 signed roots<10: true
 tree intact: true
 tree collected>=501: true
 ref shared: true
