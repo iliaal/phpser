@@ -2055,6 +2055,10 @@ typedef struct {
     } u;
 } id_slot;
 
+/* Stack slots that cover small payloads (one DTO, a lone shared literal array)
+ * before the id table moves to the heap. */
+#define DEC_ID_INLINE_CAP 8
+
 typedef struct {
     const uint8_t *buf;
     size_t len;
@@ -2098,6 +2102,12 @@ typedef struct {
      * E_DEPRECATED handlers, and destructors of unrelated garbage never see a
      * graph entity and leave it clear. */
     bool pins_may_orphan;
+    /* Set once an object or reference claims an id. Without one the graph is
+     * acyclic (a TAG_SHARED_ARRAY array holds no reference), so the returned
+     * value needs no GC root. */
+    bool ids_may_cycle;
+    /* id_table points at caller stack storage until the first grow. */
+    bool id_table_heap;
     /* PHP references created or looked up so far; TAG_SHARED_ARRAY rejects a
      * payload that moves it, mirroring the encoder's refs_seen rule. */
     uint32_t refs_seen;
@@ -2132,15 +2142,27 @@ static zend_always_inline int dec_string_hash_chain_exhausted(
     return dec_hash_chain_exhausted(ht, zend_string_hash_val(key));
 }
 
+static zend_never_inline void dec_id_table_grow(decode_ctx *d) {
+    uint32_t cap = d->id_table_cap * 2;
+    if (d->id_table_heap) {
+        d->id_table = erealloc(d->id_table, cap * sizeof(id_slot));
+    } else {
+        id_slot *heap = emalloc(cap * sizeof(id_slot));
+        memcpy(heap, d->id_table, d->id_table_len * sizeof(id_slot));
+        d->id_table = heap;
+        d->id_table_heap = true;
+    }
+    d->id_table_cap = cap;
+}
+
 /* Claim ids in the encoder's encounter order, before decoding children
  * (TAG_SHARED_ARRAY alone registers after them). Every id-claiming tag must
  * register here; TAG_NULL claims none. Pin every entity until decode_destroy:
  * overwriting a duplicate key can drop the graph's last reference before a
  * later TAG_REF uses it. */
 static void dec_register(decode_ctx *d, zval *z) {
-    if (d->id_table_len == d->id_table_cap) {
-        d->id_table_cap = d->id_table_cap ? d->id_table_cap * 2 : 16;
-        d->id_table = erealloc(d->id_table, d->id_table_cap * sizeof(id_slot));
+    if (UNEXPECTED(d->id_table_len == d->id_table_cap)) {
+        dec_id_table_grow(d);
     }
     id_slot *s = &d->id_table[d->id_table_len++];
     s->pinned = 0;
@@ -2150,11 +2172,13 @@ static void dec_register(decode_ctx *d, zval *z) {
         /* Signed frames also need pins: a valid HMAC does not prove key uniqueness. */
         GC_ADDREF(s->u.obj);
         s->pinned = 1;
+        d->ids_may_cycle = true;
     } else if (Z_TYPE_P(z) == IS_REFERENCE) {
         s->kind = ID_REF;
         s->u.ref = Z_REF_P(z);
         GC_ADDREF(s->u.ref);
         s->pinned = 1;
+        d->ids_may_cycle = true;
     } else if (Z_TYPE_P(z) == IS_ARRAY) {
         /* Only TAG_SHARED_ARRAY registers arrays, after the array is complete. */
         s->kind = ID_ARR;
@@ -2297,9 +2321,9 @@ static zend_always_inline void dec_note_slot_drop(decode_ctx *d, zend_object *ob
  * type-mismatch it's dtor'd. Returns 0/-1. slot_is_default promises the slot
  * holds no value written by this decode (usually its object_init_ex default;
  * exception objects carry file/line/trace), so replacing it needs no drop note. */
-static int dec_install_declared_slot(decode_ctx *d, zend_object *obj,
-                                     zend_property_info *info, zval *tmp,
-                                     bool slot_is_default) {
+static zend_always_inline int dec_install_slot_impl(decode_ctx *d, zend_object *obj,
+                                                    zend_property_info *info, zval *tmp,
+                                                    bool slot_is_default) {
     zval *slot = OBJ_PROP(obj, info->offset);
     if (ZEND_TYPE_IS_SET(info->type)) {
         /* Scalar mask hits need no engine call. Objects must still verify class
@@ -2330,6 +2354,22 @@ static int dec_install_declared_slot(decode_ctx *d, zend_object *obj,
         ZVAL_COPY_VALUE(slot, tmp);
     }
     return 0;
+}
+
+/* Separate copies keep the per-slot OBJECT_SLOTS path free of the decode_ctx
+ * argument and the drop-note branch; it runs once per declared property.
+ * Out of line: inlined, the copies enlarge decode_value_inner and cost the
+ * TAG_ASSOC path extra instructions. */
+static zend_never_inline int dec_install_default_slot(
+    zend_object *obj, zend_property_info *info, zval *tmp)
+{
+    return dec_install_slot_impl(NULL, obj, info, tmp, /* slot_is_default */ true);
+}
+
+static zend_never_inline int dec_install_declared_slot(
+    decode_ctx *d, zend_object *obj, zend_property_info *info, zval *tmp)
+{
+    return dec_install_slot_impl(d, obj, info, tmp, /* slot_is_default */ false);
 }
 
 /* Install one decoded value as a property on `obj`. Mirrors TAG_OBJECT's
@@ -2526,6 +2566,7 @@ static int dec_schema_keys_are_unique(zend_string **keys, uint64_t nkeys);
 static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out);
 static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out);
 static zend_never_inline int dec_decode_shared_array(decode_ctx *d, zval *out);
+static zend_never_inline int dec_decode_packed_delta(decode_ctx *d, zval *out);
 
 /* Eagerly materialize every dict slot with a precomputed hash: one less branch
  * in the per-string hot path, and zend_hash_add_new skips hashing. */
@@ -2539,6 +2580,10 @@ static int decode_header(decode_ctx *d) {
      * remaining input before allocating, and reject UINT32_MAX explicitly so
      * the allocation count can never wrap in size arithmetic. */
     if (n >= UINT32_MAX || n > d->len - d->pos) return -1;
+    /* Scalars and first-occurrence inline strings carry no dict; skipping the
+     * table spares a small decode an allocation and a free. dec_get_zstr
+     * bounds every index by dict_len, so dict stays NULL. */
+    if (n == 0) return 0;
     d->dict_len = (uint32_t)n;
     d->dict = ecalloc((size_t)d->dict_len + 1, sizeof(zend_string *));
     for (uint32_t i = 0; i < d->dict_len; i++) {
@@ -2568,7 +2613,7 @@ static void decode_destroy(decode_ctx *d, bool result_live) {
         }
         efree(d->dict);
     }
-    if (d->id_table) {
+    if (d->id_table_len) {
         /* Release the refcount we took at registration. ID_NULL slots
          * own nothing; ID_OBJ / ID_REF release via the type-specific
          * macro so destructors and ref-table teardown fire correctly. */
@@ -2617,8 +2662,8 @@ static void decode_destroy(decode_ctx *d, bool result_live) {
                 }
             }
         }
-        efree(d->id_table);
     }
+    if (d->id_table_heap) efree(d->id_table);
     if (d->deferred) {
         for (uint32_t i = 0; i < d->deferred_len; i++) {
             OBJ_RELEASE(d->deferred[i].obj);
@@ -3046,34 +3091,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             dec_finish_packed(arr, n, out);
             return 0;
         }
-        case TAG_PACKED_DELTA: {
-            uint64_t n;
-            if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
-            /* v0 plus n-1 deltas is at least n wire bytes, the same linear
-             * bound as PACKED_LONGS. */
-            if (n > UINT32_MAX || n > d->len - d->pos) return -1;
-            zend_array *arr = zend_new_array((uint32_t)n);
-            zend_hash_real_init_packed(arr);
-            /* First varint is v0, the rest are deltas; acc starts at zero so
-             * one wrapping add covers both. Long cells own nothing, so the
-             * failure destroy needs no nNumUsed bookkeeping. */
-            uint64_t acc = 0;
-            for (uint64_t i = 0; i < n; i++) {
-                int64_t dv;
-                if (varint_read_i64(d->buf, d->len, &d->pos, &dv) < 0) {
-                    zend_array_destroy(arr);
-                    return -1;
-                }
-                acc += (uint64_t)dv;
-                if (UNEXPECTED(!dec_i64_fits_zend_long((int64_t)acc))) {
-                    zend_array_destroy(arr);
-                    return -1;
-                }
-                ZVAL_LONG(&arr->arPacked[i], (zend_long)(int64_t)acc);
-            }
-            dec_finish_packed(arr, n, out);
-            return 0;
-        }
+        case TAG_PACKED_DELTA:
+            return dec_decode_packed_delta(d, out);
         case TAG_PACKED_AFFINE: {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
@@ -3347,10 +3366,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 if (info == NULL) continue;
                 zval tmp;
                 if (decode_value_hot(d, &tmp) < 0) goto slots_fail;
-                if (dec_install_declared_slot(d, obj, info, &tmp,
-                        /* slot_is_default */ true) < 0) {
-                    goto slots_fail;
-                }
+                if (dec_install_default_slot(obj, info, &tmp) < 0) goto slots_fail;
             }
             dec_maybe_defer_wakeup(d, ce, obj);
             return 0;
@@ -3457,8 +3473,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                     zend_property_info *info = dec_prop_info_for_key(ce, key);
                     if (EXPECTED(info != NULL)) {
                         /* A duplicate wire key can rewrite a decoded value. */
-                        if (dec_install_declared_slot(d, obj, info, &tmp,
-                                /* slot_is_default */ false) < 0) {
+                        if (dec_install_declared_slot(d, obj, info, &tmp) < 0) {
                             goto obj_fail;
                         }
                         continue;
@@ -3571,6 +3586,42 @@ static zend_never_inline int dec_decode_shared_array(decode_ctx *d, zval *out) {
     /* Every decoded array is fresh and refcounted. */
     ZEND_ASSERT(!(GC_FLAGS(Z_ARR_P(out)) & GC_IMMUTABLE));
     dec_register(d, out);
+    return 0;
+}
+
+static zend_never_inline int dec_decode_packed_delta(decode_ctx *d, zval *out) {
+    uint64_t n;
+    if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
+    /* v0 plus n-1 deltas is at least n wire bytes, the same linear
+     * bound as PACKED_LONGS. */
+    if (n > UINT32_MAX || n > d->len - d->pos) return -1;
+    zend_array *arr = zend_new_array((uint32_t)n);
+    zend_hash_real_init_packed(arr);
+    /* First varint is v0, the rest are deltas; acc starts at zero so
+     * one wrapping add covers both. Long cells own nothing, so the
+     * failure destroy needs no nNumUsed bookkeeping. */
+    uint64_t acc = 0;
+    /* Locals: the cell stores may alias d->pos and arr->arPacked, so the
+     * compiler would otherwise store and reload the cursor on every element,
+     * a store-to-load chain across iterations. */
+    const uint8_t *buf = d->buf;
+    size_t len = d->len, pos = d->pos;
+    zval *cells = arr->arPacked;
+    for (uint64_t i = 0; i < n; i++) {
+        int64_t dv;
+        if (varint_read_i64(buf, len, &pos, &dv) < 0) {
+            zend_array_destroy(arr);
+            return -1;
+        }
+        acc += (uint64_t)dv;
+        if (UNEXPECTED(!dec_i64_fits_zend_long((int64_t)acc))) {
+            zend_array_destroy(arr);
+            return -1;
+        }
+        ZVAL_LONG(&cells[i], (zend_long)(int64_t)acc);
+    }
+    d->pos = pos;
+    dec_finish_packed(arr, n, out);
     return 0;
 }
 
@@ -4011,11 +4062,15 @@ int phpser_decode_buf_opts(
     const char *str, size_t str_len, zval *out,
     int allowed_mode, HashTable *allowed_set, bool require_exact)
 {
+    /* Outside decode_ctx so the zero-initializer stays small. */
+    id_slot id_inline[DEC_ID_INLINE_CAP];
     decode_ctx d = {0};
     d.buf = (const uint8_t *)str;
     d.len = str_len;
     d.allowed_mode = allowed_mode;
     d.allowed_set = allowed_set;
+    d.id_table = id_inline;
+    d.id_table_cap = DEC_ID_INLINE_CAP;
 
     if (decode_header(&d) < 0) {
         decode_destroy(&d, false);
@@ -4057,12 +4112,16 @@ int phpser_decode_buf_opts(
         if (UNEXPECTED(EG(exception))) goto done;
     }
 done:;
-    /* Hooks run user code that can detach pinned entities from the result. */
-    bool result_live = !d.pins_may_orphan && d.deferred_len == 0
-                       && !EG(exception);
+    /* Hooks run user code that can detach pinned entities from the result.
+     * Without pins there is nothing to release, so skip the checks. */
+    bool result_live = false;
+    if (d.id_table_len) {
+        result_live = !d.pins_may_orphan && d.deferred_len == 0
+                      && !EG(exception);
+    }
     /* Only objects and references can close a cycle, and each claims an id.
      * Without one, the fast release skipped nothing that needs a root. */
-    bool root_result = result_live && d.id_table_len > 0;
+    bool root_result = result_live && d.ids_may_cycle;
     decode_destroy(&d, result_live);
     /* The PHP entry point is not declared by-reference, so unwrap a top-level
      * TAG_NEW_REF before returning to Zend. The pin was released above while
