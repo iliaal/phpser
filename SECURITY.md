@@ -84,6 +84,16 @@ native's, but your autoloader bounds the total, not phpser. If
 you decode untrusted bytes through an expensive autoloader chain, prefer
 `allowed_classes` (an allowlist or `false` short-circuits before resolution).
 
+**Signing key cache.** phpser caches HMAC key material per thread so a
+signed call skips two SHA-256 compressions. The cache holds the most recent
+signing key (raw bytes for keys up to 64 bytes, otherwise their SHA-256
+digest) and the key-derived HMAC inner and outer states, in thread-local
+memory. A different key overwrites the entry in place, and module shutdown
+wipes it; a ZTS worker thread that exits before module shutdown frees its
+copy without wiping it. The lookup compares the full 64-byte key block in
+constant time, so timing reveals only whether the key matches the thread's
+previous key.
+
 **Session handler.** When built against the session extension, phpser
 registers `session.serialize_handler = phpser`. This handler restores
 `$_SESSION` through the **unsigned, all-classes-allowed** decode path,
@@ -103,7 +113,8 @@ signed session frames would harden this path but are not shipped today.
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.6.x   | :white_check_mark: |
+| 0.7.x   | :white_check_mark: |
+| 0.6.x   | :x:                |
 | 0.5.x   | :x:                |
 | 0.4.x   | :x:                |
 
