@@ -41,13 +41,13 @@ $rt = phpser_unserialize(phpser_serialize($v));
 echo ($rt instanceof Visi && $rt->get() === [1, 2, 3])
     ? "sleep_visibility OK\n" : "sleep_visibility FAIL " . json_encode($rt->get()) . "\n";
 
-// --- __sleep returning a name not declared on the class: skip silently
-// (PHP warns; we don't propagate the warning, but result must be safe). ---
+// --- __sleep returning a name not declared on the class: omitted with the
+// native warning (165 pins the warning text); the result must be safe. ---
 class Bogus {
     public int $real = 5;
     public function __sleep(): array { return ['real', 'nonexistent']; }
 }
-$rt = phpser_unserialize(phpser_serialize(new Bogus()));
+$rt = phpser_unserialize(@phpser_serialize(new Bogus()));
 echo ($rt->real === 5) ? "sleep_unknown_skip OK\n" : "sleep_unknown_skip FAIL\n";
 
 // --- __sleep returning a dynamic property name: PHP includes it in the

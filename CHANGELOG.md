@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Objects with a built property table follow the positional rules of untouched ones: a class missing at decode keeps only its name, a property inserted mid-class misplaces values (TypeError when types clash), and hooks that mutate later properties see the tail snapshot.
 
+### Fixed
+
+- Lazy ghosts and proxies with `__sleep` encoded their uninitialized properties; they now initialize first, as `serialize()` does.
+- `__sleep` names that `serialize()` omits (parent-private, static, virtual, missing, repeated) are omitted with the same warnings.
+
 ## [0.7.0] - 2026-09-29
 
 ### Performance

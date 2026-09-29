@@ -903,6 +903,101 @@ static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
     e->depth--;
 }
 
+enum { ENC_SLEEP_MISS, ENC_SLEEP_FOUND, ENC_SLEEP_UNINIT };
+
+/* One lookup of native's php_var_serialize_try_add_sleep_prop: an
+ * uninitialized typed slot counts as found-but-omitted, an unset untyped one
+ * as missing so the next mangling is tried. */
+static int enc_sleep_classify(zend_object *obj, zval *p, zval **out)
+{
+    if (p == NULL) return ENC_SLEEP_MISS;
+    if (Z_TYPE_P(p) == IS_INDIRECT && Z_TYPE_P(Z_INDIRECT_P(p)) == IS_UNDEF) {
+        return zend_get_typed_property_info_for_slot(obj, Z_INDIRECT_P(p))
+            ? ENC_SLEEP_UNINIT : ENC_SLEEP_MISS;
+    }
+    *out = p;
+    return ENC_SLEEP_FOUND;
+}
+
+static int enc_sleep_try_key(HashTable *props, zend_object *obj,
+                             const char *key, size_t len, zval **out)
+{
+    return enc_sleep_classify(obj, zend_hash_str_find(props, key, len), out);
+}
+
+/* True when every live bucket of `props` is one of obj's declared slots, so
+ * its key set is exactly the slot names of obj->ce. */
+static bool enc_sleep_props_declared_only(HashTable *props, zend_object *obj)
+{
+    if (props != obj->properties
+        || obj->handlers->get_properties != zend_std_get_properties
+        || obj->handlers->get_properties_for != NULL
+        || HT_IS_PACKED(props)) {
+        return false;
+    }
+    Bucket *b = props->arData;
+    Bucket *end = b + props->nNumUsed;
+    for (; b < end; b++) {
+        if (Z_TYPE(b->val) == IS_UNDEF) continue;
+        if (Z_TYPE(b->val) != IS_INDIRECT) return false;
+    }
+    return true;
+}
+
+/* Resolve a __sleep name the way native serialize() does: the name as given,
+ * then mangled private to the object's own class, then mangled protected.
+ * Private properties of a parent class never match an unmangled name. On
+ * ENC_SLEEP_FOUND, *out is the bucket value (possibly IS_INDIRECT).
+ * *declared_only caches enc_sleep_props_declared_only (-1 = not computed). */
+static int enc_sleep_find_prop(HashTable *props, zend_object *obj,
+                               zend_string *name, int *declared_only,
+                               zval **out)
+{
+    int r = enc_sleep_classify(obj, zend_hash_find(props, name), out);
+    if (r != ENC_SLEEP_MISS || EG(exception)) return r;
+
+    /* Declared non-public names skip building mangled keys: the declaration's
+     * own name is the key native would build. A private declared by obj's
+     * class is exactly the second candidate. A protected one is the third,
+     * and the second cannot exist when the table holds only declared slots:
+     * a protected property cannot be redeclared private. Every other outcome
+     * falls through to the literal three-candidate walk. */
+    zend_property_info *info = zend_hash_find_ptr(&obj->ce->properties_info, name);
+    if (info != NULL && !(info->flags & ZEND_ACC_STATIC)) {
+        bool own_private = (info->flags & ZEND_ACC_PRIVATE) && info->ce == obj->ce;
+        bool is_protected = (info->flags & ZEND_ACC_PROTECTED) != 0;
+        if (is_protected && *declared_only < 0) {
+            *declared_only = enc_sleep_props_declared_only(props, obj);
+        }
+        if (own_private || (is_protected && *declared_only)) {
+            r = enc_sleep_classify(
+                obj, zend_hash_find_known_hash(props, info->name), out);
+            if (r != ENC_SLEEP_MISS) return r;
+        }
+    }
+
+    zend_string *cname = obj->ce->name;
+    size_t cap = 3 + ZSTR_LEN(cname) + ZSTR_LEN(name);
+    char stack_buf[256];
+    char *buf = cap <= sizeof(stack_buf) ? stack_buf : emalloc(cap);
+
+    buf[0] = '\0';
+    memcpy(buf + 1, ZSTR_VAL(cname), ZSTR_LEN(cname));
+    buf[1 + ZSTR_LEN(cname)] = '\0';
+    memcpy(buf + 2 + ZSTR_LEN(cname), ZSTR_VAL(name), ZSTR_LEN(name));
+    r = enc_sleep_try_key(props, obj, buf,
+                          2 + ZSTR_LEN(cname) + ZSTR_LEN(name), out);
+    if (r == ENC_SLEEP_MISS) {
+        buf[0] = '\0';
+        buf[1] = '*';
+        buf[2] = '\0';
+        memcpy(buf + 3, ZSTR_VAL(name), ZSTR_LEN(name));
+        r = enc_sleep_try_key(props, obj, buf, 3 + ZSTR_LEN(name), out);
+    }
+    if (buf != stack_buf) efree(buf);
+    return r;
+}
+
 /* Keep the __sleep snapshot's key/value ownership and cleanup rules together. */
 static zend_always_inline void enc_encode_sleep_object(
     smart_str *body, encode_ctx *e, zend_object *obj,
@@ -930,60 +1025,115 @@ static zend_always_inline void enc_encode_sleep_object(
     }
 
     HashTable *names_ht = Z_ARRVAL(names_zv);
+    /* Resolve names against the serialize-purpose property table, as native
+     * does: it initializes lazy objects (honoring
+     * SKIP_INITIALIZATION_ON_SERIALIZE), reads a proxy's real instance, and
+     * pins the table so hook-triggered writes COW-separate. */
+    zval obj_zv;
+    ZVAL_OBJ(&obj_zv, obj);
+    HashTable *props = zend_get_properties_for(&obj_zv, ZEND_PROP_PURPOSE_SERIALIZE);
+    if (UNEXPECTED(EG(exception))) {
+        if (props) zend_release_properties(props);
+        zval_ptr_dtor(&names_zv);
+        enc_unvisit_last(e, obj, identity_tracked);
+        e->failed = 1;
+        smart_str_appendc(body, TAG_NULL);
+        return;
+    }
+    /* An initialized proxy's table lives in its real instance, which only the
+     * proxy owns. A warning handler or __toString below can reset the proxy
+     * and free that instance under the IS_INDIRECT buckets, so hold it.
+     * Recover the owner from a slot rather than zend_lazy_object_init(): with
+     * SKIP_INITIALIZATION_ON_SERIALIZE the instance may itself be lazy again
+     * and must stay uninitialized. No IS_INDIRECT bucket, nothing to hold. */
+    zend_object *inst = NULL;
+#if PHP_VERSION_ID >= 80400
+    if (props && zend_object_is_lazy_proxy(obj) && zend_lazy_object_initialized(obj)) {
+        zval *bv;
+        ZEND_HASH_FOREACH_VAL(props, bv) {
+            if (Z_TYPE_P(bv) != IS_INDIRECT) continue;
+            zval *slot = Z_INDIRECT_P(bv);
+            zend_property_info *pi =
+                zend_lazy_object_get_property_info_for_slot(obj, slot);
+            if (pi) {
+                inst = (zend_object *)((char *)slot - pi->offset);
+                GC_ADDREF(inst);
+            }
+            break;
+        } ZEND_HASH_FOREACH_END();
+    }
+#endif
     /* Fix the selected member set at __sleep-return time. Own both keys and
      * values because emitting an earlier value can run a nested hook that
      * mutates the object or replaces a referenced name in `names_ht`. */
     zend_string **snap_keys = NULL;
     zval *snap_vals = NULL;
     uint32_t nprops = 0, snap_cap = 0;
+    /* One bit per props bucket: native keys its member table by the resolved
+     * name, so a second name resolving to the same bucket is a duplicate. */
+    uint64_t seen_stack[4] = {0};
+    uint64_t *seen = seen_stack;
+    uint32_t seen_words = sizeof(seen_stack) / sizeof(seen_stack[0]);
+    if (props && props->nNumUsed > seen_words * 64) {
+        seen_words = (props->nNumUsed + 63) / 64;
+        seen = ecalloc(seen_words, sizeof(uint64_t));
+    }
+    int declared_only = -1;
     zval *zv_name;
-    ZEND_HASH_FOREACH_VAL(names_ht, zv_name) {
+    ZEND_HASH_FOREACH_VAL_IND(names_ht, zv_name) {
         ZVAL_DEREF(zv_name);
-        zend_string *tmp_name = NULL;
-        zend_string *nm;
         if (Z_TYPE_P(zv_name) != IS_STRING) {
             php_error_docref(NULL, E_WARNING,
                 "%s::__sleep() should return an array only containing the names of instance-variables to serialize",
                 ZSTR_VAL(obj->ce->name));
-            nm = zval_get_tmp_string(zv_name, &tmp_name);
+        }
+        zend_string *tmp_name;
+        zend_string *nm = zval_get_tmp_string(zv_name, &tmp_name);
+
+        zval *p = NULL;
+        int found = props
+            ? enc_sleep_find_prop(props, obj, nm, &declared_only, &p)
+            : ENC_SLEEP_MISS;
+        if (found == ENC_SLEEP_MISS) {
             if (UNEXPECTED(EG(exception))) {
                 zend_tmp_string_release(tmp_name);
                 e->failed = 1;
                 break;
             }
-        } else {
-            nm = Z_STR_P(zv_name);
-        }
-
-        zend_property_info *info = zend_hash_find_ptr(
-            &obj->ce->properties_info, nm);
-        zend_string *key;
-        zval *p;
-        if (info != NULL) {
-            if (info->flags & ZEND_ACC_STATIC) {
-                zend_tmp_string_release(tmp_name);
-                continue;
-            }
-#if PHP_VERSION_ID >= 80400
-            if (info->offset == (uint32_t)ZEND_VIRTUAL_PROPERTY_OFFSET) {
-                zend_tmp_string_release(tmp_name);
-                continue;
-            }
-#endif
-            p = OBJ_PROP(obj, info->offset);
-            if (Z_TYPE_P(p) == IS_UNDEF) {
-                zend_tmp_string_release(tmp_name);
-                continue;
-            }
-            key = info->name;
-        } else if (obj->properties
-                   && (p = zend_hash_find(obj->properties, nm)) != NULL
-                   && Z_TYPE_P(p) != IS_UNDEF) {
-            key = nm;
-        } else {
+            php_error_docref(NULL, E_WARNING,
+                "\"%s\" returned as member variable from __sleep() but does not exist",
+                ZSTR_VAL(nm));
             zend_tmp_string_release(tmp_name);
             continue;
         }
+        if (found == ENC_SLEEP_UNINIT) {
+            zend_tmp_string_release(tmp_name);
+            continue;
+        }
+
+        /* A hit never comes from a packed table (string lookup), so `p` is
+         * the val member at offset 0 of its Bucket. */
+        ZEND_ASSERT(offsetof(Bucket, val) == 0 && !HT_IS_PACKED(props));
+        Bucket *b = (Bucket *)p;
+        uint32_t bi = (uint32_t)(b - props->arData);
+        ZEND_ASSERT(b->key != NULL);
+        if (UNEXPECTED(bi / 64 >= seen_words)) {
+            /* The pinned table cannot grow, but never index past the map. */
+            uint32_t words = bi / 64 + 1;
+            uint64_t *grown = ecalloc(words, sizeof(uint64_t));
+            memcpy(grown, seen, seen_words * sizeof(uint64_t));
+            if (seen != seen_stack) efree(seen);
+            seen = grown;
+            seen_words = words;
+        }
+        if (seen[bi / 64] & ((uint64_t)1 << (bi % 64))) {
+            php_error_docref(NULL, E_WARNING,
+                "\"%s\" is returned from __sleep() multiple times", ZSTR_VAL(nm));
+            zend_tmp_string_release(tmp_name);
+            continue;
+        }
+        seen[bi / 64] |= (uint64_t)1 << (bi % 64);
+        if (Z_TYPE_P(p) == IS_INDIRECT) p = Z_INDIRECT_P(p);
 
         if (nprops == snap_cap) {
             snap_cap = snap_cap ? snap_cap * 2 : 8;
@@ -991,11 +1141,16 @@ static zend_always_inline void enc_encode_sleep_object(
                 snap_keys, snap_cap * sizeof(zend_string *));
             snap_vals = erealloc(snap_vals, snap_cap * sizeof(zval));
         }
-        snap_keys[nprops] = zend_string_copy(key);
+        /* The bucket key, not the sleep name: it is the table's own (usually
+         * interned) string, so repeated objects share one dict entry. */
+        snap_keys[nprops] = zend_string_copy(b->key);
         ZVAL_COPY(&snap_vals[nprops], p);
         nprops++;
         zend_tmp_string_release(tmp_name);
     } ZEND_HASH_FOREACH_END();
+    if (seen != seen_stack) efree(seen);
+    if (props) zend_release_properties(props);
+    if (inst) OBJ_RELEASE(inst);
 
     smart_str_appendc(body, TAG_OBJECT);
     varint_write_u64(body, class_idx);

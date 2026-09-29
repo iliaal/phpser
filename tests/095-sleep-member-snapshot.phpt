@@ -23,8 +23,9 @@ class Inner {
 // reusing one object would let the first call contaminate the second.
 function mk() { $o = new Outer; $i = new Inner; $i->outer = $o; $o->a = $i; return $o; }
 
-$phpser = phpser_unserialize(phpser_serialize(mk()));
-$native = unserialize(@serialize(mk()));  // native warns on the missing 'b'; not under test here
+// Both warn on the missing 'b'; the warning is not under test here.
+$phpser = phpser_unserialize(@phpser_serialize(mk()));
+$native = unserialize(@serialize(mk()));
 var_dump(isset($phpser->b));
 var_dump(isset($phpser->b) === isset($native->b));
 ?>
