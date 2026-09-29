@@ -317,12 +317,13 @@ as a `session.serialize_handler` when available.
   value (`TAG_OBJECT_LEGACY`) whose class is gone decodes as `null` in
   place, and an enum (`TAG_ENUM`) whose class is gone fails the whole
   decode, because neither carries a property schema to install into. The
-  positional DTO (`TAG_OBJECT_SLOTS`) decodes to an incomplete object that
-  still claims its id for later back-refs; when its class is already loaded
-  the values are installed onto the incomplete, and only when the class is
-  unavailable are the unnamed slot values dropped (phpser does not autoload
-  a class for the sole purpose of recovering property names). Evolve classes
-  append-only if cached payloads must outlive a schema change.
+  positional DTO (`TAG_OBJECT_SLOTS`, used with or without a built properties
+  table) decodes to an incomplete object that still claims its id for later
+  back-refs; when its class is already loaded the values are installed onto
+  the incomplete, and only when the class is unavailable are the unnamed slot
+  values dropped (phpser does not autoload a class for the sole purpose of
+  recovering property names). Evolve classes append-only if cached payloads
+  must outlive a schema change.
 - **Enum cases are filtered by `allowed_classes`.** Native `unserialize()` does
   not consult the allowlist on its enum path, so a serialized enum is always
   resurrected there. phpser applies the filter: a disallowed enum decodes to
@@ -349,6 +350,10 @@ as a `session.serialize_handler` when available.
 - **`TAG_OBJECT_SLOTS` is positional.** Eligible typed objects encode their
   declared properties as values in `properties_info_table` (declaration)
   order with no per-property names; decode installs them back in that order.
+  This holds whether or not the object's properties table has been built
+  (`get_object_vars()`, `foreach`, `var_dump()`); only a dynamic property or
+  an uninitialized or unset slot moves an otherwise eligible object to the
+  keyed form.
   An older payload carrying a prefix of the current effective slot table is
   accepted and appended properties retain their class defaults. A
   payload with more slots than the current class is rejected. **Nothing else

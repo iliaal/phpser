@@ -368,6 +368,39 @@ static uint32_t ce_table_slot_count(zend_class_entry *ce) {
     return n;
 }
 
+/* True when a materialized std properties table holds exactly the live
+ * declared slots, each initialized, in slot order; *count gets their number.
+ * rebuild_object_properties appends one IS_INDIRECT bucket per non-NULL
+ * properties_info_table entry, in table (slot) order, and skips dead slots
+ * that a redeclared inherited property leaves behind. Dynamic writes append
+ * non-INDIRECT buckets and an unset leaves an INDIRECT-to-UNDEF one, so either
+ * fails the lockstep compare. Deleting the last dynamic property trims
+ * nNumUsed, so a hole-free table is the normal case. */
+static zend_never_inline bool enc_props_mirror_slots(zend_object *obj, uint32_t *count)
+{
+    HashTable *ht = obj->properties;
+    uint32_t pc = (uint32_t)obj->ce->default_properties_count;
+    uint32_t n = ht->nNumUsed;
+    if (n != ht->nNumOfElements || n > pc || HT_IS_PACKED(ht)) {
+        return false;
+    }
+    zend_property_info **info = obj->ce->properties_info_table;
+    zval *slot = obj->properties_table;
+    Bucket *b = ht->arData;
+    Bucket *end = b + n;
+    for (uint32_t i = 0; i < pc; i++) {
+        if (info[i] == NULL) continue;
+        if (b == end || Z_TYPE(b->val) != IS_INDIRECT
+            || Z_INDIRECT(b->val) != &slot[i] || Z_TYPE(slot[i]) == IS_UNDEF) {
+            return false;
+        }
+        b++;
+    }
+    if (b != end) return false;
+    *count = n;
+    return true;
+}
+
 /* Exclusive properties_info_table index covering the first `nprops` live
  * slots. The current-schema path returns the full table immediately; only an
  * older append-only payload needs the prefix scan. */
@@ -1226,26 +1259,34 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             }
             /* Direct slots avoid materializing a properties HashTable. Custom
              * handlers, dynamic properties, and lazy objects need the normal path;
-             * lazy slots must initialize before reading. */
+             * lazy slots must initialize before reading. A table that
+             * get_object_vars(), foreach, or var_dump() built is equivalent to
+             * the slots when it mirrors them; an unset declared slot in such a
+             * table keeps the keyed path so its bytes match the pinned walk. */
             zend_class_entry *ce = obj->ce;
-            if (obj->properties == NULL
-                && obj->handlers->get_properties == zend_std_get_properties
+            uint32_t mirror_count = 0;
+            if (obj->handlers->get_properties == zend_std_get_properties
 #if PHP_VERSION_ID >= 80400
                 && !zend_object_is_lazy(obj)
 #endif
                 && ce->__unserialize == NULL
+                && (obj->properties == NULL
+                    || (obj->handlers->get_properties_for == NULL
+                        && enc_props_mirror_slots(obj, &mirror_count)))
                 ) {
                 int pc = ce->default_properties_count;
                 bool slots_ok = true;
-                uint32_t slot_count = 0;
-                for (int pi = 0; pi < pc; pi++) {
-                    zend_property_info *info = ce->properties_info_table[pi];
-                    if (info == NULL) continue;
-                    if (Z_TYPE_P(OBJ_PROP(obj, info->offset)) == IS_UNDEF) {
-                        slots_ok = false;
-                        break;
+                uint32_t slot_count = mirror_count;
+                if (obj->properties == NULL) {
+                    for (int pi = 0; pi < pc; pi++) {
+                        zend_property_info *info = ce->properties_info_table[pi];
+                        if (info == NULL) continue;
+                        if (Z_TYPE_P(OBJ_PROP(obj, info->offset)) == IS_UNDEF) {
+                            slots_ok = false;
+                            break;
+                        }
+                        slot_count++;
                     }
-                    slot_count++;
                 }
                 if (slots_ok) {
                     uint32_t fp_nprops = slot_count;

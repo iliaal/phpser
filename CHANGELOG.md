@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+
+- Plain objects (no `__sleep`, `__serialize`, or `__unserialize`) keep the positional `TAG_OBJECT_SLOTS` form after `get_object_vars()`, `foreach`, or `var_dump()` builds their property table.
+- On bench.php's Eloquent-like fixtures that is 36% smaller with 45% faster encode and decode, 30 models decode 44% faster, and the wallet decodes 34% faster but encodes 4% slower (aarch64).
+
+### Changed
+
+- Objects with a built property table follow the positional rules of untouched ones: a class missing at decode keeps only its name, a property inserted mid-class misplaces values (TypeError when types clash), and hooks that mutate later properties see the tail snapshot.
+
 ## [0.7.0] - 2026-09-29
 
 ### Performance
