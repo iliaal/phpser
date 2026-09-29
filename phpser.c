@@ -2089,7 +2089,8 @@ static zend_always_inline void dec_note_slot_drop(decode_ctx *d, zend_object *ob
 /* Write a decoded value into a declared property slot (typed or untyped).
  * Takes ownership of *tmp: on success it's moved into the slot; on
  * type-mismatch it's dtor'd. Returns 0/-1. slot_is_default promises the slot
- * still holds its object_init_ex default, so replacing it needs no drop note. */
+ * holds no value written by this decode (usually its object_init_ex default;
+ * exception objects carry file/line/trace), so replacing it needs no drop note. */
 static int dec_install_declared_slot(decode_ctx *d, zend_object *obj,
                                      zend_property_info *info, zval *tmp,
                                      bool slot_is_default) {
@@ -3092,7 +3093,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             }
 
             /* properties_info_table is indexed by slot number, so each slot is
-             * written once and still holds its default. */
+             * written once and holds no value written by this decode. */
             for (int pi = 0; pi < pc; pi++) {
                 zend_property_info *info = ce->properties_info_table[pi];
                 if (info == NULL) continue;
