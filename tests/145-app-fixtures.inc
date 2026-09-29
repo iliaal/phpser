@@ -1,88 +1,54 @@
 <?php
-// ab.php: phpser-only A/B harness for perf candidates. Times encode+decode
-// per shape, median of BENCH_REPS, phpser only (no igbinary/msgpack noise).
-// Run the SAME script alternately against baseline.so and candidate.so:
-//   php -d extension=baseline.so  ab.php
-//   php -d extension=candidate.so ab.php
-// Knobs: BENCH_ITERS (default 1000), BENCH_REPS (default 15).
-//   BENCH_MODE=plain   (default) phpser_serialize / phpser_unserialize
-//   BENCH_MODE=signed  phpser_serialize_signed / phpser_unserialize_signed
-//   BENCH_MODE=gc      decode BENCH_GC_KEEP (default 200) copies kept alive
-//                      with the collector on; prints ns/op and gc runs
-//   BENCH_APP=1        appends eloquent_coll_30 and wallet (see bench.php)
-// gc mode runs in-process: the adaptive GC threshold drifts across shapes,
-// but both binaries replay the same sequence, so the A/B comparison holds.
-declare(strict_types=1);
+// Shared by tests/145-154: copies of the bench.php --extended app fixture
+// builders (Eloquent model/collection, Carbon, wallet, queue job, catalog,
+// JWKS). Keep in step with bench.php when the shapes change.
 
 function mk_rowset(int $rows): array {
     $out = [];
-    for ($i = 0; $i < $rows; $i++) $out[] = [
-        'id' => $i, 'user_id' => 1000 + ($i % 50), 'name' => 'row_' . $i,
-        'created_at' => '2026-05-19T12:00:00Z', 'amount' => $i * 1.07,
-        'active' => ($i % 3) === 0, 'tags' => ['a', 'b', 'c'],
-    ];
-    return $out;
-}
-function mk_numeric_packed(int $n): array { return range(0, $n - 1); }
-function mk_numeric_rand(int $n): array {
-    mt_srand(42);
-    $out = [];
-    for ($i = 0; $i < $n; $i++) $out[] = mt_rand(0, 1000000);
-    return $out;
-}
-function mk_deep_nested(int $depth): array {
-    $cur = ['leaf' => 42];
-    for ($i = 0; $i < $depth; $i++) $cur = ['next' => $cur, 'i' => $i];
-    return $cur;
-}
-final class UserDto {
-    public function __construct(
-        public int $id, public int $tenant_id, public string $name,
-        public string $email, public ?string $phone, public string $created_at,
-        public bool $is_active, public array $tags,
-    ) {}
-}
-final class OrderDto {
-    public function __construct(
-        public int $id, public int $user_id, public string $sku,
-        public float $amount, public string $currency, public string $status,
-        public ?string $shipped_at,
-    ) {}
-}
-function mk_dto_users(int $n): array {
-    $out = [];
-    for ($i = 0; $i < $n; $i++) $out[] = new UserDto(
-        id: $i, tenant_id: 1000 + ($i % 50), name: 'user_' . $i,
-        email: "user{$i}@example.com",
-        phone: ($i % 3 === 0) ? null : '+1-555-' . str_pad((string)$i, 4, '0', STR_PAD_LEFT),
-        created_at: '2026-05-19T12:00:00Z', is_active: ($i % 7) !== 0,
-        tags: ['active', 'verified', 'beta'],
-    );
-    return $out;
-}
-function mk_dto_mixed(int $users): array {
-    $out = [];
-    for ($i = 0; $i < $users; $i++) {
-        $orders = [];
-        for ($j = 0; $j < 3; $j++) $orders[] = new OrderDto(
-            id: $i * 10 + $j, user_id: $i, sku: 'SKU-' . ($i * 10 + $j),
-            amount: ($i + $j) * 12.99, currency: 'USD',
-            status: ['pending', 'shipped', 'delivered'][$j % 3],
-            shipped_at: $j === 0 ? null : '2026-05-19T12:00:00Z',
-        );
-        $out[] = ['user' => new UserDto(
-            id: $i, tenant_id: 1000 + ($i % 50), name: 'user_' . $i,
-            email: "user{$i}@example.com", phone: null,
-            created_at: '2026-05-19T12:00:00Z', is_active: true, tags: ['active'],
-        ), 'orders' => $orders];
+    for ($i = 0; $i < $rows; $i++) {
+        $out[] = [
+            'id' => $i,
+            'user_id' => 1000 + ($i % 50),
+            'name' => 'row_' . $i,
+            'created_at' => '2026-05-19T12:00:00Z',
+            'amount' => $i * 1.07,
+            'active' => ($i % 3) === 0,
+            'tags' => ['a', 'b', 'c'],
+        ];
     }
     return $out;
 }
 
-// BENCH_APP=1 fixtures, byte-comparable copies of the bench.php builders.
-
 function distinct_string(string $value): string {
     return substr($value . "\0", 0, strlen($value));
+}
+
+// Rebuilds a list element by element so the result is a refcounted heap array
+// rather than the immutable literal (array_values() would return the input).
+function distinct_list(array $src): array {
+    $out = [];
+    foreach ($src as $v) $out[] = $v;
+    return $out;
+}
+
+function mk_rowset_tags_distinct(int $rows): array {
+    $out = mk_rowset($rows);
+    foreach ($out as $i => $row) $out[$i]['tags'] = distinct_list($row['tags']);
+    return $out;
+}
+
+function mk_rowset_tags_shared(int $rows): array {
+    $out = mk_rowset($rows);
+    $shared = distinct_list(['a', 'b', 'c']);
+    foreach ($out as $i => $row) $out[$i]['tags'] = $shared;
+    return $out;
+}
+
+function mk_small_assoc(): array {
+    return [
+        'id' => 42, 'name' => distinct_string('alice'), 'email' => distinct_string('alice@example.com'),
+        'active' => true, 'score' => 1.5, 'roles' => distinct_list(['admin', 'editor']),
+    ];
 }
 
 function fx_hex(string $seed, int $len): string {
@@ -380,87 +346,102 @@ function mk_wallet(int $groups = 10, int $recordsPerGroup = 4, int $docsPerRecor
     return $out;
 }
 
-$ITERS = (int)(getenv('BENCH_ITERS') ?: 1000);
-$REPS  = max(1, (int)(getenv('BENCH_REPS') ?: 15));
-$MODE  = getenv('BENCH_MODE') ?: 'plain';
-$KEY   = str_repeat("\x5a", 32);
+enum AuditEvent: string {
+    case Viewed = 'viewed';
+    case Shared = 'shared';
+    case Downloaded = 'downloaded';
+}
 
-function med(callable $fn, $arg, int $it, int $r): float {
-    $s = [];
-    for ($k = 0; $k < $r; $k++) {
-        $t = hrtime(true);
-        for ($i = 0; $i < $it; $i++) $fn($arg);
-        $s[] = (hrtime(true) - $t) / $it;
+final class AuditDto {
+    public function __construct(
+        public readonly AuditEvent $event,
+        public readonly string $actorId,
+        public readonly string $subjectId,
+        public readonly string $tenantId,
+        public readonly array $context,
+        public readonly array $changes,
+        public readonly string $userAgent,
+        public readonly CarbonLike $occurredAt,
+        public readonly string $ipAddress,
+        public readonly string $url,
+        public readonly string $method,
+        public readonly string $requestId,
+        public readonly int $severity,
+    ) {}
+}
+
+// Queue payload shape: Queueable defaults around a private readonly DTO.
+final class QueueJobLike {
+    public $connection = null;
+    public $queue = null;
+    public $delay = null;
+    public $afterCommit = null;
+    public $middleware = [];
+    public $chained = [];
+    public $chainConnection = null;
+    public $chainQueue = null;
+    public $chainCatchCallbacks = null;
+    public $job = null;
+
+    public function __construct(private readonly AuditDto $dto) {}
+
+    public function dto(): AuditDto { return $this->dto; }
+}
+
+function mk_queue_job(): QueueJobLike {
+    $ua = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36';
+    return new QueueJobLike(new AuditDto(
+        event: AuditEvent::Shared,
+        actorId: fx_uuid7('actor'),
+        subjectId: fx_uuid7('subject'),
+        tenantId: fx_uuid7('tenant'),
+        context: ['share_id' => fx_uuid7('share'), 'recipient' => 'hr@example.com', 'expires_in' => 604800, 'records' => 3, 'channel' => distinct_string('email')],
+        changes: ['status' => distinct_string('shared'), 'shared_at' => fx_ts(7200), 'count' => 4],
+        userAgent: distinct_string($ua),
+        occurredAt: mk_carbon(7200),
+        ipAddress: distinct_string('203.0.113.42'),
+        url: 'https://app.example.com/wallet/share/' . fx_hex('share', 16),
+        method: distinct_string('POST'),
+        requestId: fx_uuid7('request'),
+        severity: 2,
+    ));
+}
+
+function mk_catalog(int $rows = 60): array {
+    $kinds = ['date', 'string', 'email', 'numeric'];
+    $out = [];
+    for ($r = 0; $r < $rows; $r++) {
+        $attrs = [];
+        $n = 10 + ($r * 7) % 16;
+        for ($a = 0; $a < $n; $a++) {
+            $validators = [];
+            $validators[] = 'nullable';
+            $validators[] = $kinds[($r + $a) % 4];
+            $attrs[] = [
+                'label' => ucfirst(str_replace('_', ' ', "field_{$a}_label")),
+                'name' => "field_$a",
+                'validators' => $validators,
+                'isHidden' => $a % 5 === 4,
+            ];
+        }
+        $out[] = ['document_type' => "doc_type_$r", 'label' => "Document Type $r", 'attributes' => $attrs];
     }
-    sort($s);
-    return $s[intdiv($r, 2)];
+    return $out;
 }
 
-// Retained decode with the collector on: every result stays reachable, so
-// the gc runs counted here are root-buffer scans, not garbage collection.
-function med_retained(string $blob, int $keep, int $r): array {
-    $s = [];
-    $runs = [];
-    for ($k = 0; $k < $r; $k++) {
-        gc_collect_cycles();
-        $before = gc_status()['runs'];
-        $bag = [];
-        $t = hrtime(true);
-        for ($i = 0; $i < $keep; $i++) $bag[] = phpser_unserialize($blob);
-        $s[] = (hrtime(true) - $t) / $keep;
-        $runs[] = gc_status()['runs'] - $before;
-        unset($bag);
+function mk_jwks(): array {
+    $keys = [];
+    for ($k = 0; $k < 2; $k++) {
+        $raw = '';
+        for ($b = 0; strlen($raw) < 256; $b++) $raw .= hash('sha256', "modulus$k-$b", true);
+        $keys[] = [
+            'alg' => 'RS256',
+            'e' => 'AQAB',
+            'kid' => fx_hex("kid$k", 40),
+            'kty' => 'RSA',
+            'n' => rtrim(strtr(base64_encode(substr($raw, 0, 256)), '+/', '-_'), '='),
+            'use' => 'sig',
+        ];
     }
-    sort($s);
-    sort($runs);
-    return [$s[intdiv($r, 2)], $runs[intdiv($r, 2)]];
-}
-
-$shapes = [
-    'rowset_100'  => mk_rowset(100),
-    'rowset_1000' => mk_rowset(1000),
-    'packed_1k'   => mk_numeric_packed(1000),
-    'packed_10k'  => mk_numeric_packed(10000),
-    'packed_rand_10k' => mk_numeric_rand(10000),
-    'deep_50'     => mk_deep_nested(50),
-    'dto_100'     => mk_dto_users(100),
-    'dto_1000'    => mk_dto_users(1000),
-    'dto_mixed'   => mk_dto_mixed(100),
-];
-if (getenv('BENCH_APP')) {
-    $shapes['eloquent_coll_30'] = mk_eloquent_collection(30);
-    $shapes['wallet'] = mk_wallet();
-}
-
-if ($MODE === 'gc') {
-    ini_set('memory_limit', '-1');
-    gc_enable();
-    $keep = max(10, (int)(getenv('BENCH_GC_KEEP') ?: 200));
-    foreach ($shapes as $name => $data) {
-        $blob = phpser_serialize($data);
-        [$dec, $runs] = med_retained($blob, $keep, $REPS);
-        printf("%-12s size=%7d keep=%4d dec_gc=%9.1f gc_runs=%d\n", $name, strlen($blob), $keep, $dec, $runs);
-    }
-    exit(0);
-}
-
-$enc_fn = 'phpser_serialize';
-$dec_fn = 'phpser_unserialize';
-if ($MODE === 'signed') {
-    $enc_fn = fn($v) => phpser_serialize_signed($v, $KEY);
-    $dec_fn = fn($b) => phpser_unserialize_signed($b, $KEY);
-} elseif ($MODE !== 'plain') {
-    fwrite(STDERR, "unknown BENCH_MODE=$MODE (plain|signed|gc)\n");
-    exit(1);
-}
-
-foreach ($shapes as $name => $data) {
-    $blob = $enc_fn($data);
-    if (serialize($dec_fn($blob)) !== serialize($data)) {
-        fwrite(STDERR, "MISMATCH $name\n");
-        exit(1);
-    }
-    $enc = med($enc_fn, $data, $ITERS, $REPS);
-    $dec = med($dec_fn, $blob, $ITERS, $REPS);
-    printf("%-12s size=%7d enc=%9.1f dec=%9.1f\n", $name, strlen($blob), $enc, $dec);
+    return ['keys' => $keys];
 }
