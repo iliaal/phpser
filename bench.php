@@ -704,9 +704,8 @@ $timed = array_filter(
 // A Closure case is a fixture builder: each serializer then encodes its own
 // copy. Encoding an object can build its property table (igbinary_serialize()
 // does on 8.4; native serialize() does not), and phpser's output for
-// protected/untyped properties
-// differs once that table exists, so a shared copy would measure phpser in a
-// state that only the other columns created.
+// protected/untyped properties differs once that table exists, so a shared
+// copy would measure phpser in a state that only the other columns created.
 function case_data(mixed $case): mixed {
     return $case instanceof Closure ? $case() : $case;
 }
