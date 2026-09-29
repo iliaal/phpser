@@ -433,9 +433,11 @@ keeps a reference in each copy, and one shared decoded array would lose the
 aliasing a later write through either copy depends on. The decoder enforces
 the same rule and rejects a SHARED_ARRAY whose contents create or reuse a
 reference (NEW_REF, or a REF to a reference), including through an object
-property. Arrays are pinned exactly like tracked objects, and cycle
-collection stays suspended until the first hook pins them, so a freed
-table's reused address cannot masquerade as a back-reference. A shared array
+property. Arrays are pinned exactly like tracked objects, so a freed
+table's reused address cannot masquerade as a back-reference. Pins activate
+at the first hook. Before that, the encoder releases its private copies of
+shared arrays and property tails without the possible-root check, so a full
+root buffer cannot start a cycle collection whose destructors are user code. A shared array
 is captured at its first visit; see SECURITY.md for the one case where that
 differs from native.
 

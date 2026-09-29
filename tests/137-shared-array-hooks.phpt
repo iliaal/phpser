@@ -117,7 +117,7 @@ echo ($d['w']->list === ['s1', 's2', 'woke'] && $d['u']->got === ['s1', 's2', 'u
 
 // 6. A cycle collection started by the encoder's own releases (the 30000
 //    children of a duplicated shared array overflow the root buffer) runs
-//    destructors of unrelated garbage before any hook activates pins. Such a
+//    destructors of unrelated garbage before any hook has run. Such a
 //    destructor frees a claimed array through a reference alias and stores a
 //    fresh array into a later reference, where the freed address is reused.
 //    The later value must never decode as the freed array.

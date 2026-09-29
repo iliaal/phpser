@@ -309,13 +309,6 @@ typedef struct {
     /* Once user code can run, every id-table entry owns a reference.
      * Activation pins existing entries; later inserts pin individually. */
     uint8_t pins_active;
-    /* A cycle collection triggered by the encoder's own releases (a private
-     * duplicate's destroy can fill the root buffer) runs destructors of
-     * unrelated garbage, which is user code before any pin exists. It could
-     * free an unpinned entry and reuse its address, so collection stays off
-     * until pins activate or the encode ends. */
-    uint8_t gc_suspended;
-    uint8_t gc_was_enabled;
     /* First-allocation capacity for icache (power of 2; 0 = default 32).
      * Seeded from the top-level element count so a large payload skips the
      * per-doubling ecalloc + rehash cascade on its way up from 32 slots. */
@@ -359,8 +352,6 @@ static void enc_ctx_init(encode_ctx *e) {
     e->failed = 0;
     e->wire_v2 = 0;
     e->pins_active = 0;
-    e->gc_was_enabled = gc_enable(false);
-    e->gc_suspended = 1;
     e->icache_init_cap = 0;
     e->sublinear_elems = 0;
     e->refs_seen = 0;
@@ -429,13 +420,6 @@ static zend_always_inline void enc_id_addref(uintptr_t ptr, uint8_t kind) {
     }
 }
 
-static zend_always_inline void enc_gc_resume(encode_ctx *e) {
-    if (e->gc_suspended) {
-        e->gc_suspended = 0;
-        gc_enable(e->gc_was_enabled);
-    }
-}
-
 /* First user-code boundary: pin every tracked entity before the hook runs,
  * so a hook (or a destructor it triggers) cannot destroy a table entry and
  * let a same-address reallocation masquerade as a back-reference. Called
@@ -450,15 +434,41 @@ static zend_never_inline void enc_pins_activate_slow(encode_ctx *e) {
             }
         }
     }
-    enc_gc_resume(e);
 }
 
 static zend_always_inline void enc_pins_activate(encode_ctx *e) {
     if (UNEXPECTED(!e->pins_active)) enc_pins_activate_slow(e);
 }
 
+/* Releasing an encoder-held copy (private duplicate, property snapshot) with
+ * zval_ptr_dtor drops refcounts to nonzero, and a full root buffer then runs a
+ * cycle collection synchronously. Its destructors are user code, which could
+ * free an unpinned id-table entry and reuse its address. Until pins activate no
+ * user code has run, so every copied value still has its graph owner: drop the
+ * copy's reference without the possible-root check. Net refcount is unchanged,
+ * so no cycle candidate is lost. */
+static zend_always_inline void enc_release_copy_zval(encode_ctx *e, zval *zv) {
+    if (e->pins_active) {
+        zval_ptr_dtor(zv);
+    } else if (Z_REFCOUNTED_P(zv)) {
+        uint32_t rc = GC_DELREF(Z_COUNTED_P(zv));
+        ZEND_ASSERT(rc > 0);
+        (void)rc;
+    }
+}
+
+static void enc_release_dup(encode_ctx *e, HashTable *dup) {
+    if (!e->pins_active) {
+        zval *zv;
+        ZEND_HASH_FOREACH_VAL(dup, zv) {
+            enc_release_copy_zval(e, zv);
+            ZVAL_UNDEF(zv);
+        } ZEND_HASH_FOREACH_END();
+    }
+    zend_array_destroy(dup);
+}
+
 static void enc_ctx_destroy(encode_ctx *e) {
-    enc_gc_resume(e);
     if (e->icache) efree(e->icache);
     if (e->hash_map_inited) zend_hash_destroy(&e->hash_map);
     if (e->id_buckets) {
@@ -1282,7 +1292,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                     enc_patch_nprops(body, nprops_off, fp_nprops);
                     if (snap) {
                         for (uint32_t k = 0; k < snap_i; k++) {
-                            zval_ptr_dtor(&snap[k]);
+                            enc_release_copy_zval(e, &snap[k]);
                         }
                         if (snap != snap_stack) efree(snap);
                     }
@@ -1678,10 +1688,10 @@ static void enc_emit_table_column(
  * row we addref'd; a single GC_DELREF balances both, destroying the table only
  * when our reference was the last (a duplicate always, or an original whose
  * owning slot a hook deleted). NULL slots are immutable rows, never pinned. */
-static void enc_free_row_pins(HashTable **row_pin, uint32_t n_used) {
+static void enc_free_row_pins(encode_ctx *e, HashTable **row_pin, uint32_t n_used) {
     for (uint32_t r = 0; r < n_used; r++) {
         if (row_pin[r] && !GC_DELREF(row_pin[r])) {
-            zend_array_destroy(row_pin[r]);
+            enc_release_dup(e, row_pin[r]);
         }
     }
     efree(row_pin);
@@ -1734,7 +1744,7 @@ static zend_never_inline int enc_try_table(
         }
         if (UNEXPECTED(c != ncols)) {
             efree(col_cells);
-            if (row_pin) enc_free_row_pins(row_pin, n_used);
+            if (row_pin) enc_free_row_pins(e, row_pin, n_used);
             if (row_dup) efree(row_dup);
             efree(key_idx);
             return 0;
@@ -1759,7 +1769,7 @@ static zend_never_inline int enc_try_table(
         if (string_idx) efree(string_idx);
     }
     efree(col_cells);
-    if (row_pin) enc_free_row_pins(row_pin, n_used);
+    if (row_pin) enc_free_row_pins(e, row_pin, n_used);
     if (row_dup) efree(row_dup);
     return 1;
 }
@@ -1871,7 +1881,7 @@ static zend_never_inline void encode_hashtable(smart_str *body, encode_ctx *e, H
                     for (uint32_t j = 0; j < n_used; j++) {
                         encode_value_ex(body, e, &wzp[j], wflags);
                     }
-                    if (dup) zend_array_destroy(dup);
+                    if (dup) enc_release_dup(e, dup);
                     return;
                 }
                 pos = varint_put(base, pos, idx);
@@ -1933,7 +1943,7 @@ static zend_never_inline void encode_hashtable(smart_str *body, encode_ctx *e, H
             for (uint32_t i = 0; i < n_used; i++) {
                 encode_value_ex(body, e, &wzp[i], wflags);
             }
-            if (dup) zend_array_destroy(dup);
+            if (dup) enc_release_dup(e, dup);
         }
         return;
     }
@@ -1951,7 +1961,7 @@ static zend_never_inline void encode_hashtable(smart_str *body, encode_ctx *e, H
             varint_write_i64(body, (int64_t)i);
             encode_value_ex(body, e, &zp[i], wflags);
         }
-        if (dup) zend_array_destroy(dup);
+        if (dup) enc_release_dup(e, dup);
         return;
     }
 
@@ -1997,7 +2007,7 @@ static zend_never_inline void encode_hashtable(smart_str *body, encode_ctx *e, H
                 if (Z_TYPE(vb->val) == IS_UNDEF) continue;
                 encode_value_ex(body, e, &vb->val, wflags);
             }
-            if (dup) zend_array_destroy(dup);
+            if (dup) enc_release_dup(e, dup);
             return;
         }
         smart_str_appendc(body, TAG_ASSOC);
@@ -2020,7 +2030,7 @@ static zend_never_inline void encode_hashtable(smart_str *body, encode_ctx *e, H
             }
             encode_value_ex(body, e, &b->val, wflags);
         }
-        if (dup) zend_array_destroy(dup);
+        if (dup) enc_release_dup(e, dup);
     }
 }
 
