@@ -2349,8 +2349,9 @@ static int decode_header(decode_ctx *d) {
 
 /* result_live: the decoded value is being returned and every pinned entity is
  * still reachable from it (no drop, no user code). A live entity cannot be
- * cyclic garbage, and a later unset of the result roots it through the normal
- * refcount path, so the pin release skips gc_possible_root. Otherwise each
+ * cyclic garbage, and phpser_decode_buf_opts buffers the returned value as a
+ * root, which reaches every such entity, so the pin release skips
+ * gc_possible_root. Otherwise each
  * surviving entity must be offered as a root: it may now be orphaned in a
  * cycle whose earlier root a mid-decode GC run already discarded. */
 static void decode_destroy(decode_ctx *d, bool result_live) {
@@ -3786,10 +3787,14 @@ int phpser_decode_buf_opts(
         zval_ptr_dtor(&retval);
         if (UNEXPECTED(EG(exception))) goto done;
     }
-done:
+done:;
     /* Hooks run user code that can detach pinned entities from the result. */
-    decode_destroy(&d, !d.pins_may_orphan && d.deferred_len == 0
-                       && !EG(exception));
+    bool result_live = !d.pins_may_orphan && d.deferred_len == 0
+                       && !EG(exception);
+    /* Only objects and references can close a cycle, and each claims an id.
+     * Without one, the fast release skipped nothing that needs a root. */
+    bool root_result = result_live && d.id_table_len > 0;
+    decode_destroy(&d, result_live);
     /* The PHP entry point is not declared by-reference, so unwrap a top-level
      * TAG_NEW_REF before returning to Zend. The pin was released above while
      * `out` still held the reference; this drop takes the normal root path. */
@@ -3807,6 +3812,15 @@ done:
         zval_ptr_dtor(out);
         ZVAL_NULL(out);
         return -1;
+    }
+    /* Zend frees discarded temporaries, such as an unused user-function return
+     * value, with zval_ptr_dtor_nogc. That skips root buffering, so a cyclic
+     * graph whose pins released without a root would leak until shutdown.
+     * Every decoded entity is reachable from `out`, so one root covers the
+     * graph, as in native unserialize and igbinary. The slow release already
+     * buffered each surviving entity. */
+    if (root_result && Z_REFCOUNTED_P(out)) {
+        gc_check_possible_root(Z_COUNTED_P(out));
     }
     return 0;
 }

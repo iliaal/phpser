@@ -118,6 +118,21 @@ echo "tree intact: ", var_export($ok, true), "\n";
 unset($t, $c);
 echo "tree collected>=501: ", var_export(gc_collect_cycles() >= 501, true), "\n";
 
+// An unused user-function return value is freed without root buffering, so the
+// decoder itself must leave the cyclic result collectable.
+function decode_discard(string $p) { return phpser_unserialize($p); }
+$tp = $cases['cyclic_500'];
+$ts = phpser_serialize_signed(phpser_unserialize($tp), $key);
+$viaClosure = fn() => phpser_unserialize($tp);
+$viaSigned = fn() => phpser_unserialize_signed($ts, $key);
+gc_collect_cycles();
+for ($i = 0; $i < 10; $i++) {
+    $viaClosure();
+    decode_discard($tp);
+    $viaSigned();
+}
+echo "discarded trees collected: ", var_export(gc_collect_cycles() >= 30 * 501, true), "\n";
+
 $r = phpser_unserialize($cases['refs_300']);
 $r[0]->name = 'changed';
 echo "ref shared: ", var_export($r[299]->name === 'changed' && $r[299]->tags === $r[0]->tags, true), "\n";
@@ -145,6 +160,7 @@ array_default_obj_1000 unsigned roots<10: true
 array_default_obj_1000 signed roots<10: true
 tree intact: true
 tree collected>=501: true
+discarded trees collected: true
 ref shared: true
 ref graph collected: true
 roots left: 0
