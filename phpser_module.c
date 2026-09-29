@@ -270,6 +270,7 @@ static PHP_MINFO_FUNCTION(phpser) {
 #else
     php_info_print_table_row(2, "session.serialize_handler", "disabled (compiled without session)");
 #endif
+    php_info_print_table_row(2, "HMAC SHA-256 backend", phpser_sha256_backend());
     php_info_print_table_end();
 }
 

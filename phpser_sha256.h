@@ -25,10 +25,11 @@ typedef void (*phpser_sha256_blocks_fn)(uint32_t state[8],
 
 extern const uint32_t phpser_sha256_iv[8];
 
-/* Picks the fastest compression the CPU supports. A hardware candidate is
- * accepted only after it matches ext/hash on a fixed multi-block vector;
- * otherwise the ext/hash-backed compression is returned. Pure apart from the
- * self-test, so each thread may call it independently. */
-phpser_sha256_blocks_fn phpser_sha256_select(void);
+/* Picks the fastest compression the CPU supports and stores its backend name
+ * in *name. A hardware candidate is accepted only after it matches ext/hash
+ * on a fixed multi-block vector; otherwise the ext/hash-backed compression is
+ * returned. Pure apart from the self-test, so each thread may call it
+ * independently. */
+phpser_sha256_blocks_fn phpser_sha256_select(const char **name);
 
 #endif /* PHPSER_SHA256_H */

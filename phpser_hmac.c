@@ -22,8 +22,11 @@
  *
  * Each thread keeps the SHA-256 states after compressing K^ipad and K^opad
  * for its most recent key, so a repeat key costs two fewer compressions and
- * no allocation. Those midstates are key-equivalent: they are overwritten in
- * place when the key changes and wiped by phpser_hmac_mshutdown().
+ * no allocation. The entry holds the key itself (raw bytes when at most 64,
+ * else its SHA-256 digest) plus key-equivalent midstates, in static
+ * thread-local memory until a different key replaces it in place or
+ * phpser_hmac_mshutdown() wipes it; a ZTS thread that exits earlier frees its
+ * copy unwiped.
  * ------------------------------------------------------------------------- */
 
 #include "phpser_int.h"
@@ -110,7 +113,10 @@ int phpser_hmac_sha256(
     if (UNEXPECTED(!phpser_sha256_ops)) return -1;
 
     phpser_hmac_state *hs = &hmac_state;
-    if (UNEXPECTED(!hs->blocks)) hs->blocks = phpser_sha256_select();
+    if (UNEXPECTED(!hs->blocks)) {
+        const char *backend;
+        hs->blocks = phpser_sha256_select(&backend);
+    }
     phpser_sha256_blocks_fn blocks = hs->blocks;
 
     unsigned char k[SHA256_BLOCK];

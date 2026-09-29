@@ -51,8 +51,7 @@ extern const php_hash_ops *phpser_sha256_ops;
 
 /* HMAC-SHA256 of `data` under `key`. Writes a 32-byte tag to `out`.
  * Returns 0 on success, -1 if SHA256 ops weren't resolved at MINIT.
- * Callers still map -2 (unsupported block size) for older builds; it is no
- * longer produced. (phpser_hmac.c) */
+ * (phpser_hmac.c) */
 int phpser_hmac_sha256(
     const unsigned char *key, size_t key_len,
     const unsigned char *data, size_t data_len,
@@ -62,6 +61,10 @@ int phpser_hmac_sha256(
  * MSHUTDOWN; ZTS worker threads that exit earlier release theirs unwiped.
  * (phpser_hmac.c) */
 void phpser_hmac_mshutdown(void);
+
+/* SHA-256 backend the HMAC selects on this CPU: "armv8", "sha-ni", or
+ * "ext/hash". Reruns detection and the self-test. (phpser_sha256.c) */
+const char *phpser_sha256_backend(void);
 
 /* Constant-time byte compare. Returns 1 if all `n` bytes are equal.
  * (phpser_hmac.c) */

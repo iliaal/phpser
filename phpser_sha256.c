@@ -13,13 +13,15 @@
 /* -------------------------------------------------------------------------
  * SHA-256 block compression for the signed-payload HMAC.
  *
- * ext/hash accelerates SHA-256 only on x86 (SSE2 / SHA-NI); on aarch64 it
- * runs portable C at roughly 24 cycles/byte. This file adds an ARMv8 Crypto
- * Extensions path and a multi-block SHA-NI path (ext/hash re-dispatches and
+ * ext/hash accelerates SHA-256 only on x86 and only from PHP 8.4 (SSE2 /
+ * SHA-NI); PHP 8.2/8.3 and every aarch64 build run portable C, roughly 24
+ * cycles/byte on Neoverse-N1. This file adds an ARMv8 Crypto Extensions path
+ * and a multi-block SHA-NI path (ext/hash's 8.4 SHA-NI re-dispatches and
  * reshuffles the state on every block), and falls back to ext/hash for
  * everything else, including MSVC builds.
  * ------------------------------------------------------------------------- */
 
+#include "phpser_int.h"
 #include "phpser_sha256.h"
 #include "ext/hash/php_hash.h"
 #include "ext/hash/php_hash_sha.h"
@@ -36,19 +38,19 @@
 #  define PHPSER_SHA256_ARMV8 1
 #  define PHPSER_SHA256_ARMV8_ALWAYS 1
 #  define PHPSER_ARMV8_TARGET
-# elif defined(__GNUC__) && !defined(__clang__) && defined(__linux__)
+# elif defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 6 && defined(__linux__)
 #  define PHPSER_SHA256_ARMV8 1
 #  define PHPSER_ARMV8_TARGET __attribute__((target("+crypto")))
 # endif
 #endif
 
-/* MSVC is left on the ext/hash fallback, which already dispatches to SHA-NI
- * on Windows x86/x64. */
+/* MSVC is left on the ext/hash fallback: SHA-NI there on PHP 8.4+, portable
+ * C on 8.2 and 8.3. */
 #if (defined(__x86_64__) || defined(__i386__)) && (defined(__GNUC__) || defined(__clang__))
 # define PHPSER_SHA256_SHANI 1
 # define PHPSER_SHANI_TARGET __attribute__((target("sha,ssse3,sse4.1")))
 # include <immintrin.h>
-# include "Zend/zend_cpuinfo.h"
+# include <cpuid.h>
 #endif
 
 #if defined(PHPSER_SHA256_ARMV8) || defined(PHPSER_SHA256_SHANI)
@@ -227,11 +229,17 @@ static void sha256_blocks_shani(uint32_t state[8], const unsigned char *data,
 }
 #undef SHANI_ROUND4
 
+/* Queried directly: ZEND_CPU_FEATURE_SHA exists only from PHP 8.4, and
+ * __builtin_cpu_supports needs libgcc's CPU model, which some toolchains
+ * (zig cc, musl) lack. SHA-NI uses only XMM state, so no XCR0 check. */
 static bool sha256_cpu_has_shani(void)
 {
-    return zend_cpu_supports(ZEND_CPU_FEATURE_SHA)
-        && zend_cpu_supports(ZEND_CPU_FEATURE_SSSE3)
-        && zend_cpu_supports(ZEND_CPU_FEATURE_SSE41);
+    unsigned int eax, ebx, ecx, edx;
+    if (!__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return false;
+    if (!(ecx & (1u << 9)) || !(ecx & (1u << 19))) return false;   /* SSSE3, SSE4.1 */
+    if (__get_cpuid_max(0, NULL) < 7) return false;
+    __cpuid_count(7, 0, eax, ebx, ecx, edx);
+    return (ebx & (1u << 29)) != 0;                                  /* SHA */
 }
 #endif /* PHPSER_SHA256_SHANI */
 
@@ -271,17 +279,27 @@ static bool sha256_hw_accepted(phpser_sha256_blocks_fn fn, const char *name)
 }
 #endif
 
-phpser_sha256_blocks_fn phpser_sha256_select(void)
+phpser_sha256_blocks_fn phpser_sha256_select(const char **name)
 {
 #ifdef PHPSER_SHA256_ARMV8
     if (sha256_cpu_has_armv8() && sha256_hw_accepted(sha256_blocks_armv8, "ARMv8")) {
+        *name = "armv8";
         return sha256_blocks_armv8;
     }
 #endif
 #ifdef PHPSER_SHA256_SHANI
     if (sha256_cpu_has_shani() && sha256_hw_accepted(sha256_blocks_shani, "SHA-NI")) {
+        *name = "sha-ni";
         return sha256_blocks_shani;
     }
 #endif
+    *name = "ext/hash";
     return sha256_blocks_exthash;
+}
+
+const char *phpser_sha256_backend(void)
+{
+    const char *name;
+    phpser_sha256_select(&name);
+    return name;
 }
