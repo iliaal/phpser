@@ -3198,6 +3198,9 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                     zval_ptr_dtor(&data);
                     return -1;
                 }
+                /* A SHARED_ARRAY data table is pinned; dropping it may leave the
+                 * pin as its only holder. A fresh table orphans nothing. */
+                if (GC_REFCOUNT(Z_ARR(data)) > 1) dec_note_drop(d, &data);
                 zval_ptr_dtor(&data);
                 /* Like native, a class with __serialize() + __wakeup() but no
                  * __unserialize() still gets __wakeup(). Gated on `allowed` so
