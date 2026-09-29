@@ -702,8 +702,9 @@ $timed = array_filter(
 );
 
 // A Closure case is a fixture builder: each serializer then encodes its own
-// copy. Encoding an object can build its property table (native serialize()
-// and igbinary do), and phpser's output for protected/untyped properties
+// copy. Encoding an object can build its property table (igbinary_serialize()
+// does on 8.4; native serialize() does not), and phpser's output for
+// protected/untyped properties
 // differs once that table exists, so a shared copy would measure phpser in a
 // state that only the other columns created.
 function case_data(mixed $case): mixed {
@@ -837,7 +838,11 @@ function gc_retained_sample(callable $dec, string $blob, int $keep, bool $gc_on)
 // which starts every sample from the same threshold.
 function run_isolated(callable $fn): array {
     if (!function_exists('pcntl_fork')) {
-        return $fn() + ['isolated' => false];
+        try {
+            return $fn() + ['isolated' => false];
+        } catch (\Throwable $e) {
+            return ['err' => $e->getMessage(), 'isolated' => false];
+        }
     }
     $path = tempnam(sys_get_temp_dir(), 'phpser-bench-');
     $pid = pcntl_fork();
@@ -880,18 +885,25 @@ function bench_gc_retained(array $cases, array $serializers, int $keep_cap, int 
             }
         }
         $keep = max(10, min($keep_cap, intdiv($mem_budget, $bytes)));
-        $names = array_keys($blobs);
+        $names = array_keys(array_diff_key($blobs, $results[$label] ?? []));
         $samples = [];
         for ($rep = 0; $rep < $reps; $rep++) {
             foreach (serializer_order($names, $rep) as $name) {
+                if (isset($results[$label][$name]['err'])) continue;
                 $dec = $serializers[$name][1];
                 foreach (['gc_on' => true, 'gc_off' => false] as $mode => $on) {
-                    $samples[$name][$mode][] = run_isolated(
+                    $sample = run_isolated(
                         fn() => gc_retained_sample($dec, $blobs[$name], $keep, $on));
+                    if (isset($sample['err'])) {
+                        $results[$label][$name] = ['err' => $sample['err']];
+                        continue 2;
+                    }
+                    $samples[$name][$mode][] = $sample;
                 }
             }
         }
         foreach ($names as $name) {
+            if (isset($results[$label][$name]['err'])) continue;
             $cell = ['keep' => $keep, 'isolated' => $samples[$name]['gc_on'][0]['isolated']];
             foreach (['gc_on', 'gc_off'] as $mode) {
                 $ns = array_column($samples[$name][$mode], 'ns');

@@ -44,6 +44,11 @@ $renamed = phpser_unserialize(evolve(phpser_serialize(new OrderV1()), 'OrderV1',
 var_dump(get_class($renamed), ((array) $renamed)['__PHP_Incomplete_Class_Name']);
 $back = phpser_unserialize(phpser_serialize($renamed));
 var_dump(get_class($back), ((array) $back)['__PHP_Incomplete_Class_Name']);
+// Current behavior, pinned: the unnamed slot values are dropped, leaving only
+// the name carrier (150 is the XFAIL for native-parity property retention).
+require __DIR__ . '/145-app-fixtures.inc';
+$gone = phpser_unserialize(str_replace('EloquentModelLike', 'EloquentModelGone', phpser_serialize(mk_eloquent_model(2))));
+var_dump(get_class($gone), array_keys((array) $gone));
 
 echo "-- property removed from a positional (slots) class\n";
 class WideDto1 { public int $a = 1; public int $b = 2; public int $extra = 3; }
@@ -112,6 +117,11 @@ string(22) "__PHP_Incomplete_Class"
 string(7) "OrderZZ"
 string(22) "__PHP_Incomplete_Class"
 string(7) "OrderZZ"
+string(22) "__PHP_Incomplete_Class"
+array(1) {
+  [0]=>
+  string(27) "__PHP_Incomplete_Class_Name"
+}
 -- property removed from a positional (slots) class
 NULL
 Exception: phpser: signed payload failed to decode

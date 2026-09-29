@@ -82,12 +82,19 @@ $raw = $job->__serialize();
 $rt = phpser_unserialize(phpser_serialize($raw));
 var_dump(array_keys($rt) === array_keys($raw), $rt["\0SendDocumentJob\0attempt"]);
 
-// A mangled key the class does not declare is ignored by __unserialize, not
-// installed as a stray property.
-$extra = phpser_serialize($raw + ["\0*\0removedLater" => 'x']);
-$obj = (new ReflectionClass(SendDocumentJob::class))->newInstanceWithoutConstructor();
-$obj->__unserialize(phpser_unserialize($extra));
-var_dump(property_exists($obj, 'removedLater'), $obj->state()[3]);
+// A payload written by an older job class that still had a protected
+// $removedLater: phpser must route the whole data array, extra mangled key
+// included, through the current class's __unserialize. Same-length class
+// swap so the frame stays well-formed.
+class SendDocumentOld {
+    public function __construct(private array $data) {}
+    public function __serialize(): array { return $this->data; }
+    public function __unserialize(array $data): void { $this->data = $data; }
+}
+$old = phpser_serialize(new SendDocumentOld($raw + ["\0*\0removedLater" => 'x']));
+$obj = phpser_unserialize(str_replace('SendDocumentOld', 'SendDocumentJob', $old));
+[$model, $recipients, $token, $attempt] = $obj->state();
+var_dump(get_class($obj), property_exists($obj, 'removedLater'), $attempt, count($model->getAttributes()), $recipients[1]);
 ?>
 --EXPECT--
 connection,queue,middleware,\0*\0model,\0*\0recipients,\0SendDocumentJob\0token,\0SendDocumentJob\0attempt
@@ -97,5 +104,8 @@ signed: SendDocumentJob EloquentModelLike 18 hr@example.com|ops@example.com 32 2
 signed serialize_equal: true
 bool(true)
 int(2)
+string(15) "SendDocumentJob"
 bool(false)
 int(2)
+int(18)
+string(15) "ops@example.com"

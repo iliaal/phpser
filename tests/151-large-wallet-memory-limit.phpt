@@ -1,5 +1,5 @@
 --TEST--
-phpser: ~390 KB (native) wallet payload round-trips under memory_limit=128M
+phpser: ~390 KB (native) wallet payload round-trips under memory_limit=32M
 --EXTENSIONS--
 phpser
 --SKIPIF--
@@ -7,7 +7,7 @@ phpser
 if (getenv('USE_ZEND_ALLOC') === '0') die('skip memory_limit requires Zend allocator');
 ?>
 --INI--
-memory_limit=128M
+memory_limit=32M
 --FILE--
 <?php
 require __DIR__ . '/145-app-fixtures.inc';
@@ -33,11 +33,11 @@ unset($rt);
 // Several decoded copies alive at once, as a request that loads a few wallets.
 $live = [];
 for ($i = 0; $i < 8; $i++) $live[] = phpser_unserialize($payload);
-echo "8 live copies: ", count($live), " peak<128M: ", var_export(memory_get_peak_usage() < 128 * 1048576, true), "\n";
+echo "8 live copies: ", count($live), " peak<24MiB: ", var_export(memory_get_peak_usage() < 24 * 1048576, true), "\n";
 ?>
 --EXPECT--
 native>=350KB: true phpser<native: true signed_overhead: 32
 unsigned serialize_equal: true
 signed serialize_equal: true
 groups=10 records=40 documents=100
-8 live copies: 8 peak<128M: true
+8 live copies: 8 peak<24MiB: true

@@ -59,17 +59,23 @@ foreach ($cases as $label => $value) {
         gc_collect_cycles();
         $before = memory_get_usage();
         $collected_before = gc_status()['collected'];
-        for ($i = 0; $i < 300; $i++) {
-            $v = $decode();
-            unset($v);
+        // Two batches: 300 decodes, then 600 more. Growth is 0 once warm, so
+        // a 4 KiB cumulative bound over 900 decodes catches ~4.5 B/decode.
+        $growth = [];
+        foreach ([300, 600] as $batch) {
+            for ($i = 0; $i < $batch; $i++) {
+                $v = $decode();
+                unset($v);
+            }
+            gc_collect_cycles();
+            $growth[] = memory_get_usage() - $before;
         }
-        $collected = gc_collect_cycles() + gc_status()['collected'] - $collected_before;
-        $growth = memory_get_usage() - $before;
-        printf("%s/%s: growth<16KiB=%s cycles_collected=%s\n", $label, $mode,
-            var_export($growth < 16384, true),
+        $collected = gc_status()['collected'] - $collected_before;
+        printf("%s/%s: growth<4KiB after 300=%s after 900=%s cycles_collected=%s\n", $label, $mode,
+            var_export($growth[0] < 4096, true), var_export($growth[1] < 4096, true),
             in_array($label, ['cyclic_tree', 'self_ref_array'], true)
                 ? var_export($collected > 0, true) : 'n/a');
-        if ($growth >= 16384) echo "  growth=$growth bytes over 300 decodes\n";
+        if ($growth[1] >= 4096) echo "  growth=", implode('/', $growth), " bytes after 300/900 decodes\n";
     }
 }
 
@@ -80,13 +86,13 @@ unset($tree);
 var_dump(gc_collect_cycles() >= 81);
 ?>
 --EXPECT--
-wallet/unsigned: growth<16KiB=true cycles_collected=n/a
-wallet/signed: growth<16KiB=true cycles_collected=n/a
-eloquent_coll_30/unsigned: growth<16KiB=true cycles_collected=n/a
-eloquent_coll_30/signed: growth<16KiB=true cycles_collected=n/a
-cyclic_tree/unsigned: growth<16KiB=true cycles_collected=true
-cyclic_tree/signed: growth<16KiB=true cycles_collected=true
-self_ref_array/unsigned: growth<16KiB=true cycles_collected=true
-self_ref_array/signed: growth<16KiB=true cycles_collected=true
+wallet/unsigned: growth<4KiB after 300=true after 900=true cycles_collected=n/a
+wallet/signed: growth<4KiB after 300=true after 900=true cycles_collected=n/a
+eloquent_coll_30/unsigned: growth<4KiB after 300=true after 900=true cycles_collected=n/a
+eloquent_coll_30/signed: growth<4KiB after 300=true after 900=true cycles_collected=n/a
+cyclic_tree/unsigned: growth<4KiB after 300=true after 900=true cycles_collected=true
+cyclic_tree/signed: growth<4KiB after 300=true after 900=true cycles_collected=true
+self_ref_array/unsigned: growth<4KiB after 300=true after 900=true cycles_collected=true
+self_ref_array/signed: growth<4KiB after 300=true after 900=true cycles_collected=true
 bool(true)
 bool(true)
