@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   4 KB page.
 - Wrapped payloads such as `['data' => $rows, 'ttl' => 60]` encode 5-9% faster:
   the intern cache is now sized from the wrapper's children.
+- Small values decode 3-16% faster: the first eight back-reference ids live on
+  the stack, and a payload without strings allocates no dictionary. Shuffled
+  integer arrays (`packed_rand_10k`) decode 15% faster with the delta-run loop
+  moved out of line.
 
 ### Changed
 

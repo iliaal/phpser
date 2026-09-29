@@ -14,9 +14,9 @@ where decode time matters more than encode time or payload size.
 
 PHP cache workloads pay decode cost on every read and encode cost once per write. `igbinary` has been the default for over a decade, but it leaves performance on the table for common cache shapes: database rowsets, packed numeric arrays, deep-nested structures, and same-class DTO batches (Laravel queue payloads, cached models).
 
-phpser optimizes for decode. It uses pointer-equality dict interning with a bounded content fallback, reuses decoded zend_strings by refcount, pre-sizes hash tables, writes straight into packed zval storage, and emits tagged scalar runs. On the current ARM benchmark, phpser beats igbinary on encode and decode in all ten cases. Integer ranges collapse to constant-size affine runs and decode 91-92% faster, shuffled integer arrays decode 73% faster, deep nesting decodes 22% faster, and DTO batches decode 53-63% faster.
+phpser optimizes for decode. It uses pointer-equality dict interning with a bounded content fallback, reuses decoded zend_strings by refcount, pre-sizes hash tables, writes straight into packed zval storage, and emits tagged scalar runs. On the current ARM benchmark, phpser beats igbinary on encode and decode in all ten cases. Integer ranges collapse to constant-size affine runs and decode 91-92% faster, shuffled integer arrays decode 78% faster, deep nesting decodes 26% faster, and DTO batches decode 62-65% faster.
 
-Rowsets keep the pointer-equality fast path for shared strings, while columnar encoding also deduplicates low-cardinality strings and equal packed-string vectors by content. In `rowset_distinct_1000`, where equal repeated strings have separate allocations, phpser is 56% smaller, 63% faster to encode, and 51% faster to decode than igbinary.
+Rowsets keep the pointer-equality fast path for shared strings, while columnar encoding also deduplicates low-cardinality strings and equal packed-string vectors by content. In `rowset_distinct_1000`, where equal repeated strings have separate allocations, phpser is 56% smaller, 63% faster to encode, and 53% faster to decode than igbinary.
 
 📖 Design writeup: [phpser: a fast, secure binary serializer for PHP cache workloads](https://ilia.ws/blog/phpser-a-fast-secure-binary-serializer-for-php-cache-workloads) covers what the decoder does differently and why decode time is the metric to optimize. The [interactive benchmark page](https://iliaal.github.io/phpser/) compares phpser against igbinary, native `serialize()`, and msgpack across every cache shape.
 
@@ -116,40 +116,48 @@ model.
 - **Untrusted input limits**: both unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (returns `null`). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled keys run against a bounded collision budget, so a payload built around Zend's stable string hash cannot make an array, property table, or rowset schema quadratic to decode; exhausting the budget rejects the payload.
 - **Supported versions**: PHP 8.2+ (8.3, 8.4, 8.5, master). BSD 3-Clause.
 
-## Bench (PHP 8.4.23 aarch64, idle box, 1000 iters, median of 35)
+## Bench (PHP 8.4.25 aarch64, idle box, 1000 iters, median of 35)
 
 | Shape | Size: ig → ps | Encode: ig → ps | Decode: ig → ps |
 |---|---|---|---|
-| rowset_100 | 4570 → **2592** (**-43%**) | 18.1k → **10.8k** ns (**-41%**) | 21.2k → **12.6k** ns (**-41%**) |
-| rowset_1000 | 47K → **26K** (**-45%**) | 257.2k → **107.7k** ns (**-58%**) | 217.7k → **152.1k** ns (**-30%**) |
-| rowset_distinct_1000 | 59K → **26K** (**-56%**) | 329.9k → **121.2k** ns (**-63%**) | 301.1k → **148.9k** ns (**-51%**) |
-| packed_1k | 5495 → **7** (**-99.9%**) | 9.7k → **1.5k** ns (**-84%**) | 15.8k → **1.4k** ns (**-91%**) |
-| packed_10k | 59K → **7** (**-99.9%**) | 93.5k → **14.5k** ns (**-84%**) | 154.0k → **12.6k** ns (**-92%**) |
-| packed_rand_10k | 78K → **30K** (**-62%**) | 105.1k → **74.3k** ns (**-29%**) | 174.5k → **47.0k** ns (**-73%**) |
-| deep_50 | **419** → 424 (**+1%**) | 2.8k → **1.9k** ns (**-32%**) | 3.5k → **2.7k** ns (**-22%**) |
-| dto_100 | 7083 → **5506** (**-22%**) | 28.2k → **24.8k** ns (**-12%**) | 56.1k → **26.5k** ns (**-53%**) |
-| dto_1000 | 73K → **57K** (**-23%**) | 313.1k → **273.4k** ns (**-13%**) | 596.4k → **267.6k** ns (**-55%**) |
-| dto_mixed | 22K → **14K** (**-34%**) | 108.0k → **85.7k** ns (**-21%**) | 236.8k → **88.7k** ns (**-63%**) |
+| rowset_100 | 4570 → **2287** (**-50%**) | 18.2k → **9.9k** ns (**-45%**) | 21.9k → **9.3k** ns (**-57%**) |
+| rowset_1000 | 47K → **23K** (**-52%**) | 256.5k → **100.1k** ns (**-61%**) | 219.7k → **102.2k** ns (**-53%**) |
+| rowset_distinct_1000 | 59K → **26K** (**-56%**) | 328.5k → **120.6k** ns (**-63%**) | 310.2k → **147.1k** ns (**-53%**) |
+| packed_1k | 5495 → **7** (**-99.9%**) | 9.6k → **1.5k** ns (**-84%**) | 16.2k → **1.4k** ns (**-91%**) |
+| packed_10k | 59K → **7** (**-99.9%**) | 93.1k → **14.3k** ns (**-85%**) | 161.4k → **12.6k** ns (**-92%**) |
+| packed_rand_10k | 78K → **30K** (**-62%**) | 104.4k → **71.0k** ns (**-32%**) | 182.6k → **39.6k** ns (**-78%**) |
+| deep_50 | **419** → 425 (**+1%**) | 2.7k → **1.9k** ns (**-29%**) | 3.6k → **2.7k** ns (**-26%**) |
+| dto_100 | 7083 → **5186** (**-27%**) | 28.1k → **22.6k** ns (**-20%**) | 55.8k → **21.5k** ns (**-62%**) |
+| dto_1000 | 73K → **54K** (**-27%**) | 314.7k → **256.4k** ns (**-19%**) | 620.7k → **215.1k** ns (**-65%**) |
+| dto_mixed | 22K → **14K** (**-34%**) | 109.2k → **86.8k** ns (**-20%**) | 231.6k → **82.3k** ns (**-64%**) |
 
-phpser encodes 12-84% faster and decodes 22-92% faster than igbinary across
+phpser encodes 19-85% faster and decodes 26-92% faster than igbinary across
 all ten cases. Integer ranges collapse to a 7-byte affine run and decode
-91-92% faster; shuffled integers (`packed_rand_10k`) are 62% smaller, 29%
-faster to encode, and 73% faster to decode. Deep nesting is 32% faster to
-encode and 22% faster to decode with a five-byte size difference.
+91-92% faster; shuffled integers (`packed_rand_10k`) are 62% smaller, 32%
+faster to encode, and 78% faster to decode. Deep nesting is 29% faster to
+encode and 26% faster to decode with a six-byte size difference.
 
 The table's `rowset_100` and `rowset_1000` reuse PHP literal strings, so the
-pointer-equality intern path remains the cheapest case. Columnar `TAG_TABLE`
-also performs a bounded content-cardinality scan for separately allocated
-strings and equal packed-string vectors. That makes `rowset_distinct_1000`
-the same 25,993-byte payload as `rowset_1000`; against igbinary it is **56%
-smaller, 63% faster to encode, and 51% faster to decode**.
+pointer-equality intern path remains the cheapest case, and every row shares
+one literal `tags` array, which phpser encodes once and shares by refcount on
+decode. Columnar `TAG_TABLE` also performs a bounded content-cardinality scan
+for separately allocated strings and equal packed-string vectors, so
+`rowset_distinct_1000` (distinct string and `tags` allocations on every row)
+is **56% smaller, 63% faster to encode, and 53% faster to decode** than
+igbinary.
 
 DTO workloads (Laravel-queue-style payloads, single-class arrays) are
-**22-34% smaller, 53-63% faster to decode, 12-21% faster to encode** than
+**27-34% smaller, 62-65% faster to decode, 19-20% faster to encode** than
 igbinary. Wire-v2 `TAG_OBJECT_SLOTS` drops the per-property key indices and
 installs declared values straight into property slots; the dict dedups prop
 names once, and the class-entry lookup cache amortizes `zend_lookup_class_ex`
 across same-typed batches.
+
+`bench.php --extended` adds single values, wrapped envelopes, signed payloads,
+collector-on retained decode, and Laravel-app shapes (Eloquent models whose
+`attributes` and `original` share one array, a document wallet, a queue job,
+a catalog, JWKS). Run it with `-d opcache.enable_cli=1` for the opcache
+configuration.
 
 Sizes are byte-identical on x86 (the wire format is architecture-neutral);
 the ns/op columns are from an idle aarch64 box, median of 35. For the full
@@ -177,6 +185,15 @@ Regenerate it with `php ... bench.php --html > docs/index.html`.
   sequence exact with no overflow checks.
 - **Refcount reuse of zend_strings on decode**: a per-decode cache parallels
   the dict. The first reference allocates; later ones `addref`.
+- **Shared arrays stay shared**: a nested array held in several places (a
+  literal list on every row, an Eloquent model's `attributes` and `original`)
+  is encoded once and decoded as one refcounted table, so decoded memory
+  matches the source instead of multiplying.
+- **GC-quiet decode**: a clean decode adds one garbage-collector root for the
+  result instead of one per decoded object, so large object graphs don't
+  trigger collector runs while the application holds them.
+- **Hardware HMAC**: signed payloads use ARMv8 Crypto Extensions or SHA-NI
+  when available and cache the per-key HMAC state.
 - **HT_IS_PACKED flag check**: layout comes from the flag, without
   scanning buckets.
 - **`arPacked` stride awareness**: PHP 8+ packed arrays store zvals
