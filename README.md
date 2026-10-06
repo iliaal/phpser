@@ -304,8 +304,9 @@ as a `session.serialize_handler` when available.
   workloads typically nest 5-10 deep.
 - **Closures and resources encode as `NULL`.** This differs from
   native `serialize()` by design: PHP throws when serializing a `Closure` and
-  serializes a resource as its numeric resource id. phpser treats both as
-  unsupported cache values and writes `NULL`.
+  does not support preserving resources. Neither serializer can restore an
+  open stream or other resource handle. phpser treats both as unsupported
+  cache values and writes `NULL`.
 - **Unknown classes at decode become `__PHP_Incomplete_Class`** with the
   original name preserved, matching PHP native `unserialize()`. This holds
   for plain objects and `__serialize`-based objects, and for any shape whose
