@@ -302,10 +302,12 @@ as a `session.serialize_handler` when available.
   shipping a truncated payload. Object cycles go through the id table and
   don't count against the cap; only genuinely deep trees hit it. Cache
   workloads typically nest 5-10 deep.
-- **Closures and resources encode as `NULL`.** This differs from
-  native `serialize()` by design: PHP throws when serializing a `Closure` and
-  does not support preserving resources. Neither serializer can restore an
-  open stream or other resource handle. phpser treats both as unsupported
+- **Closures, other non-serializable objects, and resources encode as
+  `NULL`.** Native `serialize()` throws for `Closure`, `Generator`, `Fiber`,
+  and other classes marked not serializable, and writes every resource as
+  `i:0;`, so native `unserialize()` returns `int(0)` where phpser returns
+  `NULL`. Neither serializer stores the resource id or can restore an open
+  stream or other resource handle. phpser treats all of these as unsupported
   cache values and writes `NULL`.
 - **Unknown classes at decode become `__PHP_Incomplete_Class`** with the
   original name preserved, matching PHP native `unserialize()`. This holds
