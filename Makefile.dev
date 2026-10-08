@@ -24,6 +24,7 @@ LDFLAGS := -shared
 
 SRCS := phpser.c phpser_hmac.c phpser_sha256.c phpser_session.c phpser_module.c
 OBJS := $(SRCS:.c=.o)
+DEPS := $(OBJS:.o=.dep)
 
 $(TARGET): $(OBJS) | modules
 	$(CC) $(LDFLAGS) -o $@ $(OBJS)
@@ -32,10 +33,10 @@ modules:
 	mkdir -p modules
 
 %.o: %.c
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(CFLAGS) -MMD -MP -MF $(@:.o=.dep) -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(DEPS) $(TARGET)
 	rm -rf modules
 	rm -rf tests/*.diff tests/*.out tests/*.exp tests/*.log tests/*.sh
 
@@ -49,3 +50,6 @@ test: $(TARGET)
 	  $(PHP_SRC)/run-tests.php \
 	  -P -q --show-diff \
 	  $(CURDIR)/tests
+
+# Keep this after the first target so included object rules cannot change it.
+-include $(DEPS)

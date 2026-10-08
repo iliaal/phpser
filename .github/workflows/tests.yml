@@ -172,8 +172,18 @@ jobs:
       - name: Check in-tree developer build
         run: |
           make -f Makefile.dev PHP_SRC=/tmp/php-src -j"$(nproc)"
+          # An unchanged tree is up to date, but shared-header edits must rebuild.
+          make -f Makefile.dev PHP_SRC=/tmp/php-src -q
+          sleep 1
+          touch phpser_int.h
+          status=0
+          make -f Makefile.dev PHP_SRC=/tmp/php-src -q || status=$?
+          test "$status" -eq 1
+          make -f Makefile.dev PHP_SRC=/tmp/php-src -j"$(nproc)"
+          make -f Makefile.dev PHP_SRC=/tmp/php-src -q
           NO_INTERACTION=1 make -f Makefile.dev PHP_SRC=/tmp/php-src test
           make -f Makefile.dev clean
+          test -z "$(find . -maxdepth 1 -name '*.dep' -print)"
 
       - name: Build extension
         run: |
