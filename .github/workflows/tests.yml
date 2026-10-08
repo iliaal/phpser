@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # master
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: '8.4'
           tools: composer
@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # master
+      - uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: '8.4'
           tools: phpize, php-config
@@ -72,7 +72,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup PHP
-        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # master
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: ${{ matrix.php }}
           tools: phpize, php-config
@@ -110,7 +110,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup PHP
-        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # master
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: ${{ matrix.php }}
           tools: phpize, php-config
@@ -169,6 +169,12 @@ jobs:
           make -j"$(nproc)"
           make install
 
+      - name: Check in-tree developer build
+        run: |
+          make -f Makefile.dev PHP_SRC=/tmp/php-src -j"$(nproc)"
+          NO_INTERACTION=1 make -f Makefile.dev PHP_SRC=/tmp/php-src test
+          make -f Makefile.dev clean
+
       - name: Build extension
         run: |
           export PATH="/tmp/php-release/bin:$PATH"
@@ -200,7 +206,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup PHP (ZTS)
-        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # master
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         env:
           PHPTS: zts
         with:
@@ -235,7 +241,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup PHP
-        uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240 # master
+        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: ${{ matrix.php }}
           tools: phpize, php-config
