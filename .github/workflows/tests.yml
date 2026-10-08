@@ -169,6 +169,12 @@ jobs:
           make -j"$(nproc)"
           make install
 
+      - name: Check in-tree developer build
+        run: |
+          make -f Makefile.dev PHP_SRC=/tmp/php-src -j"$(nproc)"
+          NO_INTERACTION=1 make -f Makefile.dev PHP_SRC=/tmp/php-src test
+          make -f Makefile.dev clean
+
       - name: Build extension
         run: |
           export PATH="/tmp/php-release/bin:$PATH"
