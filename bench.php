@@ -9,7 +9,7 @@
 // HTML page (writes a self-contained doc to stdout):
 //   php ... bench.php --html > docs/index.html
 //
-// Knobs (env): BENCH_ITERS (inner loop, default 1000),
+// Knobs (env): BENCH_ITERS (inner loop, default 1000, minimum 1),
 //              BENCH_REPS  (timed repetitions, median+IQR reported, default 35),
 //              BENCH_WARMUP (untimed warmup iters per op, default 100, 0 disables).
 //
@@ -613,7 +613,8 @@ if (!isset($SERIALIZERS['phpser'])) {
     exit(1);
 }
 $REFERENCE = isset($SERIALIZERS['igbinary']) ? 'igbinary' : 'phpser';
-$ITERS = (int) (getenv('BENCH_ITERS') ?: 1000);
+// Empty/zero values retain the default; other invalid counts still time a call.
+$ITERS = max(1, (int) (getenv('BENCH_ITERS') ?: 1000));
 $REPS  = max(1, (int) (getenv('BENCH_REPS') ?: 35));
 $warmup_env = getenv('BENCH_WARMUP');
 // The string "0" is an explicit opt-out, not a missing environment value.
