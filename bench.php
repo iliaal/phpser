@@ -615,7 +615,9 @@ if (!isset($SERIALIZERS['phpser'])) {
 $REFERENCE = isset($SERIALIZERS['igbinary']) ? 'igbinary' : 'phpser';
 $ITERS = (int) (getenv('BENCH_ITERS') ?: 1000);
 $REPS  = max(1, (int) (getenv('BENCH_REPS') ?: 35));
-$WARMUP_ITERS = max(0, (int) (getenv('BENCH_WARMUP') ?: 100));
+$warmup_env = getenv('BENCH_WARMUP');
+// The string "0" is an explicit opt-out, not a missing environment value.
+$WARMUP_ITERS = max(0, (int) (($warmup_env === false || $warmup_env === '') ? 100 : $warmup_env));
 $FORMAT = match (true) {
     in_array('--html', $argv, true),
     in_array('--format=html', $argv, true) => 'html',
