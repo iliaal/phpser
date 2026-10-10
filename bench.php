@@ -859,7 +859,16 @@ function run_isolated(callable $fn): array {
         }
         exit(0);
     }
-    pcntl_waitpid($pid, $status);
+    // A handled signal can interrupt waitpid before the child writes its result.
+    // Keep waiting for this child rather than reading/unlinking its file early.
+    do {
+        $waited = pcntl_waitpid($pid, $status);
+    } while ($waited === -1 && pcntl_get_last_error() === PCNTL_EINTR);
+    if ($waited === -1) {
+        $error = pcntl_strerror(pcntl_get_last_error());
+        unlink($path);
+        throw new RuntimeException('pcntl_waitpid failed: ' . $error);
+    }
     $raw = file_get_contents($path);
     unlink($path);
     $res = $raw === '' || $raw === false ? false : unserialize($raw);
