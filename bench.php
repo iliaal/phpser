@@ -742,26 +742,41 @@ function bench_matrix(array $cases, array $serializers, int|array $iters, int $r
 
         // Untimed warmup so cold caches / first-call paths don't pollute rep 0.
         if ($warmup > 0) {
-            foreach ($prepared as [$enc, $dec, $blob, $data]) {
-                time_op_sample($enc, $data, $warmup);
-                time_op_sample($dec, $blob, $warmup);
+            foreach ($prepared as $name => [$enc, $dec, $blob, $data]) {
+                try {
+                    time_op_sample($enc, $data, $warmup);
+                    time_op_sample($dec, $blob, $warmup);
+                } catch (\Throwable $e) {
+                    $results[$label][$name] = ['err' => $e->getMessage()];
+                }
             }
         }
         for ($rep = 0; $rep < $reps; $rep++) {
             $order = serializer_order($names, $rep);
             foreach ($order as $name) {
+                if (isset($results[$label][$name]['err'])) continue;
                 [$enc, , $blob, $data] = $prepared[$name];
-                $results[$label][$name]['enc_samples'][] =
-                    time_op_sample($enc, $data, $n);
+                try {
+                    $results[$label][$name]['enc_samples'][] =
+                        time_op_sample($enc, $data, $n);
+                } catch (\Throwable $e) {
+                    $results[$label][$name] = ['err' => $e->getMessage()];
+                }
             }
             foreach (array_reverse($order) as $name) {
+                if (isset($results[$label][$name]['err'])) continue;
                 [, $dec, $blob] = $prepared[$name];
-                $results[$label][$name]['dec_samples'][] =
-                    time_op_sample($dec, $blob, $n);
+                try {
+                    $results[$label][$name]['dec_samples'][] =
+                        time_op_sample($dec, $blob, $n);
+                } catch (\Throwable $e) {
+                    $results[$label][$name] = ['err' => $e->getMessage()];
+                }
             }
         }
 
         foreach ($names as $name) {
+            if (isset($results[$label][$name]['err'])) continue;
             $results[$label][$name]['enc'] = median(
                 $results[$label][$name]['enc_samples']);
             $results[$label][$name]['dec'] = median(
