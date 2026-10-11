@@ -4,7 +4,7 @@
 // Run the SAME script alternately against baseline.so and candidate.so:
 //   php -d extension=baseline.so  ab.php
 //   php -d extension=candidate.so ab.php
-// Knobs: BENCH_ITERS (default 1000), BENCH_REPS (default 15).
+// Knobs: BENCH_ITERS (default 1000, minimum 1), BENCH_REPS (default 15).
 //   BENCH_MODE=plain   (default) phpser_serialize / phpser_unserialize
 //   BENCH_MODE=signed  phpser_serialize_signed / phpser_unserialize_signed
 //   BENCH_MODE=gc      decode BENCH_GC_KEEP (default 200) copies kept alive
@@ -380,7 +380,7 @@ function mk_wallet(int $groups = 10, int $recordsPerGroup = 4, int $docsPerRecor
     return $out;
 }
 
-$ITERS = (int)(getenv('BENCH_ITERS') ?: 1000);
+$ITERS = max(1, (int)(getenv('BENCH_ITERS') ?: 1000));
 $REPS  = max(1, (int)(getenv('BENCH_REPS') ?: 15));
 $MODE  = getenv('BENCH_MODE') ?: 'plain';
 $KEY   = str_repeat("\x5a", 32);
