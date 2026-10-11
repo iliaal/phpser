@@ -918,8 +918,13 @@ function bench_gc_retained(array $cases, array $serializers, int $keep_cap, int 
                 if (isset($results[$label][$name]['err'])) continue;
                 $dec = $serializers[$name][1];
                 foreach (['gc_on' => true, 'gc_off' => false] as $mode => $on) {
-                    $sample = run_isolated(
-                        fn() => gc_retained_sample($dec, $blobs[$name], $keep, $on));
+                    try {
+                        $sample = run_isolated(
+                            fn() => gc_retained_sample($dec, $blobs[$name], $keep, $on));
+                    } catch (\Throwable $e) {
+                        // A child can exit before returning a serialized error.
+                        $sample = ['err' => $e->getMessage()];
+                    }
                     if (isset($sample['err'])) {
                         $results[$label][$name] = ['err' => $sample['err']];
                         continue 2;

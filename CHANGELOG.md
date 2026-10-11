@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Forked GC benchmark samples that exit without a result now mark only their serializer cell as unavailable instead of aborting the extended report.
 - Lazy ghosts and proxies with `__sleep` encoded their uninitialized properties; they now initialize first, as `serialize()` does.
 - `__sleep` names that `serialize()` omits (parent-private, static, virtual, missing, repeated) are omitted with the same warnings.
 
