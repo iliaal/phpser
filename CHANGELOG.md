@@ -7,10 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-10-11
+
+### Security
+
+- Legacy SPL handlers inherit the decoder's class allowlist and nesting limit; native serialization contexts are restored after exceptions and fatal errors.
+- Failed or skipped wakeup hooks suppress object destructors, and failed reference decoding leaves valid cleanup state. Nested reference wrappers are rejected before construction.
+- Empty associative arrays reuse immutable storage. TABLE/ROWSET rows and fallback object-property copies share a bounded allocation allowance; large encoder inputs fall back to ordinary array tags.
+- Long-key comparisons and bucket walks consume a cumulative work budget. Encoder dictionary collisions disable content deduplication while preserving pointer reuse and round-trips.
+- Re-encoding shared arrays behind object references no longer expands their logical tree repeatedly; object identity and property-reference aliases are preserved.
+- SECURITY.md distinguishes allocation and key-work limits from uncached class resolution, application hooks, and recursive walks of decoded graphs.
+
 ### Performance
 
 - Plain objects (no `__sleep`, `__serialize`, or `__unserialize`) keep the positional `TAG_OBJECT_SLOTS` form after `get_object_vars()`, `foreach`, or `var_dump()` builds their property table.
-- On bench.php's Eloquent-like fixtures that is 36% smaller with 45% faster encode and decode, 30 models decode 44% faster, and the wallet decodes 34% faster but encodes 4% slower (aarch64).
 
 ### Changed
 
@@ -20,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Lazy ghosts and proxies with `__sleep` encoded their uninitialized properties; they now initialize first, as `serialize()` does.
 - `__sleep` names that `serialize()` omits (parent-private, static, virtual, missing, repeated) are omitted with the same warnings.
+- Autoloader exceptions abort decoding immediately; enum constant-evaluation failures propagate without dereferencing an invalid case.
+- Legacy and magic object tags enforce class serialization restrictions. Unmangled declared properties resolve to their slots, and virtual properties cannot be shadowed by wire data.
+- Numeric keys passed to `__unserialize` follow native array semantics. Arrays from internal classes with numeric string keys use ordinary array tags, and integer keys sharing hash buckets round-trip within the work budget.
+- Decode pin cleanup retains its fallback in release builds.
+- Resource compatibility guidance distinguishes native `int(0)` from phpser's `null`; neither restores the original resource handle.
+
+### For contributors
+
+- `Makefile.dev` supports in-tree PHP builds and tracks header dependencies without conflicting with phpize's generated Makefile.
+- Benchmarks honor zero warmup iterations, clamp sample iterations to at least one, retry interrupted child waits, and keep failed samples local to their serializer cell.
 
 ## [0.7.0] - 2026-09-29
 
@@ -341,7 +361,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.7.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.7.1...HEAD
+[0.7.1]: https://github.com/iliaal/phpser/releases/tag/0.7.1
 [0.7.0]: https://github.com/iliaal/phpser/releases/tag/0.7.0
 [0.6.2]: https://github.com/iliaal/phpser/releases/tag/0.6.2
 [0.6.1]: https://github.com/iliaal/phpser/releases/tag/0.6.1

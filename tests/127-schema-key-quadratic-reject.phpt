@@ -8,10 +8,10 @@ with no hash function and no MAX_HASH_CHAIN_LENGTH budget. Because the
 destination table is pre-sized to next_pow2(n) and never resizes, crafted keys
 T, 2T, ..., nT all collapse into one slot: Theta(n^2) bucket walks from a
 bounded-size frame, the quadratic-blowup class the security policy excludes.
-No honest frame produces such keys (a real string-keyed bucket is never a
-canonical numeric string, and array keys are unique), so dec_read_schema_keys
-REJECTS numeric or duplicate schema keys at schema-parse time, before any cell
-decode.
+The encoder excludes canonical numeric strings from schema paths, including
+string-key buckets supplied by internal classes, and array keys are unique.
+dec_read_schema_keys rejects numeric or duplicate schema keys at schema-parse
+time, before any cell decode.
 --EXTENSIONS--
 phpser
 --FILE--

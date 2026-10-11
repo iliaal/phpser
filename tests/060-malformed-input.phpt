@@ -32,6 +32,10 @@ $malformed_static = [
     "\x01\x00\x0c\x05",                  // TAG_STR_INLINE len=5, no bytes
     "\x01\x00\x06\x01\x01\x63",          // TAG_ASSOC KEY_STR dict_idx=99 (dict empty)
     "\x01\x01\x08stdClass\x0e\x00\x03\x02", // TAG_OBJECT_MAGIC with scalar inner value
+    "\x02\x00\x07\x02\x18\x06\x00\xff", // shared immutable empty array, invalid sibling
+    "\x02\x00\x07\x02\x18\x06\x00\x10\x01", // shared empty array claims only id 0
+    "\x02\x00\x11\x11\x03\x02",          // nested NEW_REF must reject before publishing an inner wrapper
+    "\x02\x00\x11\x10\x00",              // NEW_REF cannot wrap itself
 ];
 
 $malformed_fail = 0;
@@ -124,6 +128,7 @@ $crafted = [
     // TAG_OBJECT naming a legacy Serializable class with no __unserialize:
     // native unserialize refuses this (raw props would bypass unserialize()).
     "object_serializable"  => "\x01\x01\x09LegacySer\x0a\x00\x00",
+    "failed_ref_object"    => "\x01\x02\x08stdClass\x01x\x11\x0a\x00\x02\x01\x10\x00\x63\x00",
 ];
 foreach ($crafted as $name => $bytes) {
     $rt = phpser_unserialize($bytes);
@@ -417,16 +422,18 @@ if (!is_array($obj_ref) || $obj_ref[1][0] !== $obj_ref[0]
     echo "shared_array legal backrefs FAIL\n";
     $sa_fail++;
 }
-// The encoder side of the same rule: a reference behind an object property
-// inside a pointer-shared array keeps the array by value, so the frame
-// carries no TAG_SHARED_ARRAY and decodes with the aliasing intact.
+// The first walk reaches an object property reference and stays by value.
+// A later walk may share the array using the already-registered object;
+// object identity and the property's reference alias must survive both.
 $o = new stdClass;
 $shared_x = 1;
 $o->p = &$shared_x;
+$o->q = &$shared_x;
 $held = [$o, 'k'];
 $frame = phpser_serialize([$held, $held]);
 $back = phpser_unserialize($frame);
-if (strpos($frame, "\x18") !== false || $back[0][0] !== $back[1][0]) {
+$back[0][0]->p = 7;
+if ($back[0][0] !== $back[1][0] || $back[1][0]->q !== 7) {
     echo "shared_array object reference FAIL\n";
     $sa_fail++;
 }
@@ -437,6 +444,25 @@ if (phpser_unserialize("\x02\x00\x07\x02\x18\x07\x00\x10\x00") !== [[], []]) {
     $sa_fail++;
 }
 echo $sa_fail ? "shared_array FAIL $sa_fail\n" : "shared_array OK\n";
+
+class NumericDataCanary {
+    public array $data;
+    public function __unserialize(array $data): void { $this->data = $data; }
+}
+$numeric_data = "\x02\x02\x11NumericDataCanary\x010"
+    . "\x0a\x00\x02\x01\x18\x07\x00\x01\x03\x02";
+$decoded = phpser_unserialize($numeric_data);
+echo $decoded instanceof NumericDataCanary && $decoded->data === [1]
+    ? "numeric_hook_overwrite OK\n" : "numeric_hook_overwrite FAIL\n";
+
+if (PHP_VERSION_ID >= 80400) {
+    eval('class VirtualPropertyCanary { public $v { get => 1; } }');
+    $virtual_wire = "\x01\x02\x15VirtualPropertyCanary\x01v\x0a\x00\x01\x01\x00";
+    echo phpser_unserialize($virtual_wire) === null
+        ? "virtual_property OK\n" : "virtual_property FAIL\n";
+} else {
+    echo "virtual_property OK\n";
+}
 
 ?>
 --EXPECT--
@@ -467,3 +493,5 @@ signed_assoc_dict_dup OK
 invalid_class_name OK
 delta_affine OK
 shared_array OK
+numeric_hook_overwrite OK
+virtual_property OK

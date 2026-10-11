@@ -113,7 +113,7 @@ model.
 ## ✨ Features
 
 - **Signed payloads**: `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input before any decoding runs. Use it whenever the store crosses a trust boundary (memcached, redis, files, cookies), anywhere an attacker who can write to the store could feed your decoder a crafted payload. Both sides reject an empty key, since a keyless HMAC is forgeable.
-- **Untrusted input limits**: both unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (returns `null`). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled keys run against a bounded collision budget, so a payload built around Zend's stable string hash cannot make an array, property table, or rowset schema quadratic to decode; exhausting the budget rejects the payload.
+- **Untrusted input limits**: both unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (returns `null`). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled key comparisons and collision chains consume bounded work budgets. TABLE/ROWSET rows and fallback object-property copies have a separate materialization budget. Exhausting a budget rejects the frame; these limits do not bound autoloaders or application hooks. See [SECURITY.md](SECURITY.md) for exact limits and class-resolution costs.
 - **Supported versions**: PHP 8.2+ (8.3, 8.4, 8.5, master). BSD 3-Clause.
 
 ## Bench (PHP 8.4.25 aarch64, idle box, 1000 iters, median of 35)
@@ -185,10 +185,11 @@ Regenerate it with `php ... bench.php --html > docs/index.html`.
   sequence exact with no overflow checks.
 - **Refcount reuse of zend_strings on decode**: a per-decode cache parallels
   the dict. The first reference allocates; later ones `addref`.
-- **Shared arrays stay shared**: a nested array held in several places (a
-  literal list on every row, an Eloquent model's `attributes` and `original`)
-  is encoded once and decoded as one refcounted table, so decoded memory
-  matches the source instead of multiplying.
+- **Eligible shared arrays stay shared**: a nested array held in several
+  places (a literal list on every row, an Eloquent model's `attributes` and
+  `original`) can reuse one encoded and decoded table. Sharing requires a
+  traversal without PHP references; the wire-format section describes
+  eligibility and retries after objects acquire identities.
 - **GC-quiet decode**: a clean decode adds one garbage-collector root for the
   result instead of one per decoded object, so large object graphs don't
   trigger collector runs while the application holds them.
@@ -456,12 +457,15 @@ The encoder emits SHARED_ARRAY only for a non-empty nested array that is
 pointer-shared (refcount above one, not counting the encoder's own
 snapshots, or immutable) and whose walk reached no PHP reference; a later
 visit of the same `HashTable` emits REF. The top-level value never claims.
-An array holding a reference stays by-value on every visit: COW separation
+An array directly holding a reference stays by-value on every visit: COW separation
 keeps a reference in each copy, and one shared decoded array would lose the
 aliasing a later write through either copy depends on. The decoder enforces
-the same rule and rejects a SHARED_ARRAY whose contents create or reuse a
-reference (NEW_REF, or a REF to a reference), including through an object
-property. Arrays are pinned exactly like tracked objects, so a freed
+the same traversal rule and rejects a SHARED_ARRAY whose contents create or
+reuse a reference (NEW_REF, or a REF to a reference). An existing object's
+back-reference does not traverse its properties, which may hold references.
+The encoder retries arrays that were initially unshareable once their objects
+have registered identities, avoiding repeated expansion through those objects.
+Arrays are pinned exactly like tracked objects, so a freed
 table's reused address cannot masquerade as a back-reference. Pins activate
 at the first hook. Before that, the encoder releases its private copies of
 shared arrays and property tails without the possible-root check, so a full

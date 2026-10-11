@@ -40,26 +40,36 @@ can come back to life on a later permissive read of the same bytes.
 Never re-encode an `__PHP_Incomplete_Class` into a store that a
 permissive reader trusts.
 
-Wire-controlled HashTable keys are rejected when a collision chain exhausts
-the decoder's bounded work budget. Deterministic collisions in Zend's stable
-string hash cannot turn a bounded payload into quadratic decode CPU, and
-ordinary large arrays are not limited by a global element cap.
+Wire-controlled HashTable keys use separate limits for full-hash collisions,
+long bucket walks, and long string comparisons. The cumulative work allowance
+is 65,536 plus 64 times the payload length; exhausting it rejects the frame.
+Integer keys that merely share a bucket remain valid within that allowance.
+These checks bound key insertion and schema validation, not all decoder work;
+class resolution and application hooks have the limits described below.
 
 Sub-linear wire is budgeted. `TAG_PACKED_AFFINE` reconstructs an integer run
 from a constant number of wire bytes, so payload length alone no longer bounds
-decoded memory on that tag. Both sides enforce the same cumulative one-million
-element budget (~16 MB of packed values per decode): the encoder falls back to
+decoded memory on that tag. Both sides enforce the same cumulative 1,048,576
+element budget (16 MiB of packed values on 64-bit PHP): the encoder falls back to
 linear tags past it and the decoder rejects past it, so a legitimate encoder
-can never emit a frame the decoder refuses. The tag is also rejected as a
-table column, where the per-cell wire-byte bound is what limits row-table
-allocations.
+cannot exceed that affine-element limit. The tag is also rejected as a
+table column.
+
+TABLE/ROWSET row allocations and copies of `__serialize` data into object
+properties share a separate materialization allowance: 16 MiB plus 64 times
+the payload length. Copies occur when a decoded class has no `__unserialize`
+hook, including disallowed or unavailable classes. The charge estimates table
+capacity and generated property keys using conservative 64-bit sizes; it is
+not a bound on total process memory. The encoder falls back from TABLE when
+its row-allocation excess would exhaust the fixed allowance. Empty associative
+arrays reuse immutable storage instead of allocating a mixed table per tag.
 
 Shared arrays make the decoded value a DAG. `TAG_SHARED_ARRAY` lets a later
 `TAG_REF` reuse one decoded array by refcount, the way object and reference
-back-references already reuse one instance. Decoded memory stays linear in
-payload bytes: a back-reference costs at least two wire bytes and fills one
-zval slot the enclosing container already paid for, with a refcount
-increment and no allocation. The logical tree can still be exponentially
+back-references already reuse one instance. Reading an array back-reference
+itself does not copy the table, but later property materialization can copy
+its entries and is charged against the allowance above. The logical tree can
+still be exponentially
 larger than the payload: under 150 bytes describe an array whose recursive
 expansion has a million leaves. `TAG_NEW_REF`/`TAG_REF` on PHP references and
 shared objects (incomplete ones included) already allowed the same shape, so
@@ -68,21 +78,33 @@ that repeat one lookup array thousands of times. Code that recursively walks
 a decoded untrusted value without tracking identity (`json_encode()`,
 `var_export()`, `serialize()`, `array_walk_recursive()`,
 `count($v, COUNT_RECURSIVE)`, deep `==`) does work proportional to the
-logical size, so bound that work at the application layer. Re-encoding with
-phpser stays linear because the encoder emits each shared array once. That
-holds only for arrays free of PHP references, which the encoder never shares,
-so the decoder rejects a shared array whose contents create or reuse a
-reference, including one behind an object property. The decoder registers a
-shared array only after its contents decode, so no back-reference can reach
-an array that is still being built.
+logical size, so bound that work at the application layer. The encoder shares
+an array only when its traversal encounters no PHP reference. An array that
+was initially ineligible can become shareable on a later visit when its
+objects already have identities and encode as back-references; this prevents
+repeated expansion while preserving reference aliases in those objects.
+The decoder rejects a shared array whose contents create or reuse a PHP
+reference during decoding. A back-reference to an existing object does not
+traverse its properties, which may contain references. The decoder registers
+a shared array only after its contents decode, so no back-reference can reach
+an array that is still being built. Arrays containing direct PHP references
+remain by-value; application work on their logical expansion still needs
+its own limit.
 
 Class resolution is *not* memoized on a miss, so a payload naming an unknown
 class once per object triggers one autoloader invocation per object rather
 than one per payload. This matches native `unserialize()`, which also calls
-`zend_lookup_class` per object. phpser's own per-miss cost is lower than
-native's, but your autoloader bounds the total, not phpser. If
-you decode untrusted bytes through an expensive autoloader chain, prefer
-`allowed_classes` (an allowlist or `false` short-circuits before resolution).
+`zend_lookup_class` per object. Each lookup can scan and lowercase the class
+name even when no autoloader is registered. A long dictionary name reused
+by many object tags can therefore make class resolution quadratic in payload
+size; the key-comparison budgets do not bound that work or application
+autoloaders. Use `allowed_classes` to reject unknown names before resolution:
+an explicit allowlist or `false` short-circuits those lookups.
+
+Native decoding performed inside legacy SPL serialization handlers inherits
+the outer class allowlist and the remaining nesting limit. An allowlisted
+user-defined `Serializable::unserialize` method can still make its own
+unrestricted decode calls; that user code is outside the allowlist gate.
 
 **Signing key cache.** phpser caches HMAC key material per thread so a
 signed call skips two SHA-256 compressions. The cache holds the most recent
