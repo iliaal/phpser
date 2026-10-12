@@ -27,6 +27,8 @@ jobs:
           tools: composer
           coverage: none
       - run: composer validate --strict
+      - name: Check build failure handling
+        run: python3 .github/tests/test_build_steps.py
 
   # PIE 1.5+ install-path smoke test against a path repository pointing at
   # this checkout. Catches composer.json php-ext metadata drift, configure
@@ -81,7 +83,9 @@ jobs:
         run: |
           phpize
           ./configure --enable-phpser
-          WARNINGS=$(make -j$(nproc) 2>&1 | tee /dev/stderr | grep -c 'warning:' || true)
+          set -o pipefail
+          make -j$(nproc) 2>&1 | tee build.log
+          WARNINGS=$(grep -c 'warning:' build.log || true)
           if [ "$WARNINGS" -gt 0 ]; then
             echo "::error::Build produced $WARNINGS warning(s)"
             exit 1
@@ -119,7 +123,9 @@ jobs:
         run: |
           phpize
           ./configure --enable-phpser
-          WARNINGS=$(make -j$(nproc) 2>&1 | tee /dev/stderr | grep -c 'warning:' || true)
+          set -o pipefail
+          make -j$(nproc) 2>&1 | tee build.log
+          WARNINGS=$(grep -c 'warning:' build.log || true)
           if [ "$WARNINGS" -gt 0 ]; then
             echo "::error::Build produced $WARNINGS warning(s)"
             exit 1
@@ -190,7 +196,9 @@ jobs:
           export PATH="/tmp/php-release/bin:$PATH"
           phpize
           ./configure --enable-phpser --with-php-config=/tmp/php-release/bin/php-config
-          WARNINGS=$(make -j"$(nproc)" 2>&1 | tee /dev/stderr | grep -c 'warning:' || true)
+          set -o pipefail
+          make -j"$(nproc)" 2>&1 | tee build.log
+          WARNINGS=$(grep -c 'warning:' build.log || true)
           if [ "$WARNINGS" -gt 0 ]; then
             echo "::error::Build produced $WARNINGS warning(s)"
             exit 1
