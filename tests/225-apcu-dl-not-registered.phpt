@@ -27,7 +27,15 @@ echo "apcu: ", $m[1] ?? "missing", "\n";
 ob_start();
 (new ReflectionExtension("phpser"))->info();
 preg_match("/APCu serializer => (.*)/", ob_get_clean(), $m);
-echo "phpser: ", $m[1] ?? "missing", "\n";');
+echo "phpser: ", $m[1] ?? "missing", "\n";
+if (extension_loaded("session")) {
+    ob_start();
+    (new ReflectionExtension("phpser"))->info();
+    preg_match("/session.serialize_handler => (.*)/", ob_get_clean(), $m);
+    echo "session: ", $m[1] ?? "missing", "\n";
+} else {
+    echo "session: n/a\n";
+}');
 $base = escapeshellarg(getenv('TEST_PHP_EXECUTABLE') ?: PHP_BINARY) . ' -n -d ' . escapeshellarg("extension=$apcu")
     . ' -d apc.enable_cli=1 -d apc.serializer=phpser';
 echo "== dl\n", shell_exec("$base -d enable_dl=1 -d " . escapeshellarg('extension_dir=' . dirname($phpser)) . ' ' . escapeshellarg($script) . ' 2>&1');
@@ -43,7 +51,9 @@ foreach (glob("$dir/*") as $f) @unlink($f);
 == dl
 bool(true)
 apcu: php
-phpser: not registered (APCu not loaded at startup, disabled for this SAPI, or phpser loaded with dl())
+phpser: not registered (APCu not loaded at startup, disabled by apc.enabled or apc.enable_cli, its serializer table full, or phpser loaded with dl())
+%r(session: not registered \(session not loaded at startup, its serializer table full, or phpser loaded with dl\(\)\)|session: n\/a)%r
 == startup
 apcu: php, phpser
 phpser: registered, not yet used by APCu in this process
+%r(session: available|session: n\/a)%r

@@ -17,6 +17,7 @@
 
 #include "phpser_int.h"
 #include "php_phpser_api.h"
+#include "zend_atomic.h"
 
 #define PHPSER_KEYED_LABEL_PREFIX "phpser:"
 #define PHPSER_KEYED_LABEL_SUFFIX ":v1"
@@ -293,13 +294,21 @@ typedef int (*phpser_apc_register_t)(const char *name, phpser_apc_serialize_t se
 static bool phpser_apcu_registered = false;
 /* APCu binds its cache serializer by name in its own MINIT, when only its
  * built-in "php" serializer exists, so a startup apc.serializer of "php"
- * (also the default) is final. Any other name is bound later by APCu's
- * RINIT, in whichever process and request first runs with APCu enabled;
- * phpser does not predict that and reports only what it observes. */
+ * (also the default) is final. Any other name is bound at each process's
+ * first request with APCu enabled (a non-root FPM master running
+ * opcache.preload binds before forking, and workers inherit it); phpser does
+ * not predict that and reports only what it observes. */
 static bool phpser_apcu_bound_php_at_startup = false;
-/* Set the first time APCu calls either phpser callback in this process.
- * It only ever goes from false to true, so concurrent ZTS writers agree. */
-static bool phpser_apcu_used = false;
+/* Set the first time APCu calls either phpser callback, and inherited across
+ * fork. Atomic because ZTS requests store concurrently while MINFO reads; the
+ * load-first check keeps the hot path free of shared-line writes. */
+static zend_atomic_bool phpser_apcu_used;
+
+static zend_always_inline void phpser_apcu_mark_used(void) {
+    if (UNEXPECTED(!zend_atomic_bool_load_ex(&phpser_apcu_used))) {
+        zend_atomic_bool_store_ex(&phpser_apcu_used, true);
+    }
+}
 
 static zend_string *phpser_apcu_serializer_ini(void) {
     zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives),
@@ -312,7 +321,7 @@ static int phpser_apc_serialize(unsigned char **buf, size_t *buf_len,
                                 const zval *value, void *config) {
     zend_string *s;
     (void) config;
-    phpser_apcu_used = true;
+    phpser_apcu_mark_used();
     if (phpser_api_serialize(value, PHPSER_APCU_CONTEXT,
                              sizeof(PHPSER_APCU_CONTEXT) - 1, &s) != PHPSER_API_OK) {
         return 0;
@@ -328,7 +337,7 @@ static int phpser_apc_serialize(unsigned char **buf, size_t *buf_len,
 static int phpser_apc_unserialize(zval *value, unsigned char *buf, size_t buf_len,
                                   void *config) {
     (void) config;
-    phpser_apcu_used = true;
+    phpser_apcu_mark_used();
     return phpser_api_unserialize((const char *) buf, buf_len, PHPSER_APCU_CONTEXT,
                                   sizeof(PHPSER_APCU_CONTEXT) - 1, value) == PHPSER_API_OK;
 }
@@ -336,7 +345,7 @@ static int phpser_apc_unserialize(zval *value, unsigned char *buf, size_t buf_le
 void phpser_apcu_minit(bool persistent) {
     phpser_apcu_registered = false;
     phpser_apcu_bound_php_at_startup = false;
-    phpser_apcu_used = false;
+    zend_atomic_bool_store_ex(&phpser_apcu_used, false);
     /* APCu keeps registered serializers for the life of the process and has
      * no unregister call, so a dl() load, unmapped at request end, would
      * leave it calling unmapped code. */
@@ -359,15 +368,15 @@ void phpser_apcu_minit(bool persistent) {
 
 const char *phpser_apcu_status(void) {
     if (!phpser_apcu_registered) {
-        return "not registered (APCu not loaded at startup, disabled for this SAPI, "
-               "or phpser loaded with dl())";
+        return "not registered (APCu not loaded at startup, disabled by apc.enabled or "
+               "apc.enable_cli, its serializer table full, or phpser loaded with dl())";
     }
     if (phpser_apcu_bound_php_at_startup) {
         return "inactive (APCu bound the php serializer at startup; "
                "set apc.serializer=phpser in php.ini)";
     }
-    if (phpser_apcu_used) {
-        return "registered, used by APCu in this process";
+    if (zend_atomic_bool_load_ex(&phpser_apcu_used)) {
+        return "registered, used by APCu in this process or the parent it forked from";
     }
     return "registered, not yet used by APCu in this process";
 }

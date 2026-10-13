@@ -113,8 +113,8 @@ jobs:
           export TEST_PHP_EXECUTABLE=$(which php)
           export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
           php -r 'exit(extension_loaded("apcu") ? 0 : 1);'
-          php run-tests.php --show-diff tests/218-apcu-serializer.phpt tests/219-apcu-keyed.phpt tests/222-apcu-short-key.phpt | tee apcu-tests.log
-          grep -Eq 'Tests passed +: +3 ' apcu-tests.log
+          php run-tests.php --show-diff tests/218-apcu-serializer.phpt tests/219-apcu-keyed.phpt tests/222-apcu-short-key.phpt tests/224-apcu-minfo-status.phpt | tee apcu-tests.log
+          grep -Eq 'Tests passed +: +4 ' apcu-tests.log
 
   # aarch64 exercises the ARMv8 SHA-256 path; test 142 fails if it falls back.
   linux-arm:

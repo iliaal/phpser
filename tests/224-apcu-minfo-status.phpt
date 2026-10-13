@@ -50,6 +50,6 @@ foreach (glob("$dir/*") as $f) @unlink($f);
 --EXPECT--
 start: registered, not yet used by APCu in this process
 after_scalar: registered, not yet used by APCu in this process
-after_store: registered, used by APCu in this process
+after_store: registered, used by APCu in this process or the parent it forked from
 php_child: array(2) {   [0]=>   int(1)   [1]=>   int(2) } inactive (APCu bound the php serializer at startup; set apc.serializer=phpser in php.ini)
 DONE

@@ -328,6 +328,10 @@ PHP_INI_BEGIN()
     PHP_INI_ENTRY("phpser.key", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
 PHP_INI_END()
 
+#ifdef HAVE_PHP_SESSION
+static bool phpser_session_registered = false;
+#endif
+
 static PHP_MINIT_FUNCTION(phpser) {
 #if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
     /* Initialize TLS for shared ZTS builds. phpize defines COMPILE_DL_PHPSER;
@@ -340,12 +344,11 @@ static PHP_MINIT_FUNCTION(phpser) {
     /* ext/session's serializer table is process-lifetime with no unregister
      * call, so a dl() load would leave it pointing at unmapped code after the
      * request. Best-effort otherwise: skipped when session isn't loaded. */
-    if (type == MODULE_PERSISTENT) {
-        php_session_register_serializer(
-            PHP_PHPSER_EXTNAME,
-            PS_SERIALIZER_ENCODE_NAME(phpser),
-            PS_SERIALIZER_DECODE_NAME(phpser));
-    }
+    phpser_session_registered = type == MODULE_PERSISTENT
+        && php_session_register_serializer(
+               PHP_PHPSER_EXTNAME,
+               PS_SERIALIZER_ENCODE_NAME(phpser),
+               PS_SERIALIZER_DECODE_NAME(phpser)) == SUCCESS;
 #endif
     /* php_hash_fetch_ops does not retain the name; release it after lookup. */
     zend_string *algo = zend_string_init("sha256", sizeof("sha256") - 1, 0);
@@ -377,7 +380,10 @@ static PHP_MINFO_FUNCTION(phpser) {
     php_info_print_table_row(2, "phpser support", "enabled");
     php_info_print_table_row(2, "version", PHP_PHPSER_VERSION);
 #ifdef HAVE_PHP_SESSION
-    php_info_print_table_row(2, "session.serialize_handler", "available");
+    php_info_print_table_row(2, "session.serialize_handler", phpser_session_registered
+        ? "available"
+        : "not registered (session not loaded at startup, its serializer table full, "
+          "or phpser loaded with dl())");
     php_info_print_table_row(2, "session HMAC signing", phpser_session_signing_status());
 #else
     php_info_print_table_row(2, "session.serialize_handler", "disabled (compiled without session)");
