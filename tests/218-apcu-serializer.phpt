@@ -42,8 +42,9 @@ $values = [
     'empty' => [],
 ];
 foreach ($values as $name => $v) {
-    apcu_store($name, $v);
-    echo "$name: ", apcu_fetch($name) == $v ? "OK" : "FAIL", "\n";
+    $stored = apcu_store($name, $v);
+    $got = apcu_fetch($name, $ok);
+    echo "$name: ", $stored && $ok && $got == $v ? "OK" : "FAIL", "\n";
 }
 $id = apcu_fetch('identity');
 echo "identity_kept: ", $id[0] === $id[1] ? "OK" : "FAIL", "\n";
@@ -74,7 +75,7 @@ echo "DONE\n";
 ?>
 --EXPECT--
 apcu_lists_phpser: yes
-minfo_apcu: registered, active
+minfo_apcu: registered, not yet used by APCu in this process
 minfo_key: disabled
 packed: OK
 assoc: OK

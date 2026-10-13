@@ -72,7 +72,7 @@ echo "DONE\n";
 ?>
 --EXPECT--
 minfo_key: enabled
-minfo_apcu: registered, active
+minfo_apcu: registered, not yet used by APCu in this process
 bool(true)
 bool(true)
 cycle_kept: OK

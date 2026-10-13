@@ -77,13 +77,10 @@ void phpser_api_mshutdown(void);
 const char *phpser_key_signing_status(void);
 const char *phpser_apcu_status(void);
 
-/* Registers the "phpser" APCu serializer when APCu exposes its registration
- * hook. Call from MINIT, after APCu's MINIT. (phpser_api.c) */
-void phpser_apcu_register(void);
-
-/* Records the apc.serializer value of the first request in this process
- * lineage, the one APCu binds. Call from RINIT. (phpser_api.c) */
-void phpser_apcu_rinit(void);
+/* Resets the APCu status, then, for a persistent (not dl()) load, registers
+ * the "phpser" APCu serializer when APCu exposes its registration hook.
+ * Call from MINIT, after APCu's MINIT. (phpser_api.c) */
+void phpser_apcu_minit(bool persistent);
 
 /* Bound C-stack use on deeply nested input, including ASAN builds. */
 #define MAX_DEPTH 512

@@ -21,8 +21,12 @@
  * also declares ZEND_MOD_REQUIRED("phpser") in its module dependencies;
  * that orders MINIT among loaded modules and refuses to start without
  * phpser, but does not load phpser. This is the model igbinary uses for
- * phpredis and memcached. To reject an incompatible phpser at startup,
- * compare phpser_api_version() with PHPSER_API_VERSION in MINIT.
+ * phpredis and memcached. To reject an incompatible phpser at startup, first
+ * check in MINIT that zend_get_module_version("phpser") is 0.9.0 or later
+ * (php_version_compare()): phpser_api_version() and the functions below do
+ * not exist in earlier releases, and calling a missing symbol from a lazily
+ * bound consumer aborts the process. Only then compare phpser_api_version()
+ * with PHPSER_API_VERSION.
  *
  * On Windows, a consumer of a shared php_phpser.dll defines
  * COMPILE_DL_PHPSER before including this header (for dllimport) and links

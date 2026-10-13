@@ -42,7 +42,7 @@ foreach (glob("$dir/*") as $f) @unlink($f);
 ?>
 --EXPECT--
 bool(false)
-not registered (APCu not loaded at startup, or disabled for this SAPI)
+not registered (APCu not loaded at startup, disabled for this SAPI, or phpser loaded with dl())
 array(1) {
   ["k"]=>
   int(1)

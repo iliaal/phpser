@@ -292,15 +292,14 @@ typedef int (*phpser_apc_register_t)(const char *name, phpser_apc_serialize_t se
 
 static bool phpser_apcu_registered = false;
 /* APCu binds its cache serializer by name in its own MINIT, when only its
- * built-in "php" serializer exists, so a startup value of "php" is final.
- * Any other name resolves to nothing there and APCu's RINIT binds the
- * apc.serializer of the first request in the process. That request can run
- * in the FPM master (opcache.preload starts one before forking), in which
- * case every pool inherits the php.ini value whatever its own setting. These
- * process statics follow the same lineage: set once, inherited by fork. */
+ * built-in "php" serializer exists, so a startup apc.serializer of "php"
+ * (also the default) is final. Any other name is bound later by APCu's
+ * RINIT, in whichever process and request first runs with APCu enabled;
+ * phpser does not predict that and reports only what it observes. */
 static bool phpser_apcu_bound_php_at_startup = false;
-static bool phpser_apcu_first_request_seen = false;
-static bool phpser_apcu_first_request_phpser = false;
+/* Set the first time APCu calls either phpser callback in this process.
+ * It only ever goes from false to true, so concurrent ZTS writers agree. */
+static bool phpser_apcu_used = false;
 
 static zend_string *phpser_apcu_serializer_ini(void) {
     zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives),
@@ -313,6 +312,7 @@ static int phpser_apc_serialize(unsigned char **buf, size_t *buf_len,
                                 const zval *value, void *config) {
     zend_string *s;
     (void) config;
+    phpser_apcu_used = true;
     if (phpser_api_serialize(value, PHPSER_APCU_CONTEXT,
                              sizeof(PHPSER_APCU_CONTEXT) - 1, &s) != PHPSER_API_OK) {
         return 0;
@@ -328,11 +328,21 @@ static int phpser_apc_serialize(unsigned char **buf, size_t *buf_len,
 static int phpser_apc_unserialize(zval *value, unsigned char *buf, size_t buf_len,
                                   void *config) {
     (void) config;
+    phpser_apcu_used = true;
     return phpser_api_unserialize((const char *) buf, buf_len, PHPSER_APCU_CONTEXT,
                                   sizeof(PHPSER_APCU_CONTEXT) - 1, value) == PHPSER_API_OK;
 }
 
-void phpser_apcu_register(void) {
+void phpser_apcu_minit(bool persistent) {
+    phpser_apcu_registered = false;
+    phpser_apcu_bound_php_at_startup = false;
+    phpser_apcu_used = false;
+    /* APCu keeps registered serializers for the life of the process and has
+     * no unregister call, so a dl() load, unmapped at request end, would
+     * leave it calling unmapped code. */
+    if (!persistent) {
+        return;
+    }
     zend_string *name = zend_string_init(PHPSER_APC_SERIALIZER_CONSTANT,
                                          sizeof(PHPSER_APC_SERIALIZER_CONSTANT) - 1, 1);
     zval *hook = zend_get_constant(name);
@@ -347,32 +357,17 @@ void phpser_apcu_register(void) {
     phpser_apcu_bound_php_at_startup = startup && zend_string_equals_literal(startup, "php");
 }
 
-static bool phpser_apcu_serializer_is_phpser(void) {
-    zend_string *value = phpser_apcu_serializer_ini();
-    return value && zend_string_equals_literal(value, PHP_PHPSER_EXTNAME);
-}
-
-void phpser_apcu_rinit(void) {
-    if (EXPECTED(phpser_apcu_first_request_seen) || !phpser_apcu_registered) {
-        return;
-    }
-    phpser_apcu_first_request_seen = true;
-    phpser_apcu_first_request_phpser = phpser_apcu_serializer_is_phpser();
-}
-
 const char *phpser_apcu_status(void) {
     if (!phpser_apcu_registered) {
-        return "not registered (APCu not loaded at startup, or disabled for this SAPI)";
+        return "not registered (APCu not loaded at startup, disabled for this SAPI, "
+               "or phpser loaded with dl())";
     }
     if (phpser_apcu_bound_php_at_startup) {
-        return "registered, inactive (APCu bound the php serializer at startup; "
-               "set apc.serializer=phpser in the php.ini PHP starts with, not per FPM pool)";
+        return "inactive (APCu bound the php serializer at startup; "
+               "set apc.serializer=phpser in php.ini)";
     }
-    bool bound_phpser = phpser_apcu_first_request_seen
-        ? phpser_apcu_first_request_phpser : phpser_apcu_serializer_is_phpser();
-    if (!bound_phpser) {
-        return "registered, inactive (APCu bound another serializer at the first request "
-               "of this process; set apc.serializer=phpser in php.ini, the same for every pool)";
+    if (phpser_apcu_used) {
+        return "registered, used by APCu in this process";
     }
-    return "registered, active";
+    return "registered, not yet used by APCu in this process";
 }

@@ -351,12 +351,7 @@ static PHP_MINIT_FUNCTION(phpser) {
     zend_string *algo = zend_string_init("sha256", sizeof("sha256") - 1, 0);
     phpser_sha256_ops = php_hash_fetch_ops(algo);
     zend_string_release(algo);
-    /* APCu keeps registered serializers for the life of the process and has
-     * no unregister call, so a dl() load, unmapped at request end, would
-     * leave it calling unmapped code. */
-    if (type == MODULE_PERSISTENT) {
-        phpser_apcu_register();
-    }
+    phpser_apcu_minit(type == MODULE_PERSISTENT);
     return SUCCESS;
 }
 
@@ -368,16 +363,14 @@ static PHP_MSHUTDOWN_FUNCTION(phpser) {
     return SUCCESS;
 }
 
-static PHP_RINIT_FUNCTION(phpser) {
 #if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
-    /* MINIT initializes only the loading thread; each ZTS worker needs its own
-     * TLS cache initialized before CG/EG access. */
+/* MINIT initializes only the loading thread; each ZTS worker needs its own
+ * TLS cache initialized before CG/EG access. */
+static PHP_RINIT_FUNCTION(phpser) {
     ZEND_TSRMLS_CACHE_UPDATE();
-#endif
-    /* After the first request this is a single flag test. */
-    phpser_apcu_rinit();
     return SUCCESS;
 }
+#endif
 
 static PHP_MINFO_FUNCTION(phpser) {
     php_info_print_table_start();
@@ -416,7 +409,11 @@ zend_module_entry phpser_module_entry = {
     ext_functions,
     PHP_MINIT(phpser),
     PHP_MSHUTDOWN(phpser),
+#if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
     PHP_RINIT(phpser), NULL,
+#else
+    NULL, NULL,   /* no RINIT on NTS builds: zero per-request cost */
+#endif
     PHP_MINFO(phpser),
     PHP_PHPSER_VERSION,
     STANDARD_MODULE_PROPERTIES,
