@@ -119,8 +119,11 @@ copy without wiping it. The lookup compares the full 64-byte key block in
 constant time, so timing reveals only whether the key matches the thread's
 previous key. Keyed signing (`phpser.key`) also caches, per thread, the
 most recent key of up to 128 bytes, its context, and the subkey derived
-from them, under the same rules: a new key or context overwrites the entry,
-the key compare runs in constant time, and module shutdown wipes it.
+from them. A miss wipes the whole entry before it is replaced, including
+when the new key is too long to cache, and the key compare runs in
+constant time. Module shutdown wipes only the shutting-down thread's
+copies of both caches; under ZTS, other worker threads' copies are freed
+without being wiped.
 
 **Session handler.** When built against the session extension, phpser
 registers `session.serialize_handler = phpser`. Unless
@@ -222,12 +225,19 @@ APCu keeps its cache in one shared memory segment created by the PHP-FPM
 master, so every pool of that master reads and writes the same entries.
 Without signing, code running in any pool can store an object graph that
 another pool's `apcu_fetch()` instantiates, running its `__wakeup` /
-`__unserialize` there. With a distinct `php_admin_value[phpser.key]` per
-pool, a pool can still overwrite or delete another pool's entries (APCu has
-no per-pool namespace), but the victim's fetch fails verification and
-reports a miss with an `E_WARNING`, so the victim never decodes the
-foreign value. Shared memory that is written directly (native code, a
-debugger) is outside this model.
+`__unserialize` there. Signing defends against that object injection; it
+is not general authentication of APCu data. It holds when
+`apc.serializer = phpser` is set globally, in the `php.ini` the master
+reads (APCu binds the serializer when the master starts and ignores a
+per-pool `php_admin_value[apc.serializer]` under a master left on `php`;
+`phpinfo()` then reports the APCu serializer as inactive), and each pool
+has its own `php_admin_value[phpser.key]`. Then every value APCu passes
+through the serializer in a pool, objects always and arrays, is verified
+before it is decoded, and a value another pool wrote under its own key, or
+with another serializer, fails verification and reads as a miss with an
+`E_WARNING`. A pool can still overwrite or delete another pool's entries
+(APCu has no per-pool namespace). Shared memory that is written directly
+(native code, a debugger) is outside this model.
 
 Limits:
 
@@ -237,9 +247,13 @@ Limits:
   another of the same context, or replay an older value. Store the identity
   the value is for inside the value and check it after reading when that
   matters.
-- APCu stores scalars (`null`, booleans, integers, floats, strings) without
-  calling a serializer, so they are never signed. Entries from
-  `apc.preload_path` are written before phpser registers and carry no tag.
+- Values APCu does not pass through a serializer are never verified:
+  scalars (`null`, booleans, integers, floats, strings), arrays persisted
+  natively by a process whose `apc.serializer` did not resolve to a
+  registered serializer, and arrays and scalars loaded from
+  `apc.preload_path` before phpser registers. Another pool can therefore
+  still change such values. Do not keep authorization data (roles,
+  permissions) in APCu on a master shared with untrusted pools.
 - Use a distinct key per application and environment, as with sessions.
 
 ## Supported versions
