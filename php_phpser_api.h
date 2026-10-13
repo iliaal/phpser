@@ -13,14 +13,21 @@
 /*
  * phpser C API for other extensions (cache clients, session stores).
  *
- * A consumer includes this header, declares ZEND_MOD_REQUIRED("phpser") in
- * its module dependencies so phpser loads and initializes first (the model
- * igbinary uses for phpredis and memcached), and calls the functions below
- * during a request. The consumer references these symbols directly, so its
- * shared object needs phpser loaded to resolve them; on Windows, link
- * against php_phpser.lib and define nothing. To reject an incompatible
- * phpser at startup, compare phpser_api_version() with PHPSER_API_VERSION
- * in MINIT.
+ * A consumer includes this header and calls the functions below during a
+ * request. It references these symbols directly, so phpser must already be
+ * loaded when the consumer's shared object is opened: users load it with
+ * extension=phpser BEFORE the consuming extension (with PHP built
+ * --enable-rtld-now, a consumer listed first fails to load). The consumer
+ * also declares ZEND_MOD_REQUIRED("phpser") in its module dependencies;
+ * that orders MINIT among loaded modules and refuses to start without
+ * phpser, but does not load phpser. This is the model igbinary uses for
+ * phpredis and memcached. To reject an incompatible phpser at startup,
+ * compare phpser_api_version() with PHPSER_API_VERSION in MINIT.
+ *
+ * On Windows, a consumer of a shared php_phpser.dll defines
+ * COMPILE_DL_PHPSER before including this header (for dllimport) and links
+ * against php_phpser.lib; a build with phpser compiled statically into PHP
+ * leaves it undefined.
  *
  * Both functions follow the phpser.key INI setting:
  *
@@ -32,7 +39,8 @@
  *   ":v1\0"), so a value signed for one context does not verify under
  *   another. The tag is checked in constant time before any decode work;
  *   unsigned or foreign input fails with PHPSER_API_ERR_TAG and an
- *   E_WARNING, as the signed session handler does.
+ *   E_WARNING, as the signed session handler does. A tag that cannot be
+ *   computed (SHA-256 unavailable) also fails as PHPSER_API_ERR_TAG.
  * - Shorter than 32 bytes: both directions fail with an E_WARNING naming
  *   phpser.key. Nothing is signed with a weak key and nothing falls back
  *   to unsigned.
@@ -55,10 +63,13 @@
  * verification and must be treated as absent. */
 #define PHPSER_API_OK       0
 #define PHPSER_API_ERR      (-1) /* encode/decode failure, bad context, short key */
-#define PHPSER_API_ERR_TAG  (-2) /* phpser.key is set and the HMAC tag did not verify */
+#define PHPSER_API_ERR_TAG  (-2) /* phpser.key is set and the HMAC tag did not verify,
+                                    or could not be computed */
 
+/* Same scheme as PDO_API: export when building phpser or when phpser is
+ * part of php8.dll, import only for consumers of a shared phpser. */
 #ifdef PHP_WIN32
-# ifdef PHPSER_EXPORTS
+# if defined(PHPSER_EXPORTS) || !defined(COMPILE_DL_PHPSER)
 #  define PHP_PHPSER_API __declspec(dllexport)
 # else
 #  define PHP_PHPSER_API __declspec(dllimport)
@@ -74,11 +85,13 @@ BEGIN_EXTERN_C()
 /* PHPSER_API_VERSION of the loaded phpser. */
 PHP_PHPSER_API unsigned int phpser_api_version(void);
 
-/* Serializes `value`. On PHPSER_API_OK, *out is a new non-persistent string
- * owned by the caller, who releases it with zend_string_release(). On
- * PHPSER_API_ERR, *out is NULL and either an exception is pending (a
- * serialization hook threw, or the value exceeds the nesting or 4 GiB size
- * limit) or an E_WARNING was raised (bad context, short key). */
+/* Serializes `value`. *out must not hold a live string on entry: it is
+ * overwritten without being released. On PHPSER_API_OK, *out is a new
+ * non-persistent string owned by the caller, who releases it with
+ * zend_string_release(). On PHPSER_API_ERR, *out is NULL and either an
+ * exception is pending (a serialization hook threw, or the value exceeds
+ * the nesting or 4 GiB size limit) or an E_WARNING was raised (bad context,
+ * short key, or SHA-256 unavailable while signing). */
 PHP_PHPSER_API int phpser_api_serialize(const zval *value,
                                         const char *context, size_t context_len,
                                         zend_string **out);

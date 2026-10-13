@@ -49,6 +49,42 @@ $trail = phpser_serialize(1) . 'x';
 $trail .= hash_hmac('sha256', $trail, $subkey, true);
 echo "trailing_bytes: ", attempt(fn() => phpser_unserialize_keyed($trail, 'redis')), "\n";
 
+// Exactly one tag's worth of bytes authenticates an empty frame, which is
+// then a decode failure, not a verification failure.
+echo "empty_frame: ", attempt(fn() => phpser_unserialize_keyed(hash_hmac('sha256', '', $subkey, true), 'redis')), "\n";
+echo "short_31: ", attempt(fn() => phpser_unserialize_keyed(str_repeat("\0", 31), 'redis')), "\n";
+
+// Side-effect oracle: if anything decoded, a hook or the autoloader would
+// echo. The control decodes the same frame validly signed.
+class Loud {
+    public function __serialize(): array { return ['v' => 1]; }
+    public function __unserialize(array $d): void { echo "[unserialize ran]"; }
+}
+class Wakey { public $w = 1; public function __wakeup(): void { echo "[wakeup ran]"; } }
+class GhostTpl { public $g = 1; }
+spl_autoload_register(function ($c) { echo "[autoload $c]"; });
+$oframe = str_replace('GhostTpl', 'GhostZzz', phpser_serialize([new Loud, new Wakey, new GhostTpl]));
+$ogood = $oframe . hash_hmac('sha256', $oframe, $subkey, true);
+$otagflip = $ogood; $otagflip[strlen($otagflip) - 5] = chr(ord($otagflip[strlen($otagflip) - 5]) ^ 4);
+foreach ([
+    'other_context' => fn() => phpser_unserialize_keyed($ogood, 'memcached'),
+    'tag_flip' => fn() => phpser_unserialize_keyed($otagflip, 'redis'),
+    'appended' => fn() => phpser_unserialize_keyed($ogood . 'x', 'redis'),
+    'truncated' => fn() => phpser_unserialize_keyed(substr($ogood, 0, -1), 'redis'),
+    'unsigned' => fn() => phpser_unserialize_keyed($oframe, 'redis'),
+    'raw_key_signed' => fn() => phpser_unserialize_keyed($oframe . hash_hmac('sha256', $oframe, $key, true), 'redis'),
+] as $name => $f) {
+    ob_start();
+    $r = attempt($f);
+    $side = ob_get_clean();
+    echo "oracle_$name: ", $r, $side === '' ? '' : " SIDE EFFECTS $side", "\n";
+}
+ob_start();
+$r = attempt(fn() => count(phpser_unserialize_keyed($ogood, 'redis')));
+$side = ob_get_clean();
+echo "oracle_control: ", $r, " ", implode(' ', array_map(fn($k) => str_contains($side, $k) ? "$k:seen" : "$k:MISSING",
+    ['[autoload GhostZzz]', '[unserialize ran]', '[wakeup ran]'])), "\n";
+
 echo "signed_null: ", attempt(fn() => phpser_unserialize_keyed(phpser_serialize_keyed(null, 'redis'), 'redis')), "\n";
 class Secret { public $s = 1; }
 $obj = phpser_unserialize_keyed(phpser_serialize_keyed(new Secret, 'redis'), 'redis', ['allowed_classes' => false]);
@@ -97,6 +133,15 @@ empty: Exception: phpser: signature verification failed
 unsigned: Exception: phpser: signature verification failed
 raw_key_signed: Exception: phpser: signature verification failed
 trailing_bytes: Exception: phpser: signed payload failed to decode
+empty_frame: Exception: phpser: signed payload failed to decode
+short_31: Exception: phpser: signature verification failed
+oracle_other_context: Exception: phpser: signature verification failed
+oracle_tag_flip: Exception: phpser: signature verification failed
+oracle_appended: Exception: phpser: signature verification failed
+oracle_truncated: Exception: phpser: signature verification failed
+oracle_unsigned: Exception: phpser: signature verification failed
+oracle_raw_key_signed: Exception: phpser: signature verification failed
+oracle_control: accepted 3 [autoload GhostZzz]:seen [unserialize ran]:seen [wakeup ran]:seen
 signed_null: accepted null
 allowed_classes: __PHP_Incomplete_Class
 bad_option: ValueError: phpser_unserialize_keyed(): Argument #3 ($options) allowed_classes option must be array or bool

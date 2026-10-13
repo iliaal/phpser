@@ -81,6 +81,10 @@ const char *phpser_apcu_status(void);
  * hook. Call from MINIT, after APCu's MINIT. (phpser_api.c) */
 void phpser_apcu_register(void);
 
+/* Records the apc.serializer value of the first request in this process
+ * lineage, the one APCu binds. Call from RINIT. (phpser_api.c) */
+void phpser_apcu_rinit(void);
+
 /* Bound C-stack use on deeply nested input, including ASAN builds. */
 #define MAX_DEPTH 512
 

@@ -23,33 +23,6 @@
 
 #define PHPSER_APCU_CONTEXT "apcu"
 
-phpser_key_status phpser_key_lookup(zend_string **out) {
-    /* A direct directive lookup avoids allocating a name per call on the
-     * cache hot path; zend_ini_str_ex() is 8.3+ and INI_STR() is gone in 8.6. */
-    zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives),
-                                                   "phpser.key", sizeof("phpser.key") - 1);
-    zend_string *key = entry ? entry->value : NULL;
-    *out = NULL;
-    if (!key || ZSTR_LEN(key) == 0) {
-        return PHPSER_KEY_UNSET;
-    }
-    if (ZSTR_LEN(key) < PHPSER_KEY_MIN) {
-        return PHPSER_KEY_SHORT;
-    }
-    *out = key;
-    return PHPSER_KEY_OK;
-}
-
-/* The derivation message is "phpser:" || context || ":v1\0". "session" is
- * refused because the session handler derives from "phpser:session:v1\0" ||
- * session_id, which an empty session ID would make identical. */
-bool phpser_keyed_context_valid(const char *context, size_t context_len) {
-    return context_len > 0 && context_len <= PHPSER_KEYED_CONTEXT_MAX
-        && memchr(context, '\0', context_len) == NULL
-        && !(context_len == sizeof("session") - 1
-             && memcmp(context, "session", context_len) == 0);
-}
-
 /* The derived subkey of the last (phpser.key, context) pair, per thread.
  * Without it every keyed call pays for two HMAC key schedules plus the
  * derivation, which more than quadruples a small APCu fetch. Keys longer
@@ -69,6 +42,43 @@ ZEND_TLS phpser_subkey_cache subkey_cache;
 
 void phpser_api_mshutdown(void) {
     ZEND_SECURE_ZERO(&subkey_cache, sizeof(subkey_cache));
+}
+
+/* Called when phpser.key is unset or short, so a key that is no longer
+ * configured does not stay resident. */
+static zend_always_inline void phpser_subkey_cache_drop(void) {
+    if (UNEXPECTED(subkey_cache.valid)) {
+        ZEND_SECURE_ZERO(&subkey_cache, sizeof(subkey_cache));
+    }
+}
+
+phpser_key_status phpser_key_lookup(zend_string **out) {
+    /* A direct directive lookup avoids allocating a name per call on the
+     * cache hot path; zend_ini_str_ex() is 8.3+ and INI_STR() is gone in 8.6. */
+    zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives),
+                                                   "phpser.key", sizeof("phpser.key") - 1);
+    zend_string *key = entry ? entry->value : NULL;
+    *out = NULL;
+    if (!key || ZSTR_LEN(key) == 0) {
+        phpser_subkey_cache_drop();
+        return PHPSER_KEY_UNSET;
+    }
+    if (ZSTR_LEN(key) < PHPSER_KEY_MIN) {
+        phpser_subkey_cache_drop();
+        return PHPSER_KEY_SHORT;
+    }
+    *out = key;
+    return PHPSER_KEY_OK;
+}
+
+/* The derivation message is "phpser:" || context || ":v1\0". "session" is
+ * refused because the session handler derives from "phpser:session:v1\0" ||
+ * session_id, which an empty session ID would make identical. */
+bool phpser_keyed_context_valid(const char *context, size_t context_len) {
+    return context_len > 0 && context_len <= PHPSER_KEYED_CONTEXT_MAX
+        && memchr(context, '\0', context_len) == NULL
+        && !(context_len == sizeof("session") - 1
+             && memcmp(context, "session", context_len) == 0);
 }
 
 static int phpser_keyed_subkey(const zend_string *key, const char *context, size_t context_len,
@@ -146,7 +156,9 @@ zend_string *phpser_keyed_encode(zval *value, const zend_string *key,
 static bool phpser_keyed_verify(const zend_string *key, const char *buf, size_t buf_len,
                                 const char *context, size_t context_len) {
     unsigned char tag[PHPSER_HMAC_TAG_LEN];
-    if (buf_len <= PHPSER_HMAC_TAG_LEN) {
+    /* An exactly tag-sized buffer authenticates an empty frame, which then
+     * fails to decode; only a buffer too short to hold a tag is a tag error. */
+    if (buf_len < PHPSER_HMAC_TAG_LEN) {
         return false;
     }
     size_t frame_len = buf_len - PHPSER_HMAC_TAG_LEN;
@@ -280,11 +292,15 @@ typedef int (*phpser_apc_register_t)(const char *name, phpser_apc_serialize_t se
 
 static bool phpser_apcu_registered = false;
 /* APCu binds its cache serializer by name in its own MINIT, when only its
- * built-in "php" serializer exists. Any other name resolves to nothing there
- * and is filled in by the first RINIT of each process from that process's
- * apc.serializer. So a startup value of "php" wins over any later per-pool
- * value, while any other startup value defers to the per-process value. */
+ * built-in "php" serializer exists, so a startup value of "php" is final.
+ * Any other name resolves to nothing there and APCu's RINIT binds the
+ * apc.serializer of the first request in the process. That request can run
+ * in the FPM master (opcache.preload starts one before forking), in which
+ * case every pool inherits the php.ini value whatever its own setting. These
+ * process statics follow the same lineage: set once, inherited by fork. */
 static bool phpser_apcu_bound_php_at_startup = false;
+static bool phpser_apcu_first_request_seen = false;
+static bool phpser_apcu_first_request_phpser = false;
 
 static zend_string *phpser_apcu_serializer_ini(void) {
     zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives),
@@ -331,17 +347,32 @@ void phpser_apcu_register(void) {
     phpser_apcu_bound_php_at_startup = startup && zend_string_equals_literal(startup, "php");
 }
 
+static bool phpser_apcu_serializer_is_phpser(void) {
+    zend_string *value = phpser_apcu_serializer_ini();
+    return value && zend_string_equals_literal(value, PHP_PHPSER_EXTNAME);
+}
+
+void phpser_apcu_rinit(void) {
+    if (EXPECTED(phpser_apcu_first_request_seen) || !phpser_apcu_registered) {
+        return;
+    }
+    phpser_apcu_first_request_seen = true;
+    phpser_apcu_first_request_phpser = phpser_apcu_serializer_is_phpser();
+}
+
 const char *phpser_apcu_status(void) {
     if (!phpser_apcu_registered) {
-        return "not registered (APCu not loaded, or disabled for this SAPI)";
-    }
-    zend_string *current = phpser_apcu_serializer_ini();
-    if (!current || !zend_string_equals_literal(current, PHP_PHPSER_EXTNAME)) {
-        return "registered, inactive (apc.serializer is not phpser)";
+        return "not registered (APCu not loaded at startup, or disabled for this SAPI)";
     }
     if (phpser_apcu_bound_php_at_startup) {
         return "registered, inactive (APCu bound the php serializer at startup; "
-               "set apc.serializer=phpser in php.ini, not per FPM pool)";
+               "set apc.serializer=phpser in the php.ini PHP starts with, not per FPM pool)";
+    }
+    bool bound_phpser = phpser_apcu_first_request_seen
+        ? phpser_apcu_first_request_phpser : phpser_apcu_serializer_is_phpser();
+    if (!bound_phpser) {
+        return "registered, inactive (APCu bound another serializer at the first request "
+               "of this process; set apc.serializer=phpser in php.ini, the same for every pool)";
     }
     return "registered, active";
 }

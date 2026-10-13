@@ -13,9 +13,10 @@
 /*
  * phpser module entry header.
  *
- * Exports only the zend_module_entry. Extensions that serialize through
- * phpser use php_phpser_api.h; the internal encode/decode paths are not a
- * stable C API.
+ * Declares the module entry for static builds. A shared phpser.so exports
+ * only get_module() and the php_phpser_api.h functions; extensions that
+ * serialize through phpser use that header. The internal encode/decode
+ * paths are not a stable C API.
  */
 #ifndef PHP_PHPSER_H
 #define PHP_PHPSER_H
