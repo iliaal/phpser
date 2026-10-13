@@ -105,6 +105,9 @@ $out = req($boom, $k1);
 echo "hook_throw: ", str_contains($out, 'a serialization hook threw') && str_contains($out, 'CAUGHT:x') ? "threw" : $out, "\n";
 $after = req('session_id("hookthrow1"); session_start(); echo json_encode($_SESSION);', $k1);
 echo "hook_throw_next_read: ", $after === (PHP_VERSION_ID >= 80600 ? '{"keep":1}' : '[]') ? "OK" : $after, "\n";
+// A key with another serialize_handler signs nothing; phpinfo() says so.
+$minfo = req('(new ReflectionExtension("phpser"))->info();', $k1 + ['session.serialize_handler' => 'php']);
+echo "minfo_other_handler: ", preg_match('/session HMAC signing.*inactive/', $minfo) ? "inactive" : $minfo, "\n";
 echo "DONE\n";
 ?>
 --CLEAN--
@@ -126,4 +129,5 @@ strict_new_id: OK
 strict_roundtrip: {"s":1}
 hook_throw: threw
 hook_throw_next_read: OK
+minfo_other_handler: inactive
 DONE

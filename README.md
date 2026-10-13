@@ -133,8 +133,9 @@ the tag binds a blob to its session ID, not to the app that wrote it.
 handler, for every script that shares the session store: in `php.ini` or
 an FPM pool's `php_admin_value`, not a `.user.ini` that covers only part
 of the tree. A script that runs without the key, or switches
-`session.serialize_handler` (which any script can), reads the store
-unverified.
+`session.serialize_handler` (which any script can, unless it is locked
+with `php_admin_value`), reads the store unverified. Lock both settings
+with `php_admin_value` where you can.
 
 No application code changes, with two consequences to know about:
 

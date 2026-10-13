@@ -131,8 +131,12 @@ is attacker-writable, set `phpser.session_key`.
 **Signed sessions.** With `phpser.session_key` set, the handler appends an
 HMAC-SHA256 tag to every session frame and verifies it, in constant time,
 before any decode work. The tag key is derived per session:
-`HMAC(session_key, "phpser:session:v1\0" || session_id)`. `php --ri phpser`
-reports signing as `enabled`, `disabled`, or `invalid` (short key). Binding the ID
+`HMAC(session_key, "phpser:session:v1\0" || session_id)`. The phpser
+section of `phpinfo()` reports signing as `enabled`, `disabled`, `invalid`
+(short key), or `inactive` (key set, but `session.serialize_handler` is not
+`phpser`). Check it from the SAPI that serves requests, such as a
+`phpinfo()` page in the FPM pool; `php --ri phpser` shows only the CLI
+configuration. Binding the ID
 means a store writer cannot copy another user's validly signed blob into
 their own session; the label keeps session tags distinct from
 `phpser_serialize_signed()` tags made with the same key. A failed

@@ -74,8 +74,15 @@ static phpser_skey_status phpser_session_key(zend_string **out) {
 const char *phpser_session_signing_status(void) {
     zend_string *key;
     switch (phpser_session_key_lookup(&key)) {
-    case PHPSER_SKEY_OK:
+    case PHPSER_SKEY_OK: {
+        zend_string *name = ZSTR_INIT_LITERAL("session.serialize_handler", 0);
+        zend_string *handler = zend_ini_get_value(name);
+        zend_string_release_ex(name, 0);
+        if (!handler || !zend_string_equals_literal(handler, PHP_PHPSER_EXTNAME)) {
+            return "inactive (key set, but session.serialize_handler is not phpser)";
+        }
         return "enabled";
+    }
     case PHPSER_SKEY_SHORT:
         return "invalid (phpser.session_key shorter than 32 bytes; sessions rejected)";
     default:
