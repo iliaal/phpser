@@ -120,8 +120,8 @@ constant time, so timing reveals only whether the key matches the thread's
 previous key. Keyed signing (`phpser.key`) also caches, per thread, the
 most recent key of up to 128 bytes, its context, and the subkey derived
 from them. A miss wipes the whole entry before it is replaced, including
-when the new key is too long to cache, and the key compare runs in
-constant time. Module shutdown wipes only the shutting-down thread's
+when the new key is too long to cache; a keyed call that finds `phpser.key`
+unset or short wipes it too. The key compare runs in constant time. Module shutdown wipes only the shutting-down thread's
 copies of both caches; under ZTS, other worker threads' copies are freed
 without being wiped.
 
@@ -228,15 +228,19 @@ another pool's `apcu_fetch()` instantiates, running its `__wakeup` /
 `__unserialize` there. Signing defends against that object injection; it
 is not general authentication of APCu data. It holds when
 `apc.serializer = phpser` is set globally, in the `php.ini` the master
-reads (APCu binds the serializer when the master starts and ignores a
-per-pool `php_admin_value[apc.serializer]` under a master left on `php`;
-`phpinfo()` then reports the APCu serializer as inactive), and each pool
-has its own `php_admin_value[phpser.key]`. Then every value APCu passes
+reads, and each pool has its own `php_admin_value[phpser.key]`. APCu binds
+its serializer once per process lineage (at startup for `php`, otherwise at
+the first request, which `opcache.preload` runs in the master), so a
+per-pool `php_admin_value[apc.serializer]` can be ignored; `phpinfo()`
+reports the APCu serializer as inactive when phpser is not the one bound. Then every value APCu passes
 through the serializer in a pool, objects always and arrays, is verified
 before it is decoded, and a value another pool wrote under its own key, or
-with another serializer, fails verification and reads as a miss with an
-`E_WARNING`. A pool can still overwrite or delete another pool's entries
-(APCu has no per-pool namespace). Shared memory that is written directly
+with another serializer, fails verification with an `E_WARNING` and is not
+decoded: `apcu_fetch()` returns `false`, and `apcu_entry()` returns `null`
+without calling its generator until the entry expires or is deleted. A
+pool can still overwrite or delete another pool's entries (APCu has no
+per-pool namespace), so a hostile pool can make another pool's
+`apcu_entry()` return `null`. Shared memory that is written directly
 (native code, a debugger) is outside this model.
 
 Limits:

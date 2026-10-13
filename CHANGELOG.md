@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `phpser.key` INI setting signs APCu values and keyed payloads with HMAC-SHA256 bound to a per-store context; keys under 32 bytes fail closed.
 - `phpser_serialize_keyed()` and `phpser_unserialize_keyed()` sign with `phpser.key`.
 - `php_phpser_api.h` C API (`phpser_api_serialize()`, `phpser_api_unserialize()`, `phpser_api_version()`) for other extensions; failed verification returns its own code.
-- `phpinfo()` reports keyed signing status and whether APCu actually uses the phpser serializer.
+- `phpinfo()` reports keyed signing status and whether APCu bound the phpser serializer, including under `opcache.preload` and per-pool overrides.
 
 ### Changed
 

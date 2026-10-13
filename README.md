@@ -161,27 +161,31 @@ apc.serializer = phpser
 phpser.key = "<64 hex chars, e.g. from: openssl rand -hex 32>"
 ```
 
-Set `apc.serializer` globally, in the `php.ini` the FPM master reads. APCu
-binds its serializer when the master starts; a pool's
-`php_admin_value[apc.serializer] = phpser` under a master left on the
-default `php` is ignored, and `phpinfo()` reports the APCu serializer as
-inactive in that case. APCu and phpser must both load at startup through
-`extension=` lines: phpser registers with APCu only in its module startup,
-so loading either one with `dl()` leaves APCu without phpser.
+Set `apc.serializer` globally, in the `php.ini` the FPM master reads, the
+same for every pool. APCu binds its serializer once per process lineage: at
+startup when the value is `php`, otherwise at the first request, which runs
+in the master when `opcache.preload` is set. Either way a pool's
+`php_admin_value[apc.serializer]` can be ignored, and `phpinfo()` then
+reports the APCu serializer as inactive. phpser registers with APCu only
+when it is loaded at startup through an `extension=` line, never through
+`dl()`.
 
 Without `phpser.key` the frames are plain and APCu shared memory is
 trusted, as with APCu's own `php` serializer. With it, every value APCu
 passes through the serializer (objects always, and arrays) carries an
 HMAC-SHA256 tag bound to the key and to the context `apcu`. A value whose
 tag does not verify (written under another key, by another serializer, or
-before the key was set) is never decoded: `apcu_fetch()` returns `false`
-and raises an `E_WARNING`. Scalars, and arrays that a process with no
+before the key was set) is never decoded and raises an `E_WARNING`:
+`apcu_fetch()` returns `false`, as for a miss, but `apcu_entry()` returns
+`null` without calling its generator until the entry expires or is
+deleted. Scalars, and arrays that a process with no
 resolvable serializer stored natively, are read back without a check.
 
 This is a defense against object injection between PHP-FPM pools that share
 one master, and therefore one APCu shared memory segment: give each pool its
 own `php_admin_value[phpser.key]` and one pool cannot make another pool's
-`apcu_fetch()` instantiate objects. It does not authenticate APCu data in
+`apcu_fetch()` instantiate objects. It can still make the other pool's
+`apcu_entry()` return `null` for an entry it overwrites. It does not authenticate APCu data in
 general, so do not keep authorization data (roles, permissions) in APCu on a
 master shared with untrusted pools. A key shorter than 32 bytes fails
 closed: `apcu_store()` of an array or object returns `false` with a
@@ -212,7 +216,10 @@ from the installed header `ext/phpser/php_phpser_api.h`. Both follow
 when it is set. Failed verification returns `PHPSER_API_ERR_TAG`, distinct
 from other failures, so a client that falls back to raw bytes on a decode
 error can treat it as a miss instead. The header documents the ownership
-and error contract; consumers declare `ZEND_MOD_REQUIRED("phpser")`.
+and error contract. A consumer declares `ZEND_MOD_REQUIRED("phpser")`, and
+`extension=phpser` must come before the consumer's `extension=` line: the
+dependency orders startup among loaded extensions but does not load
+phpser.
 
 ## ✨ Features
 
