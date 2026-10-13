@@ -220,7 +220,8 @@ use the raw key, so the three schemes do not produce each other's tags.
 The phpser section of `phpinfo()` reports keyed signing as `enabled`,
 `disabled`, or `invalid` (short key), and what phpser observed of APCu:
 not registered, inactive (APCu bound its `php` serializer at startup), or
-whether APCu has called phpser in the current process yet.
+whether APCu has called phpser in the current process, or in a parent
+before it forked.
 
 APCu keeps its cache in one shared memory segment created by the PHP-FPM
 master, so every pool of that master reads and writes the same entries.

@@ -171,7 +171,8 @@ so each worker binds at its own first request. A pool's
 `php_admin_value[apc.serializer]` can therefore be ignored. The APCu row in
 the phpser section of `phpinfo()` reports what phpser observed, not what
 will happen: `inactive` when APCu bound `php` at startup, `used by APCu in
-this process` once APCu has called phpser in that process, `not yet used`
+this process or the parent it forked from` once APCu has called phpser in
+that process or in a parent before it forked, `not yet used`
 before then (or when another serializer is bound), and `not registered`
 when APCu was not loaded at startup or phpser came from `dl()`. phpser
 registers with APCu only when it is loaded at startup through an

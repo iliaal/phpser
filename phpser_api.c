@@ -301,7 +301,8 @@ static bool phpser_apcu_registered = false;
 static bool phpser_apcu_bound_php_at_startup = false;
 /* Set the first time APCu calls either phpser callback, and inherited across
  * fork. Atomic because ZTS requests store concurrently while MINFO reads; the
- * load-first check keeps the hot path free of shared-line writes. */
+ * load-first check skips the store once set (Zend's load is a plain read on
+ * C11 and GCC __atomic builds, a read-modify-write on Windows and legacy GCC). */
 static zend_atomic_bool phpser_apcu_used;
 
 static zend_always_inline void phpser_apcu_mark_used(void) {
