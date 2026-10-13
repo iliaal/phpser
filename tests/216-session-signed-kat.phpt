@@ -21,7 +21,7 @@ phpser.session_key=kat-key-0123456789abcdef0123456789
 <?php
 ob_start();
 $key = 'kat-key-0123456789abcdef0123456789';
-$dir = sys_get_temp_dir() . '/phpser-signed-kat-216';
+$dir = sys_get_temp_dir() . '/phpser-216-' . md5(__DIR__);
 @mkdir($dir);
 session_save_path($dir);
 
@@ -60,13 +60,19 @@ function req(string $code, array $ini): string {
     $extra = getenv('TEST_PHP_EXTRA_ARGS') ?: '';
     $ini += [
         'session.serialize_handler' => 'phpser', 'session.save_handler' => 'files',
-        'session.save_path' => sys_get_temp_dir() . '/phpser-signed-kat-216',
+        'session.save_path' => sys_get_temp_dir() . '/phpser-216-' . md5(__DIR__),
         'session.use_cookies' => '0', 'session.cache_limiter' => '', 'display_errors' => '1',
     ];
+    // Child code goes through a file: Windows escapeshellarg() strips double
+    // quotes, which would mangle code passed with -r.
+    $script = $ini['session.save_path'] . '/child-' . md5($code) . '.php';
+    file_put_contents($script, "<?php\n" . $code);
     $cmd = escapeshellarg($php) . " $extra";
     foreach ($ini as $k => $v) $cmd .= ' -d ' . escapeshellarg("$k=$v");
-    $cmd .= ' -r ' . escapeshellarg($code) . ' 2>&1';
-    return (string) shell_exec($cmd);
+    $cmd .= ' ' . escapeshellarg($script) . ' 2>&1';
+    $out = (string) shell_exec($cmd);
+    unlink($script);
+    return $out;
 }
 // TEST_PHP_EXTRA_ARGS carries this test's --INI-- section, key included,
 // so the keyless and other-key requests override it explicitly.
@@ -91,18 +97,18 @@ echo "strict_roundtrip: ", req('session_id("' . $sid . '"); session_start(); ech
 // an empty session, which reads back as new rather than as a forgery.
 $boom = 'class Boom { function __serialize(): array { throw new Exception("x"); } }
 session_id("hookthrow1"); session_start(); $_SESSION = ["b" => new Boom];
-try { session_write_close(); } catch (Throwable $e) { echo "threw"; }';
+try { session_write_close(); echo "NO-THROW"; } catch (Throwable $e) { echo "CAUGHT:", $e->getMessage(); }';
 req('session_id("hookthrow1"); session_start(); $_SESSION = ["keep" => 1];', $k1);
 $out = req($boom, $k1);
-echo "hook_throw: ", str_contains($out, 'a serialization hook threw') && str_contains($out, 'threw') ? "threw" : $out, "\n";
+echo "hook_throw: ", str_contains($out, 'a serialization hook threw') && str_contains($out, 'CAUGHT:x') ? "threw" : $out, "\n";
 $after = req('session_id("hookthrow1"); session_start(); echo json_encode($_SESSION);', $k1);
 echo "hook_throw_next_read: ", $after === (PHP_VERSION_ID >= 80600 ? '{"keep":1}' : '[]') ? "OK" : $after, "\n";
 echo "DONE\n";
 ?>
 --CLEAN--
 <?php
-$dir = sys_get_temp_dir() . '/phpser-signed-kat-216';
-foreach (glob("$dir/sess_*") as $f) @unlink($f);
+$dir = sys_get_temp_dir() . '/phpser-216-' . md5(__DIR__);
+foreach (glob("$dir/*") as $f) @unlink($f);
 @rmdir($dir);
 ?>
 --EXPECT--

@@ -18,7 +18,9 @@ session.cache_limiter=
 phpser.session_key=test-session-key-0123456789abcdef
 --FILE--
 <?php
-session_save_path(sys_get_temp_dir());
+$dir = sys_get_temp_dir() . '/phpser-214-' . md5(__DIR__);
+@mkdir($dir);
+session_save_path($dir);
 
 class Gadget {
     public function __wakeup() { echo "GADGET WOKE\n"; }
@@ -102,17 +104,23 @@ for ($i = 0; $i < 1000; $i++) $deep = [$deep];
 $_SESSION = ['deep' => $deep];
 $tomb = session_encode();
 echo "overdepth_tombstone: ", $tomb === 'phpser:session-not-serialized' ? "yes" : "no", "\n";
-rejected('tombstone_read', $tomb, 'was not saved by the previous request');
+rejected('tombstone_read', $tomb, 'encode-failure marker');
 
 echo "ini_set_denied: ", ini_set('phpser.session_key', 'attacker') === false
     && ini_get('phpser.session_key') === 'test-session-key-0123456789abcdef' ? "yes" : "no", "\n";
 
+ob_start();
+(new ReflectionExtension('phpser'))->info();
+$info = ob_get_clean();
+echo "minfo: ", preg_match('/session HMAC signing.*enabled/', $info) ? "enabled" : "WRONG", "\n";
 restore_error_handler();
 echo "DONE\n";
 ?>
 --CLEAN--
 <?php
-foreach (glob(sys_get_temp_dir() . '/sess_phpsersignedtest*') as $f) @unlink($f);
+$dir = sys_get_temp_dir() . '/phpser-214-' . md5(__DIR__);
+foreach (glob("$dir/sess_*") as $f) @unlink($f);
+@rmdir($dir);
 ?>
 --EXPECT--
 tag_appended: yes
@@ -131,4 +139,5 @@ empty_is_new_session: OK
 overdepth_tombstone: yes
 tombstone_read: rejected
 ini_set_denied: yes
+minfo: enabled
 DONE

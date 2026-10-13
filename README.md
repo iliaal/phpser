@@ -119,9 +119,12 @@ session.serialize_handler = phpser
 phpser.session_key = "<64 hex chars, e.g. from: openssl rand -hex 32>"
 ```
 
-The key must be at least 32 bytes; a shorter one (including `On`, which
-INI turns into `"1"`) rejects every session rather than falling back to
-unsigned. `phpser.session_key` is `PHP_INI_SYSTEM | PHP_INI_PERDIR`, so
+Quote the value: an unquoted key containing `=` (base64) is a `php.ini`
+syntax error that drops every line after it. The key must be at least 32
+bytes. A shorter one (including `On`, which INI turns into `"1"`) fails
+closed: every session read is rejected and PHP destroys that session, so a
+typo during rollout logs out everyone it touches. `Off`, `no`, `false`,
+and `none` become an empty value, which means unsigned. `phpser.session_key` is `PHP_INI_SYSTEM | PHP_INI_PERDIR`, so
 `ini_set()` from application code cannot change it. Set it, and the
 handler, for every script that shares the session store: in `php.ini` or
 an FPM pool's `php_admin_value`, not a `.user.ini` that covers only part
@@ -131,11 +134,14 @@ unverified.
 
 No application code changes, with two consequences to know about:
 
-- A session saved before an attacker captured it can be restored later.
-  The tag binds the data to the session ID, not to a point in time, so
-  anyone who can write the store can roll a session back to an older,
-  validly signed state (for example, from before a role was revoked).
-  Call `session_regenerate_id(true)` on every privilege change.
+- Signing does not stop rollback. The tag binds the data to the session
+  ID, not to a point in time, so anyone who can write the store can put
+  back an older, validly signed copy of a session (for example, from
+  before a role was revoked). That includes a user who saved their own
+  session file and still holds the old ID; regenerating the ID does not
+  stop them, because they can recreate the old record. Keep authorization
+  decisions (roles, revocations, completed 2FA) in server-side state the
+  store cannot override, and check it on each request.
 - `session_encode()` output is bound to the current session ID.
   `session_decode()` of that string under a different ID fails and
   destroys the target session.
@@ -143,7 +149,7 @@ No application code changes, with two consequences to know about:
 ## ✨ Features
 
 - **Signed payloads**: `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input before any decoding runs. Use it whenever the store crosses a trust boundary (memcached, redis, files, cookies), anywhere an attacker who can write to the store could feed your decoder a crafted payload. Both sides reject an empty key, since a keyless HMAC is forgeable.
-- **Signed sessions**: `phpser.session_key` turns on HMAC-SHA256 signing for the session handler. The tag is bound to the session ID, so a forged, corrupted, or copied-from-another-session blob fails verification and is never decoded. One INI line next to `session.serialize_handler = phpser`, no code changes. It does not stop rollback to an older blob signed for the same ID.
+- **Signed sessions**: `phpser.session_key` turns on HMAC-SHA256 signing for the session handler. The tag is bound to the session ID, so a forged, corrupted, or copied-from-another-session blob fails verification and is never decoded. One INI line next to `session.serialize_handler = phpser`, no code changes. It does not stop rollback to an older blob signed for the same ID, so keep authorization state outside the session.
 - **Untrusted input limits**: both unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (returns `null`). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled key comparisons and collision chains consume bounded work budgets. TABLE/ROWSET rows and fallback object-property copies have a separate materialization budget. Exhausting a budget rejects the frame; these limits do not bound autoloaders or application hooks. See [SECURITY.md](SECURITY.md) for exact limits and class-resolution costs.
 - **Supported versions**: PHP 8.2+ (8.3, 8.4, 8.5, master). BSD 3-Clause.
 

@@ -26,6 +26,10 @@
  * reports failure instead of treating an empty string as a new session. */
 #define PHPSER_SESSION_TOMBSTONE "phpser:session-not-serialized"
 
+/* "enabled", "disabled", or an "invalid ..." explanation for MINFO.
+ * Defined only when HAVE_PHP_SESSION. (phpser_session.c) */
+const char *phpser_session_signing_status(void);
+
 /* Bound C-stack use on deeply nested input, including ASAN builds. */
 #define MAX_DEPTH 512
 

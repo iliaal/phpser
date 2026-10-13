@@ -19,7 +19,7 @@ phpser.session_key=test-session-key-0123456789abcdef
 --FILE--
 <?php
 ob_start();
-$dir = sys_get_temp_dir() . '/phpser-signed-files-215';
+$dir = sys_get_temp_dir() . '/phpser-215-' . md5(__DIR__);
 @mkdir($dir);
 session_save_path($dir);
 
@@ -88,7 +88,7 @@ echo "DONE\n";
 ?>
 --CLEAN--
 <?php
-$dir = sys_get_temp_dir() . '/phpser-signed-files-215';
+$dir = sys_get_temp_dir() . '/phpser-215-' . md5(__DIR__);
 foreach (glob("$dir/sess_*") as $f) @unlink($f);
 @rmdir($dir);
 ?>

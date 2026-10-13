@@ -41,10 +41,7 @@ typedef enum {
     PHPSER_SKEY_SHORT,
 } phpser_skey_status;
 
-/* With a key set, signing is mandatory in both directions, so an unsigned
- * blob can never be read back. A short key fails closed rather than falling
- * back to unsigned: INI booleans turn `On` into the one-byte key "1". */
-static phpser_skey_status phpser_session_key(zend_string **out) {
+static phpser_skey_status phpser_session_key_lookup(zend_string **out) {
     zend_string *key = zend_ini_str_ex("phpser.session_key",
                                        sizeof("phpser.session_key") - 1, false, NULL);
     *out = NULL;
@@ -52,13 +49,35 @@ static phpser_skey_status phpser_session_key(zend_string **out) {
         return PHPSER_SKEY_UNSET;
     }
     if (ZSTR_LEN(key) < PHPSER_SESSION_KEY_MIN) {
-        php_error_docref(NULL, E_WARNING,
-            "phpser.session_key must be at least %d bytes; session data rejected",
-            PHPSER_SESSION_KEY_MIN);
         return PHPSER_SKEY_SHORT;
     }
     *out = key;
     return PHPSER_SKEY_OK;
+}
+
+/* With a key set, signing is mandatory in both directions, so an unsigned
+ * blob can never be read back. A short key fails closed rather than falling
+ * back to unsigned: INI booleans turn `On` into the one-byte key "1". */
+static phpser_skey_status phpser_session_key(zend_string **out) {
+    phpser_skey_status st = phpser_session_key_lookup(out);
+    if (UNEXPECTED(st == PHPSER_SKEY_SHORT)) {
+        php_error_docref(NULL, E_WARNING,
+            "phpser.session_key must be at least %d bytes; session data rejected",
+            PHPSER_SESSION_KEY_MIN);
+    }
+    return st;
+}
+
+const char *phpser_session_signing_status(void) {
+    zend_string *key;
+    switch (phpser_session_key_lookup(&key)) {
+    case PHPSER_SKEY_OK:
+        return "enabled";
+    case PHPSER_SKEY_SHORT:
+        return "invalid (phpser.session_key shorter than 32 bytes; sessions rejected)";
+    default:
+        return "disabled";
+    }
 }
 
 /* Tag over the frame under a per-session-ID subkey. Binding the ID stops a
@@ -160,7 +179,7 @@ PS_SERIALIZER_DECODE_FUNC(phpser) {
         if (vallen == sizeof(PHPSER_SESSION_TOMBSTONE) - 1
             && memcmp(val, PHPSER_SESSION_TOMBSTONE, vallen) == 0) {
             php_error_docref(NULL, E_WARNING,
-                "phpser: session was not saved by the previous request (encode failed)");
+                "phpser: session data is the encode-failure marker, not decoded");
             return FAILURE;
         }
         if (vallen <= PHPSER_HMAC_TAG_LEN

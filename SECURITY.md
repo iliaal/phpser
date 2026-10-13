@@ -131,16 +131,22 @@ is attacker-writable, set `phpser.session_key`.
 **Signed sessions.** With `phpser.session_key` set, the handler appends an
 HMAC-SHA256 tag to every session frame and verifies it, in constant time,
 before any decode work. The tag key is derived per session:
-`HMAC(session_key, "phpser:session:v1\0" || session_id)`. Binding the ID
+`HMAC(session_key, "phpser:session:v1\0" || session_id)`. `php --ri phpser`
+reports signing as `enabled`, `disabled`, or `invalid` (short key). Binding the ID
 means a store writer cannot copy another user's validly signed blob into
 their own session; the label keeps session tags distinct from
 `phpser_serialize_signed()` tags made with the same key. A failed
 verification raises an `E_WARNING` and returns failure to the session
 engine, which destroys the session. Unsigned blobs, including sessions
 written before the key was set, are rejected the same way. A key shorter
-than 32 bytes fails closed: every session read and write is rejected with
-a warning, rather than signing with a guessable key (INI turns `On` into
-`"1"`) or falling back to unsigned.
+than 32 bytes fails closed: every session read is rejected with a
+warning and the session engine destroys that session, rather than signing
+with a guessable key (INI turns `On` into `"1"`) or falling back to
+unsigned. A mistyped key therefore logs out every session it touches.
+`Off`, `no`, `false`, and `none` become an empty value, which disables
+signing. Quote the value in `php.ini`: an unquoted base64 key's `=` is a
+syntax error that drops every later directive, including a
+`session.serialize_handler` line that follows it.
 
 The setting is `PHP_INI_SYSTEM | PHP_INI_PERDIR`, so application code
 cannot replace it with `ini_set()`; it can still read it with
@@ -162,10 +168,15 @@ Limits:
 - Rollback: a store writer can replay an older blob that was validly
   signed for the same session ID, restoring an earlier state of that
   session (for example, from before a role was revoked or a 2FA step
-  completed). The tag binds the data to the ID, not to a time; preventing
-  rollback needs per-session state outside the store. Calling
-  `session_regenerate_id(true)` on every privilege change closes the
-  window, because the old ID's blobs no longer verify under the new ID.
+  completed). The tag binds the data to the ID, not to a time.
+  `session_regenerate_id()` does not close this: a store writer who still
+  holds the old ID, such as a demoted user who saved their own session
+  file, can recreate the old record, and it verifies, including under
+  `session.use_strict_mode`. Regeneration only stops a victim's session
+  from being moved to an older state under the victim's new ID. Preventing
+  rollback needs per-session state outside the store: keep authorization
+  decisions (roles, revocations, completed 2FA) server-side and check them
+  on each request, or keep a per-session version counter there.
 - `session_encode()` output is bound to the current session ID, so
   `session_decode()` under a different ID fails.
 

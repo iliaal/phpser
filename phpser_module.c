@@ -277,8 +277,7 @@ static PHP_MINFO_FUNCTION(phpser) {
     php_info_print_table_row(2, "version", PHP_PHPSER_VERSION);
 #ifdef HAVE_PHP_SESSION
     php_info_print_table_row(2, "session.serialize_handler", "available");
-    php_info_print_table_row(2, "session HMAC signing",
-        INI_STR("phpser.session_key")[0] ? "enabled" : "disabled");
+    php_info_print_table_row(2, "session HMAC signing", phpser_session_signing_status());
 #else
     php_info_print_table_row(2, "session.serialize_handler", "disabled (compiled without session)");
 #endif
