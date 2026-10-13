@@ -30,6 +30,57 @@
  * Defined only when HAVE_PHP_SESSION. (phpser_session.c) */
 const char *phpser_session_signing_status(void);
 
+/* Keyed (phpser.key) signing shared by the C API, the APCu serializer, and
+ * the userland keyed functions. (phpser_api.c) */
+#define PHPSER_KEY_MIN 32
+#define PHPSER_KEYED_CONTEXT_MAX 255
+
+typedef enum {
+    PHPSER_KEY_UNSET = 0,
+    PHPSER_KEY_OK,
+    PHPSER_KEY_SHORT,
+} phpser_key_status;
+
+/* Reads phpser.key. *out is set only for PHPSER_KEY_OK and stays owned by
+ * the INI entry. */
+phpser_key_status phpser_key_lookup(zend_string **out);
+
+/* 1 to PHPSER_KEYED_CONTEXT_MAX bytes, no NUL, not "session". */
+bool phpser_keyed_context_valid(const char *context, size_t context_len);
+
+/* Encodes `value`; with a non-NULL key, appends the context-bound tag.
+ * Returns NULL on failure: an exception is pending unless the SHA-256 ops
+ * are unavailable. */
+zend_string *phpser_keyed_encode(zval *value, const zend_string *key,
+                                 const char *context, size_t context_len);
+
+typedef enum {
+    PHPSER_KEYED_OK = 0,
+    PHPSER_KEYED_BAD_TAG,
+    PHPSER_KEYED_DECODE,
+} phpser_keyed_rc;
+
+/* With a non-NULL key, checks the trailing tag in constant time and decodes
+ * the frame before it only when the tag matches; with a NULL key, decodes
+ * `buf` as a plain frame. Trailing bytes after the value are rejected. On
+ * failure `out` is NULL; PHPSER_KEYED_DECODE may leave a hook exception
+ * pending. */
+phpser_keyed_rc phpser_keyed_decode(const char *buf, size_t buf_len, const zend_string *key,
+                                    const char *context, size_t context_len, zval *out,
+                                    int allowed_mode, HashTable *allowed_set);
+
+/* Wipes the calling thread's cached derived subkey. Call from MSHUTDOWN.
+ * (phpser_api.c) */
+void phpser_api_mshutdown(void);
+
+/* MINFO strings. (phpser_api.c) */
+const char *phpser_key_signing_status(void);
+const char *phpser_apcu_status(void);
+
+/* Registers the "phpser" APCu serializer when APCu exposes its registration
+ * hook. Call from MINIT, after APCu's MINIT. (phpser_api.c) */
+void phpser_apcu_register(void);
+
 /* Bound C-stack use on deeply nested input, including ASAN builds. */
 #define MAX_DEPTH 512
 

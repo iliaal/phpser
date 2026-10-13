@@ -221,6 +221,100 @@ PHP_FUNCTION(phpser_unserialize_signed) {
     }
 }
 
+/* Validates the context argument and resolves phpser.key. Userland keyed
+ * calls require a valid key: an unset key would otherwise decode an
+ * attacker-writable store unverified. Returns NULL with an exception thrown. */
+static zend_string *keyed_userland_key(const char *context, size_t context_len) {
+    if (!phpser_keyed_context_valid(context, context_len)) {
+        zend_argument_value_error(2,
+            "must be 1 to %d bytes, without NUL bytes, and not \"session\"",
+            PHPSER_KEYED_CONTEXT_MAX);
+        return NULL;
+    }
+    zend_string *key;
+    switch (phpser_key_lookup(&key)) {
+    case PHPSER_KEY_OK:
+        return key;
+    case PHPSER_KEY_SHORT:
+        zend_throw_exception_ex(zend_ce_exception, 0,
+            "phpser: phpser.key must be at least %d bytes", PHPSER_KEY_MIN);
+        return NULL;
+    default:
+        zend_throw_exception(zend_ce_exception, "phpser: phpser.key is not set", 0);
+        return NULL;
+    }
+}
+
+PHP_FUNCTION(phpser_serialize_keyed) {
+    zval *value;
+    char *context;
+    size_t context_len;
+    ZEND_PARSE_PARAMETERS_START(2, 2)
+        Z_PARAM_ZVAL(value)
+        Z_PARAM_STRING(context, context_len)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zend_string *key = keyed_userland_key(context, context_len);
+    if (!key) {
+        RETURN_THROWS();
+    }
+    zend_string *out = phpser_keyed_encode(value, key, context, context_len);
+    if (UNEXPECTED(!out)) {
+        if (!EG(exception)) {
+            zend_throw_exception(zend_ce_exception,
+                "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
+        }
+        RETURN_THROWS();
+    }
+    RETURN_STR(out);
+}
+
+PHP_FUNCTION(phpser_unserialize_keyed) {
+    char *payload;
+    size_t payload_len;
+    char *context;
+    size_t context_len;
+    HashTable *options_ht = NULL;
+    ZEND_PARSE_PARAMETERS_START(2, 3)
+        Z_PARAM_STRING(payload, payload_len)
+        Z_PARAM_STRING(context, context_len)
+        Z_PARAM_OPTIONAL
+        Z_PARAM_ARRAY_HT(options_ht)
+    ZEND_PARSE_PARAMETERS_END();
+
+    zend_string *key = keyed_userland_key(context, context_len);
+    if (!key) {
+        RETURN_THROWS();
+    }
+    int allowed_mode;
+    HashTable *allowed_set;
+    if (parse_unserialize_options(options_ht, 3, "phpser_unserialize_keyed",
+                                  &allowed_mode, &allowed_set) < 0) {
+        RETURN_THROWS();
+    }
+
+    phpser_keyed_rc rc = phpser_keyed_decode(payload, payload_len, key, context, context_len,
+                                             return_value, allowed_mode, allowed_set);
+
+    if (allowed_set) {
+        zend_hash_destroy(allowed_set);
+        efree(allowed_set);
+    }
+
+    if (rc == PHPSER_KEYED_BAD_TAG) {
+        zend_throw_exception(zend_ce_exception,
+            "phpser: signature verification failed", 0);
+        RETURN_THROWS();
+    }
+    if (rc != PHPSER_KEYED_OK) {
+        if (!EG(exception)) {
+            zend_throw_exception(zend_ce_exception,
+                "phpser: signed payload failed to decode", 0);
+        }
+        RETURN_THROWS();
+    }
+}
+
 /* -------------------------------------------------------------------------
  * Module plumbing.
  * ------------------------------------------------------------------------- */
@@ -231,6 +325,7 @@ PHP_FUNCTION(phpser_unserialize_signed) {
  * set it in php.ini or an FPM pool's php_admin_value. */
 PHP_INI_BEGIN()
     PHP_INI_ENTRY("phpser.session_key", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
+    PHP_INI_ENTRY("phpser.key", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
 PHP_INI_END()
 
 static PHP_MINIT_FUNCTION(phpser) {
@@ -252,12 +347,14 @@ static PHP_MINIT_FUNCTION(phpser) {
     zend_string *algo = zend_string_init("sha256", sizeof("sha256") - 1, 0);
     phpser_sha256_ops = php_hash_fetch_ops(algo);
     zend_string_release(algo);
+    phpser_apcu_register();
     return SUCCESS;
 }
 
 static PHP_MSHUTDOWN_FUNCTION(phpser) {
     UNREGISTER_INI_ENTRIES();
     phpser_hmac_mshutdown();
+    phpser_api_mshutdown();
     phpser_sha256_ops = NULL;
     return SUCCESS;
 }
@@ -281,6 +378,8 @@ static PHP_MINFO_FUNCTION(phpser) {
 #else
     php_info_print_table_row(2, "session.serialize_handler", "disabled (compiled without session)");
 #endif
+    php_info_print_table_row(2, "keyed HMAC signing (phpser.key)", phpser_key_signing_status());
+    php_info_print_table_row(2, "APCu serializer", phpser_apcu_status());
     php_info_print_table_row(2, "HMAC SHA-256 backend", phpser_sha256_backend());
     php_info_print_table_end();
 }
@@ -293,6 +392,8 @@ static const zend_module_dep phpser_deps[] = {
 #ifdef HAVE_PHP_SESSION
     ZEND_MOD_OPTIONAL("session")
 #endif
+    /* APCu must publish its serializer registration hook before MINIT. */
+    ZEND_MOD_OPTIONAL("apcu")
     ZEND_MOD_END
 };
 

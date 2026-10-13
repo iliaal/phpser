@@ -13,9 +13,9 @@
 /*
  * phpser module entry header.
  *
- * Exports only the zend_module_entry. The encode/decode paths are not a
- * stable C API; use phpser_serialize() / phpser_unserialize() from PHP, or
- * the session.serialize_handler when HAVE_PHP_SESSION.
+ * Exports only the zend_module_entry. Extensions that serialize through
+ * phpser use php_phpser_api.h; the internal encode/decode paths are not a
+ * stable C API.
  */
 #ifndef PHP_PHPSER_H
 #define PHP_PHPSER_H
