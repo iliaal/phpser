@@ -162,13 +162,20 @@ phpser.key = "<64 hex chars, e.g. from: openssl rand -hex 32>"
 ```
 
 Set `apc.serializer` globally, in the `php.ini` the FPM master reads, the
-same for every pool. APCu binds its serializer once per process lineage: at
-startup when the value is `php`, otherwise at the first request, which runs
-in the master when `opcache.preload` is set. Either way a pool's
-`php_admin_value[apc.serializer]` can be ignored, and `phpinfo()` then
-reports the APCu serializer as inactive. phpser registers with APCu only
-when it is loaded at startup through an `extension=` line, never through
-`dl()`.
+same for every pool. APCu binds its serializer once per process: at startup
+when the value is `php` (the default), otherwise at the first request that
+runs with APCu enabled. With `opcache.preload`, a non-root FPM master runs
+that request itself before forking, so every pool inherits the `php.ini`
+value; a root master with `opcache.preload_user` preloads in a forked child,
+so each worker binds at its own first request. A pool's
+`php_admin_value[apc.serializer]` can therefore be ignored. The APCu row in
+the phpser section of `phpinfo()` reports what phpser observed, not what
+will happen: `inactive` when APCu bound `php` at startup, `used by APCu in
+this process` once APCu has called phpser in that process, `not yet used`
+before then (or when another serializer is bound), and `not registered`
+when APCu was not loaded at startup or phpser came from `dl()`. phpser
+registers with APCu only when it is loaded at startup through an
+`extension=` line.
 
 Without `phpser.key` the frames are plain and APCu shared memory is
 trusted, as with APCu's own `php` serializer. With it, every value APCu
@@ -178,7 +185,9 @@ tag does not verify (written under another key, by another serializer, or
 before the key was set) is never decoded and raises an `E_WARNING`:
 `apcu_fetch()` returns `false`, as for a miss, but `apcu_entry()` returns
 `null` without calling its generator until the entry expires or is
-deleted. Scalars, and arrays that a process with no
+deleted. Under an error handler that turns warnings into exceptions (as
+Laravel's does), the fetch throws instead, so a hostile pool that
+overwrites an entry can make another pool's reads of it throw. Scalars, and arrays that a process with no
 resolvable serializer stored natively, are read back without a check.
 
 This is a defense against object injection between PHP-FPM pools that share

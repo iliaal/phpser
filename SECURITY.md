@@ -218,8 +218,9 @@ instead. The context labels cannot reproduce the session derivation
 (`session` is refused as a context), and `phpser_serialize_signed()` tags
 use the raw key, so the three schemes do not produce each other's tags.
 The phpser section of `phpinfo()` reports keyed signing as `enabled`,
-`disabled`, or `invalid` (short key), and whether the APCu serializer is
-registered and active.
+`disabled`, or `invalid` (short key), and what phpser observed of APCu:
+not registered, inactive (APCu bound its `php` serializer at startup), or
+whether APCu has called phpser in the current process yet.
 
 APCu keeps its cache in one shared memory segment created by the PHP-FPM
 master, so every pool of that master reads and writes the same entries.
@@ -229,15 +230,21 @@ another pool's `apcu_fetch()` instantiates, running its `__wakeup` /
 is not general authentication of APCu data. It holds when
 `apc.serializer = phpser` is set globally, in the `php.ini` the master
 reads, and each pool has its own `php_admin_value[phpser.key]`. APCu binds
-its serializer once per process lineage (at startup for `php`, otherwise at
-the first request, which `opcache.preload` runs in the master), so a
-per-pool `php_admin_value[apc.serializer]` can be ignored; `phpinfo()`
-reports the APCu serializer as inactive when phpser is not the one bound. Then every value APCu passes
+its serializer once per process: at startup for `php`, otherwise at the
+first request run with APCu enabled, which a non-root FPM master with
+`opcache.preload` runs itself before forking (a root master with
+`opcache.preload_user` preloads in a child, and workers bind at their own
+first request). A per-pool `php_admin_value[apc.serializer]` can therefore
+be ignored. `phpinfo()` reports only what phpser observed and cannot
+predict which serializer a worker will bind. Then every value APCu passes
 through the serializer in a pool, objects always and arrays, is verified
 before it is decoded, and a value another pool wrote under its own key, or
 with another serializer, fails verification with an `E_WARNING` and is not
 decoded: `apcu_fetch()` returns `false`, and `apcu_entry()` returns `null`
-without calling its generator until the entry expires or is deleted. A
+without calling its generator until the entry expires or is deleted. Where
+an error handler converts warnings to exceptions, the read throws instead,
+so a hostile pool can turn an overwritten entry into exceptions in another
+pool. A
 pool can still overwrite or delete another pool's entries (APCu has no
 per-pool namespace), so a hostile pool can make another pool's
 `apcu_entry()` return `null`. Shared memory that is written directly
