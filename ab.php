@@ -385,6 +385,13 @@ $REPS  = max(1, (int)(getenv('BENCH_REPS') ?: 15));
 $MODE  = getenv('BENCH_MODE') ?: 'plain';
 $KEY   = str_repeat("\x5a", 32);
 
+function ab_median(array $samples): float {
+    sort($samples);
+    $n = count($samples);
+    $mid = intdiv($n, 2);
+    return ($n % 2) ? $samples[$mid] : ($samples[$mid - 1] + $samples[$mid]) / 2.0;
+}
+
 function med(callable $fn, $arg, int $it, int $r): float {
     $s = [];
     for ($k = 0; $k < $r; $k++) {
@@ -392,8 +399,7 @@ function med(callable $fn, $arg, int $it, int $r): float {
         for ($i = 0; $i < $it; $i++) $fn($arg);
         $s[] = (hrtime(true) - $t) / $it;
     }
-    sort($s);
-    return $s[intdiv($r, 2)];
+    return ab_median($s);
 }
 
 // Retained decode with the collector on: every result stays reachable, so
@@ -411,9 +417,7 @@ function med_retained(string $blob, int $keep, int $r): array {
         $runs[] = gc_status()['runs'] - $before;
         unset($bag);
     }
-    sort($s);
-    sort($runs);
-    return [$s[intdiv($r, 2)], $runs[intdiv($r, 2)]];
+    return [ab_median($s), ab_median($runs)];
 }
 
 $shapes = [
@@ -439,7 +443,7 @@ if ($MODE === 'gc') {
     foreach ($shapes as $name => $data) {
         $blob = phpser_serialize($data);
         [$dec, $runs] = med_retained($blob, $keep, $REPS);
-        printf("%-12s size=%7d keep=%4d dec_gc=%9.1f gc_runs=%d\n", $name, strlen($blob), $keep, $dec, $runs);
+        printf("%-12s size=%7d keep=%4d dec_gc=%9.1f gc_runs=%s\n", $name, strlen($blob), $keep, $dec, $runs);
     }
     exit(0);
 }

@@ -941,8 +941,8 @@ function bench_gc_retained(array $cases, array $serializers, int $keep_cap, int 
                 $cell[$mode] = median($ns);
                 $cell[$mode . '_iqr'] = iqr($ns);
             }
-            $cell['gc_on_runs'] = (int) median(array_column($samples[$name]['gc_on'], 'runs'));
-            $cell['gc_on_collected'] = (int) median(array_column($samples[$name]['gc_on'], 'collected'));
+            $cell['gc_on_runs'] = median(array_column($samples[$name]['gc_on'], 'runs'));
+            $cell['gc_on_collected'] = median(array_column($samples[$name]['gc_on'], 'collected'));
             $cell['threshold'] = $samples[$name]['gc_on'][0]['threshold'];
             $results[$label][$name] = $cell;
         }
