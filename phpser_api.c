@@ -84,6 +84,11 @@ static int phpser_keyed_subkey(const zend_string *key, const char *context, size
         memcpy(subkey, c->subkey, PHPSER_HMAC_TAG_LEN);
         return 0;
     }
+    /* A miss retires the cached key; a shorter or uncacheable new key must not
+     * leave any of its bytes behind. */
+    if (c->valid) {
+        ZEND_SECURE_ZERO(c, sizeof(*c));
+    }
 
     unsigned char msg[sizeof(PHPSER_KEYED_LABEL_PREFIX) - 1 + PHPSER_KEYED_CONTEXT_MAX
                       + sizeof(PHPSER_KEYED_LABEL_SUFFIX)];
@@ -210,7 +215,7 @@ PHP_PHPSER_API int phpser_api_serialize(const zval *value,
     *out = NULL;
     if (!phpser_api_context_ok(context, context_len)
         || phpser_api_key(&key) == PHPSER_KEY_SHORT) {
-        return -1;
+        return PHPSER_API_ERR;
     }
     /* The encoder does not write the top-level zval; serialization hooks may
      * still mutate the objects it reaches, as with any serializer. */
@@ -220,10 +225,10 @@ PHP_PHPSER_API int phpser_api_serialize(const zval *value,
             php_error_docref(NULL, E_WARNING,
                 "phpser: SHA256 hash ops unavailable; value not serialized");
         }
-        return -1;
+        return PHPSER_API_ERR;
     }
     *out = s;
-    return 0;
+    return PHPSER_API_OK;
 }
 
 PHP_PHPSER_API int phpser_api_unserialize(const char *buf, size_t buf_len,
@@ -233,7 +238,7 @@ PHP_PHPSER_API int phpser_api_unserialize(const char *buf, size_t buf_len,
     ZVAL_NULL(out);
     if (!phpser_api_context_ok(context, context_len)
         || phpser_api_key(&key) == PHPSER_KEY_SHORT) {
-        return -1;
+        return PHPSER_API_ERR;
     }
     /* Same trust model as the unsigned session handler: the store framing is
      * authoritative, so trailing bytes are corruption, and every class may
@@ -241,15 +246,19 @@ PHP_PHPSER_API int phpser_api_unserialize(const char *buf, size_t buf_len,
     switch (phpser_keyed_decode(buf, buf_len, key, context, context_len, out,
                                 ALLOWED_ALL, NULL)) {
     case PHPSER_KEYED_OK:
-        return 0;
+        return PHPSER_API_OK;
     case PHPSER_KEYED_BAD_TAG:
         php_error_docref(NULL, E_WARNING,
             "phpser: %.*s value failed HMAC verification, not decoded",
             (int) context_len, context);
-        return -1;
+        return PHPSER_API_ERR_TAG;
     default:
-        return -1;
+        return PHPSER_API_ERR;
     }
+}
+
+PHP_PHPSER_API unsigned int phpser_api_version(void) {
+    return PHPSER_API_VERSION;
 }
 
 /* -------------------------------------------------------------------------
@@ -270,6 +279,18 @@ typedef int (*phpser_apc_register_t)(const char *name, phpser_apc_serialize_t se
                                      phpser_apc_unserialize_t unserialize, void *config);
 
 static bool phpser_apcu_registered = false;
+/* APCu binds its cache serializer by name in its own MINIT, when only its
+ * built-in "php" serializer exists. Any other name resolves to nothing there
+ * and is filled in by the first RINIT of each process from that process's
+ * apc.serializer. So a startup value of "php" wins over any later per-pool
+ * value, while any other startup value defers to the per-process value. */
+static bool phpser_apcu_bound_php_at_startup = false;
+
+static zend_string *phpser_apcu_serializer_ini(void) {
+    zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives),
+                                                   "apc.serializer", sizeof("apc.serializer") - 1);
+    return entry ? entry->value : NULL;
+}
 
 /* APCu returns 1 on success and 0 on failure, and efree()s *buf. */
 static int phpser_apc_serialize(unsigned char **buf, size_t *buf_len,
@@ -277,7 +298,7 @@ static int phpser_apc_serialize(unsigned char **buf, size_t *buf_len,
     zend_string *s;
     (void) config;
     if (phpser_api_serialize(value, PHPSER_APCU_CONTEXT,
-                             sizeof(PHPSER_APCU_CONTEXT) - 1, &s) != 0) {
+                             sizeof(PHPSER_APCU_CONTEXT) - 1, &s) != PHPSER_API_OK) {
         return 0;
     }
     *buf = emalloc(ZSTR_LEN(s) + 1);
@@ -292,7 +313,7 @@ static int phpser_apc_unserialize(zval *value, unsigned char *buf, size_t buf_le
                                   void *config) {
     (void) config;
     return phpser_api_unserialize((const char *) buf, buf_len, PHPSER_APCU_CONTEXT,
-                                  sizeof(PHPSER_APCU_CONTEXT) - 1, value) == 0;
+                                  sizeof(PHPSER_APCU_CONTEXT) - 1, value) == PHPSER_API_OK;
 }
 
 void phpser_apcu_register(void) {
@@ -306,16 +327,21 @@ void phpser_apcu_register(void) {
     phpser_apc_register_t reg = (phpser_apc_register_t) (uintptr_t) Z_LVAL_P(hook);
     phpser_apcu_registered = reg(PHP_PHPSER_EXTNAME, phpser_apc_serialize,
                                  phpser_apc_unserialize, NULL) != 0;
+    zend_string *startup = phpser_apcu_serializer_ini();
+    phpser_apcu_bound_php_at_startup = startup && zend_string_equals_literal(startup, "php");
 }
 
 const char *phpser_apcu_status(void) {
     if (!phpser_apcu_registered) {
         return "not registered (APCu not loaded, or disabled for this SAPI)";
     }
-    zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives),
-                                                   "apc.serializer", sizeof("apc.serializer") - 1);
-    if (!entry || !entry->value || !zend_string_equals_literal(entry->value, PHP_PHPSER_EXTNAME)) {
+    zend_string *current = phpser_apcu_serializer_ini();
+    if (!current || !zend_string_equals_literal(current, PHP_PHPSER_EXTNAME)) {
         return "registered, inactive (apc.serializer is not phpser)";
+    }
+    if (phpser_apcu_bound_php_at_startup) {
+        return "registered, inactive (APCu bound the php serializer at startup; "
+               "set apc.serializer=phpser in php.ini, not per FPM pool)";
     }
     return "registered, active";
 }

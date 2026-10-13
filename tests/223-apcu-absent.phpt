@@ -5,11 +5,15 @@ phpser
 --SKIPIF--
 <?php
 if (!function_exists('shell_exec')) die('skip shell_exec disabled');
-// -n drops php.ini and conf.d; APCu loaded through TEST_PHP_ARGS would survive it.
+// -n drops php.ini and conf.d; APCu loaded through TEST_PHP_ARGS would survive
+// it. The probe runs from a file: Windows escapeshellarg() strips double quotes.
+$probe = sys_get_temp_dir() . '/phpser-223-probe-' . md5(__DIR__) . '.php';
+file_put_contents($probe, '<?php echo extension_loaded("phpser") ? (extension_loaded("apcu") ? "apcu" : "ok") : "noext";');
 $cmd = escapeshellarg(getenv('TEST_PHP_EXECUTABLE') ?: PHP_BINARY) . ' -n ' . (getenv('TEST_PHP_EXTRA_ARGS') ?: '')
-    . ' -r ' . escapeshellarg('echo extension_loaded("phpser") ? (extension_loaded("apcu") ? "apcu" : "ok") : "noext";');
-$probe = trim((string) shell_exec($cmd));
-if ($probe !== 'ok') die("skip cannot start a child without APCu ($probe)");
+    . ' ' . escapeshellarg($probe) . ' 2>&1';
+$out = trim((string) shell_exec($cmd));
+unlink($probe);
+if ($out !== 'ok') die("skip cannot start a child without APCu ($out)");
 ?>
 --FILE--
 <?php
