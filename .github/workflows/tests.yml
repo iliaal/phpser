@@ -67,6 +67,10 @@ jobs:
       fail-fast: false
       matrix:
         php: ['8.2', '8.3', '8.4', '8.5']
+        # One lane loads APCu so the apc.serializer tests run instead of skipping.
+        include:
+          - php: '8.4'
+            extensions: apcu
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -77,6 +81,7 @@ jobs:
         uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: ${{ matrix.php }}
+          extensions: ${{ matrix.extensions }}
           tools: phpize, php-config
 
       - name: Build extension
@@ -98,6 +103,18 @@ jobs:
           export TEST_PHP_EXECUTABLE=$(which php)
           export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
           php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/
+
+      # The APCu tests set apc.enable_cli=1 in their INI sections; fail if they skip.
+      - name: Check APCu tests ran
+        if: matrix.extensions == 'apcu'
+        env:
+          NO_INTERACTION: 1
+        run: |
+          export TEST_PHP_EXECUTABLE=$(which php)
+          export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
+          php -r 'exit(extension_loaded("apcu") ? 0 : 1);'
+          php run-tests.php --show-diff tests/218-apcu-serializer.phpt tests/219-apcu-keyed.phpt tests/222-apcu-short-key.phpt | tee apcu-tests.log
+          grep -Eq 'Tests passed +: +3 ' apcu-tests.log
 
   # aarch64 exercises the ARMv8 SHA-256 path; test 142 fails if it falls back.
   linux-arm:
