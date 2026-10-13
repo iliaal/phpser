@@ -151,10 +151,57 @@ No application code changes, with two consequences to know about:
   `session_decode()` of that string under a different ID fails and
   destroys the target session.
 
+APCu. When APCu is loaded, phpser registers itself as an APCu serializer,
+so APCu stores arrays and objects as phpser frames:
+
+```ini
+apc.serializer = phpser
+; Optional: sign every array and object APCu stores.
+phpser.key = "<64 hex chars, e.g. from: openssl rand -hex 32>"
+```
+
+Without `phpser.key` the frames are plain and APCu shared memory is
+trusted, as with APCu's own `php` serializer. With it, each array or object
+carries an HMAC-SHA256 tag bound to the key and to the context `apcu`. A
+value whose tag does not verify (written under another key, or before the
+key was set) is never decoded: `apcu_fetch()` returns `false` and raises an
+`E_WARNING`. Signing is worth it when several PHP-FPM pools share one
+master: APCu shared memory is common to all of them, so code in one pool can
+write entries that another pool decodes. Give each pool its own key with
+`php_admin_value[phpser.key]`. A key shorter than 32 bytes fails closed:
+`apcu_store()` of an array or object returns `false` with a warning, and
+nothing is stored unsigned. `phpinfo()` reports whether the APCu serializer
+is registered and active.
+
+Keyed values for other stores. `phpser_serialize_keyed($value, $context)`
+and `phpser_unserialize_keyed($payload, $context, $options)` sign with
+`phpser.key`, so the key stays in server configuration instead of
+application code:
+
+```php
+$redis->set('user:7', phpser_serialize_keyed($user, 'redis'));
+$user = phpser_unserialize_keyed($redis->get('user:7'), 'redis');
+// throws if the payload was tampered, unsigned, or signed for another
+// context or key, and if phpser.key is unset or shorter than 32 bytes
+```
+
+The context names the store and must be 1 to 255 bytes, contain no NUL
+byte, and not be `session`. A payload signed for `redis` does not verify as
+`memcached` or `apcu`. Under the same key and context, the output is
+byte-identical to what the C API below produces, so PHP code and an
+extension can share a store.
+
+C API. Other extensions (cache clients, session stores) can serialize
+through phpser with `phpser_api_serialize()` and `phpser_api_unserialize()`
+from the installed header `ext/phpser/php_phpser_api.h`. Both follow
+`phpser.key`: plain frames when it is unset, context-bound signed frames
+when it is set. The header documents the ownership and error contract.
+
 ## ✨ Features
 
 - **Signed payloads**: `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input before any decoding runs. Use it whenever the store crosses a trust boundary (memcached, redis, files, cookies), anywhere an attacker who can write to the store could feed your decoder a crafted payload. Both sides reject an empty key, since a keyless HMAC is forgeable.
 - **Signed sessions**: `phpser.session_key` turns on HMAC-SHA256 signing for the session handler. The tag is bound to the session ID, so a forged, corrupted, or copied-from-another-session blob fails verification and is never decoded. One INI line next to `session.serialize_handler = phpser`, no code changes. It does not stop rollback to an older blob signed for the same ID, so keep authorization state outside the session.
+- **APCu serializer and keyed signing**: `apc.serializer = phpser` stores APCu arrays and objects as phpser frames. Set `phpser.key` and every one of them carries an HMAC-SHA256 tag bound to the key and the `apcu` context, verified before decoding, so FPM pools that share APCu memory cannot feed each other's decoder. `phpser_serialize_keyed()` / `phpser_unserialize_keyed()` apply the same key to Redis, memcached, or any other store, and `php_phpser_api.h` exposes it to other extensions.
 - **Untrusted input limits**: both unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (returns `null`). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled key comparisons and collision chains consume bounded work budgets. TABLE/ROWSET rows and fallback object-property copies have a separate materialization budget. Exhausting a budget rejects the frame; these limits do not bound autoloaders or application hooks. See [SECURITY.md](SECURITY.md) for exact limits and class-resolution costs.
 - **Supported versions**: PHP 8.2+ (8.3, 8.4, 8.5, master). BSD 3-Clause.
 
@@ -414,8 +461,9 @@ as a `session.serialize_handler` when available.
 - **`session.serialize_handler=phpser` is shipped** (compiled in when
   `phpize` detects the session extension; gated on `HAVE_PHP_SESSION` so
   the extension still loads on session-less PHP builds). `phpredis`
-  integration is not yet wired; call `phpser_serialize`/`unserialize`
-  directly when using the extension as a phpredis serializer. The handler
+  integration is not yet wired; call `phpser_serialize_keyed()` /
+  `phpser_unserialize_keyed()` (or the unsigned pair) directly when using
+  the extension with phpredis. The handler
   serializes `$_SESSION` as a single phpser array value; it is **not**
   byte-compatible with the built-in `php`, `php_binary`, or `igbinary`
   session formats, so switching handlers doesn't read back sessions written
@@ -432,6 +480,16 @@ as a `session.serialize_handler` when available.
   returns no data: PHP 8.6+ then skips the write and the previous session
   survives, while PHP 8.5 and earlier write an empty session, which the next
   request reads as new.
+
+- **APCu signing covers arrays and objects only.** APCu stores `null`,
+  booleans, integers, floats, and strings itself without calling a
+  serializer, so those values are never signed or verified. Entries loaded
+  through `apc.preload_path` are written during APCu startup, before phpser
+  registers, so they are stored without phpser and without a tag.
+- **Keyed values are bound to the key and context, not to the entry
+  name.** Neither APCu nor phpredis passes the cache key to a serializer,
+  so a value validly signed for one entry verifies under any other entry of
+  the same context. See `SECURITY.md`.
 
 ## Wire format (V1 / V2)
 

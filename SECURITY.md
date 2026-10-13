@@ -23,6 +23,9 @@ to letting the attacker run those magic methods.
   redis, signed cookies, etc.). Both the signing and verifying side throw
   on an empty `$hmac_key`, since a keyless HMAC is forgeable. Use a
   high-entropy secret, e.g. 32 random bytes.
+- `phpser_unserialize_keyed($payload, $context)` does the same with the
+  server-configured `phpser.key` and a per-store context; see "Keyed values
+  and APCu" below.
 
 A valid HMAC proves that the signer possessed the key. It does not prove the
 body was emitted by `phpser_serialize_signed()`: code with the key can sign
@@ -114,7 +117,10 @@ memory. A different key overwrites the entry in place, and module shutdown
 wipes it; a ZTS worker thread that exits before module shutdown frees its
 copy without wiping it. The lookup compares the full 64-byte key block in
 constant time, so timing reveals only whether the key matches the thread's
-previous key.
+previous key. Keyed signing (`phpser.key`) also caches, per thread, the
+most recent key of up to 128 bytes, its context, and the subkey derived
+from them, under the same rules: a new key or context overwrites the entry,
+the key compare runs in constant time, and module shutdown wipes it.
 
 **Session handler.** When built against the session extension, phpser
 registers `session.serialize_handler = phpser`. Unless
@@ -190,6 +196,51 @@ Limits:
   on each request, or keep a per-session version counter there.
 - `session_encode()` output is bound to the current session ID, so
   `session_decode()` under a different ID fails.
+
+**Keyed values and APCu.** `phpser.key` (`PHP_INI_SYSTEM |
+PHP_INI_PERDIR`, independent of `phpser.session_key`) signs values written
+by the APCu serializer (`apc.serializer = phpser`), by
+`phpser_serialize_keyed()`, and by extensions using `php_phpser_api.h`. The
+output is the phpser frame followed by a 32-byte tag:
+`HMAC(HMAC(key, "phpser:" || context || ":v1\0"), frame)`. APCu uses the
+context `apcu`. The reader checks the tag in constant time before any
+decode work, then decodes with exact consumption and all classes allowed,
+the session handler's trust model: signing is what makes the store safe to
+decode. Unsigned input, including values written before the key was set,
+is rejected. A key shorter than 32 bytes fails closed in both directions
+with a warning naming `phpser.key`; it never signs with the weak key and
+never falls back to unsigned. With no key, APCu and the C API read and
+write plain frames and trust the store; the userland keyed functions throw
+instead. The context labels cannot reproduce the session derivation
+(`session` is refused as a context), and `phpser_serialize_signed()` tags
+use the raw key, so the three schemes do not produce each other's tags.
+The phpser section of `phpinfo()` reports keyed signing as `enabled`,
+`disabled`, or `invalid` (short key), and whether the APCu serializer is
+registered and active.
+
+APCu keeps its cache in one shared memory segment created by the PHP-FPM
+master, so every pool of that master reads and writes the same entries.
+Without signing, code running in any pool can store an object graph that
+another pool's `apcu_fetch()` instantiates, running its `__wakeup` /
+`__unserialize` there. With a distinct `php_admin_value[phpser.key]` per
+pool, a pool can still overwrite or delete another pool's entries (APCu has
+no per-pool namespace), but the victim's fetch fails verification and
+reports a miss with an `E_WARNING`, so the victim never decodes the
+foreign value. Shared memory that is written directly (native code, a
+debugger) is outside this model.
+
+Limits:
+
+- The tag binds a value to the key and the context, not to the cache entry
+  name: neither APCu nor phpredis passes the entry name to a serializer. Anyone
+  who can write the store can move a validly signed value from one entry to
+  another of the same context, or replay an older value. Store the identity
+  the value is for inside the value and check it after reading when that
+  matters.
+- APCu stores scalars (`null`, booleans, integers, floats, strings) without
+  calling a serializer, so they are never signed. Entries from
+  `apc.preload_path` are written before phpser registers and carry no tag.
+- Use a distinct key per application and environment, as with sessions.
 
 ## Supported versions
 

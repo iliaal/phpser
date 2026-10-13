@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `apc.serializer=phpser` APCu serializer, registered when APCu is loaded.
+- `phpser.key` INI setting signs APCu values and keyed payloads with HMAC-SHA256 bound to a per-store context; keys under 32 bytes fail closed.
+- `phpser_serialize_keyed()` and `phpser_unserialize_keyed()` sign with `phpser.key`.
+- `php_phpser_api.h` C API (`phpser_api_serialize()`, `phpser_api_unserialize()`) for other extensions.
+- `phpinfo()` reports keyed signing status and APCu serializer registration.
+
 ## [0.8.0] - 2026-10-13
 
 ### Added
