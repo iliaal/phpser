@@ -117,7 +117,8 @@ constant time, so timing reveals only whether the key matches the thread's
 previous key.
 
 **Session handler.** When built against the session extension, phpser
-registers `session.serialize_handler = phpser`. This handler restores
+registers `session.serialize_handler = phpser`. Unless
+`phpser.session_key` is set, this handler restores
 `$_SESSION` through the **unsigned, all-classes-allowed** decode path,
 with no `allowed_classes` filter and no HMAC, like the native
 `php_serialize` handler. It therefore trusts the session store: anyone
@@ -136,7 +137,10 @@ their own session; the label keeps session tags distinct from
 `phpser_serialize_signed()` tags made with the same key. A failed
 verification raises an `E_WARNING` and returns failure to the session
 engine, which destroys the session. Unsigned blobs, including sessions
-written before the key was set, are rejected the same way.
+written before the key was set, are rejected the same way. A key shorter
+than 32 bytes fails closed: every session read and write is rejected with
+a warning, rather than signing with a guessable key (INI turns `On` into
+`"1"`) or falling back to unsigned.
 
 The setting is `PHP_INI_SYSTEM | PHP_INI_PERDIR`, so application code
 cannot replace it with `ini_set()`; it can still read it with
@@ -144,10 +148,26 @@ cannot replace it with `ini_set()`; it can still read it with
 shared hosting, set it per pool (`php_admin_value`) so tenants do not
 share or read each other's keys.
 
-Limits: an empty store value still starts a new, empty session, so a store
-writer can log a user out. A store writer can also replay an older blob
-that was validly signed for the same session ID, rolling that session back
-to an earlier state. Session ID regeneration limits this window.
+Protection holds only for requests that run with the key. A `.user.ini`
+covers scripts at or below its directory; a script elsewhere that shares
+the store decodes it unverified. `session.serialize_handler` is
+`PHP_INI_ALL`, so any script that switches away from `phpser` also reads
+the store unverified. Set both the handler and the key for every script
+that shares the store, in `php.ini` or the pool configuration.
+
+Limits:
+
+- An empty store value still starts a new, empty session, so a store
+  writer can log a user out.
+- Rollback: a store writer can replay an older blob that was validly
+  signed for the same session ID, restoring an earlier state of that
+  session (for example, from before a role was revoked or a 2FA step
+  completed). The tag binds the data to the ID, not to a time; preventing
+  rollback needs per-session state outside the store. Calling
+  `session_regenerate_id(true)` on every privilege change closes the
+  window, because the old ID's blobs no longer verify under the new ID.
+- `session_encode()` output is bound to the current session ID, so
+  `session_decode()` under a different ID fails.
 
 ## Supported versions
 

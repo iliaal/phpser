@@ -15,7 +15,7 @@ session.save_handler=files
 session.use_cookies=0
 session.use_strict_mode=0
 session.cache_limiter=
-phpser.session_key=test-session-key-0123456789
+phpser.session_key=test-session-key-0123456789abcdef
 --FILE--
 <?php
 session_save_path(sys_get_temp_dir());
@@ -36,12 +36,12 @@ function open_as(string $id): void {
     session_start();
 }
 
-function rejected(string $label, string $payload): void {
+function rejected(string $label, string $payload, string $why = 'failed HMAC verification'): void {
     global $msgs;
     $msgs = [];
     $_SESSION = [];
     $r = session_decode($payload);
-    $hmac = (bool) preg_grep('/failed HMAC verification/', $msgs);
+    $hmac = (bool) preg_grep('/' . preg_quote($why, '/') . '/', $msgs);
     echo "$label: ", ($r === false && $hmac && session_status() !== PHP_SESSION_ACTIVE)
         ? "rejected" : "ACCEPTED", "\n";
 }
@@ -82,7 +82,7 @@ rejected('unsigned_gadget', phpser_serialize(['g' => new Gadget]));
 
 open_as($sidA);
 rejected('signed_cache_payload', phpser_serialize_signed(['user' => 'alice', 'role' => 'admin'],
-    'test-session-key-0123456789'));
+    'test-session-key-0123456789abcdef'));
 
 // The same bytes are valid under A's ID only.
 open_as($sidB);
@@ -102,10 +102,10 @@ for ($i = 0; $i < 1000; $i++) $deep = [$deep];
 $_SESSION = ['deep' => $deep];
 $tomb = session_encode();
 echo "overdepth_tombstone: ", $tomb === 'phpser:session-not-serialized' ? "yes" : "no", "\n";
-rejected('tombstone_read', $tomb);
+rejected('tombstone_read', $tomb, 'was not saved by the previous request');
 
 echo "ini_set_denied: ", ini_set('phpser.session_key', 'attacker') === false
-    && ini_get('phpser.session_key') === 'test-session-key-0123456789' ? "yes" : "no", "\n";
+    && ini_get('phpser.session_key') === 'test-session-key-0123456789abcdef' ? "yes" : "no", "\n";
 
 restore_error_handler();
 echo "DONE\n";

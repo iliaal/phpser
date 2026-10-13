@@ -33,12 +33,32 @@ static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
 
 #define PHPSER_SESSION_KDF_LABEL "phpser:session:v1"
 
-/* Non-NULL only when phpser.session_key is set; signing is then mandatory
- * for both directions, so an unsigned blob can never be read back. */
-static zend_string *phpser_session_key(void) {
+#define PHPSER_SESSION_KEY_MIN 32
+
+typedef enum {
+    PHPSER_SKEY_UNSET = 0,
+    PHPSER_SKEY_OK,
+    PHPSER_SKEY_SHORT,
+} phpser_skey_status;
+
+/* With a key set, signing is mandatory in both directions, so an unsigned
+ * blob can never be read back. A short key fails closed rather than falling
+ * back to unsigned: INI booleans turn `On` into the one-byte key "1". */
+static phpser_skey_status phpser_session_key(zend_string **out) {
     zend_string *key = zend_ini_str_ex("phpser.session_key",
                                        sizeof("phpser.session_key") - 1, false, NULL);
-    return (key && ZSTR_LEN(key) > 0) ? key : NULL;
+    *out = NULL;
+    if (!key || ZSTR_LEN(key) == 0) {
+        return PHPSER_SKEY_UNSET;
+    }
+    if (ZSTR_LEN(key) < PHPSER_SESSION_KEY_MIN) {
+        php_error_docref(NULL, E_WARNING,
+            "phpser.session_key must be at least %d bytes; session data rejected",
+            PHPSER_SESSION_KEY_MIN);
+        return PHPSER_SKEY_SHORT;
+    }
+    *out = key;
+    return PHPSER_SKEY_OK;
 }
 
 /* Tag over the frame under a per-session-ID subkey. Binding the ID stops a
@@ -79,7 +99,11 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
     /* throw_on_overflow=false: auto-save runs at request shutdown with no
      * execution frame, where an exception becomes an uncaught fatal. Degrade
      * to the E_WARNING session.c uses for write failures. */
-    zend_string *key = phpser_session_key();
+    zend_string *key;
+    if (UNEXPECTED(phpser_session_key(&key) == PHPSER_SKEY_SHORT)) {
+        return zend_string_init(PHPSER_SESSION_TOMBSTONE,
+                               sizeof(PHPSER_SESSION_TOMBSTONE) - 1, 0);
+    }
     phpser_enc_status status = PHPSER_ENC_OK;
     zend_string *out = phpser_encode_zval_ex(session_vars,
                                              /* throw_on_overflow */ false, &status,
@@ -127,9 +151,18 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
 }
 PS_SERIALIZER_DECODE_FUNC(phpser) {
     zval decoded;
-    zend_string *key = phpser_session_key();
+    zend_string *key;
+    if (UNEXPECTED(phpser_session_key(&key) == PHPSER_SKEY_SHORT)) {
+        return FAILURE;
+    }
     if (key && vallen > 0) {
         unsigned char tag[PHPSER_HMAC_TAG_LEN];
+        if (vallen == sizeof(PHPSER_SESSION_TOMBSTONE) - 1
+            && memcmp(val, PHPSER_SESSION_TOMBSTONE, vallen) == 0) {
+            php_error_docref(NULL, E_WARNING,
+                "phpser: session was not saved by the previous request (encode failed)");
+            return FAILURE;
+        }
         if (vallen <= PHPSER_HMAC_TAG_LEN
             || phpser_session_tag(key, val, vallen - PHPSER_HMAC_TAG_LEN, tag) != 0
             || !phpser_ct_eq(tag, (const unsigned char *) val + vallen - PHPSER_HMAC_TAG_LEN,

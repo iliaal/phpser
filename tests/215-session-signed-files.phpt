@@ -15,11 +15,11 @@ session.save_handler=files
 session.use_cookies=0
 session.use_strict_mode=0
 session.cache_limiter=
-phpser.session_key=test-session-key-0123456789
+phpser.session_key=test-session-key-0123456789abcdef
 --FILE--
 <?php
 ob_start();
-$dir = sys_get_temp_dir() . '/phpser-signed-files-' . getmypid();
+$dir = sys_get_temp_dir() . '/phpser-signed-files-215';
 @mkdir($dir);
 session_save_path($dir);
 
@@ -88,9 +88,9 @@ echo "DONE\n";
 ?>
 --CLEAN--
 <?php
-$dir = sys_get_temp_dir() . '/phpser-signed-files-' . getmypid();
-foreach (glob(sys_get_temp_dir() . '/phpser-signed-files-*/sess_*') as $f) @unlink($f);
-foreach (glob(sys_get_temp_dir() . '/phpser-signed-files-*') as $d) @rmdir($d);
+$dir = sys_get_temp_dir() . '/phpser-signed-files-215';
+foreach (glob("$dir/sess_*") as $f) @unlink($f);
+@rmdir($dir);
 ?>
 --EXPECT--
 persisted: OK
