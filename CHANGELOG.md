@@ -7,9 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-10-13
+
 ### Added
 
-- `phpser.session_key` INI setting signs session frames with HMAC-SHA256 bound to the session ID; tampered, unsigned, and cross-session blobs are rejected before decoding, and keys under 32 bytes fail closed.
+- `phpser.session_key` INI setting signs session frames with HMAC-SHA256 bound to the session ID; tampered, unsigned, and cross-session blobs are rejected before decoding, and keys under 32 bytes fail closed. `phpinfo()` reports signing as enabled, disabled, invalid, or inactive.
+
+### Fixed
+
+- Forked GC benchmark samples that exit without a result now mark only their serializer cell as unavailable instead of aborting the extended report.
+- `ab.php` clamps `BENCH_ITERS` to at least 1.
 
 ## [0.7.1] - 2026-10-11
 
@@ -32,7 +39,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Forked GC benchmark samples that exit without a result now mark only their serializer cell as unavailable instead of aborting the extended report.
 - Lazy ghosts and proxies with `__sleep` encoded their uninitialized properties; they now initialize first, as `serialize()` does.
 - `__sleep` names that `serialize()` omits (parent-private, static, virtual, missing, repeated) are omitted with the same warnings.
 - Autoloader exceptions abort decoding immediately; enum constant-evaluation failures propagate without dereferencing an invalid case.
@@ -366,7 +372,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.7.1...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.8.0...HEAD
+[0.8.0]: https://github.com/iliaal/phpser/releases/tag/0.8.0
 [0.7.1]: https://github.com/iliaal/phpser/releases/tag/0.7.1
 [0.7.0]: https://github.com/iliaal/phpser/releases/tag/0.7.0
 [0.6.2]: https://github.com/iliaal/phpser/releases/tag/0.6.2
