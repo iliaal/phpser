@@ -33,11 +33,17 @@ var_dump(file_exists("$dir/sess_shortkey217") && filesize("$dir/sess_shortkey217
 // yields the 29-byte tombstone rather than a frame signed with the weak key.
 // 32 bytes is the minimum that signs.
 $script = "$dir/child.php";
-file_put_contents($script, '<?php session_id("boundary217"); var_dump(@session_start()); echo strlen(session_encode() ?: ""), "\n";');
+file_put_contents($script, '<?php session_save_path(' . var_export($dir, true) . '); session_id("boundary217"); var_dump(@session_start());
+$_SESSION = ["a" => 1];
+$enc = (string) session_encode();
+$key = ini_get("phpser.session_key");
+$sub = hash_hmac("sha256", "phpser:session:v1\0" . session_id(), $key, true);
+$frame = substr($enc, 0, -32);
+echo strlen($key) >= 32 && hash_equals(hash_hmac("sha256", $frame, $sub, true), substr($enc, -32))
+    ? "signed" : strlen($enc), "\n";');
 foreach ([31, 32] as $len) {
     $cmd = escapeshellarg(getenv('TEST_PHP_EXECUTABLE') ?: PHP_BINARY) . ' ' . (getenv('TEST_PHP_EXTRA_ARGS') ?: '')
         . ' -d ' . escapeshellarg('phpser.session_key=' . str_repeat('k', $len))
-        . ' -d ' . escapeshellarg("session.save_path=$dir")
         . ' ' . escapeshellarg($script) . ' 2>&1';
     echo "key_len_$len: ", trim((string) shell_exec($cmd)), "\n";
 }
@@ -68,6 +74,6 @@ key_len_31: bool(false)
 Warning: session_encode(): phpser.session_key must be at least 32 bytes; session data rejected in %s on line %d
 29
 key_len_32: bool(true)
-%d
+signed
 minfo: invalid
 DONE

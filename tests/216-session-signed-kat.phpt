@@ -58,15 +58,17 @@ session_write_close();
 function req(string $code, array $ini): string {
     $php = getenv('TEST_PHP_EXECUTABLE') ?: PHP_BINARY;
     $extra = getenv('TEST_PHP_EXTRA_ARGS') ?: '';
+    $dir = sys_get_temp_dir() . '/phpser-216-' . md5(__DIR__);
     $ini += [
         'session.serialize_handler' => 'phpser', 'session.save_handler' => 'files',
-        'session.save_path' => sys_get_temp_dir() . '/phpser-216-' . md5(__DIR__),
         'session.use_cookies' => '0', 'session.cache_limiter' => '', 'display_errors' => '1',
     ];
     // Child code goes through a file: Windows escapeshellarg() strips double
-    // quotes, which would mangle code passed with -r.
-    $script = $ini['session.save_path'] . '/child-' . md5($code) . '.php';
-    file_put_contents($script, "<?php\n" . $code);
+    // quotes, which would mangle code passed with -r. The save path is set in
+    // code because an unquoted -d value with `~` (Windows 8.3 short temp
+    // names) is an INI syntax error.
+    $script = "$dir/child-" . md5($code) . '.php';
+    file_put_contents($script, "<?php\nsession_save_path(" . var_export($dir, true) . ");\n" . $code);
     $cmd = escapeshellarg($php) . " $extra";
     foreach ($ini as $k => $v) $cmd .= ' -d ' . escapeshellarg("$k=$v");
     $cmd .= ' ' . escapeshellarg($script) . ' 2>&1';

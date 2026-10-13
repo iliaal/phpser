@@ -139,14 +139,21 @@ their own session; the label keeps session tags distinct from
 verification raises an `E_WARNING` and returns failure to the session
 engine, which destroys the session. Unsigned blobs, including sessions
 written before the key was set, are rejected the same way. A key shorter
-than 32 bytes fails closed: every session read is rejected with a
-warning and the session engine destroys that session, rather than signing
-with a guessable key (INI turns `On` into `"1"`) or falling back to
-unsigned. A mistyped key therefore logs out every session it touches.
-`Off`, `no`, `false`, and `none` become an empty value, which disables
-signing. Quote the value in `php.ini`: an unquoted base64 key's `=` is a
+than 32 bytes fails closed: every session read, a new session's
+included, is rejected with a warning and the session engine destroys
+any existing session it read, rather than signing with a guessable key
+(INI turns `On`, `yes`, and `true` into `"1"`) or falling back to
+unsigned. A mistyped key therefore stops sessions working for everyone.
+`Off`, `no`, `false`, `null`, and `none` become an empty value, which
+disables signing. Quote the value in `php.ini`: an unquoted base64 key's `=` is a
 syntax error that drops every later directive, including a
 `session.serialize_handler` line that follows it.
+
+Use a distinct key per application and per environment. The tag binds a
+blob to the key and the session ID only, so a store writer could move a
+blob signed by another application or environment that shares the key
+(for example, a staging admin session) into this one under the same ID;
+without `session.use_strict_mode`, the attacker can pick that ID.
 
 The setting is `PHP_INI_SYSTEM | PHP_INI_PERDIR`, so application code
 cannot replace it with `ini_set()`; it can still read it with

@@ -42,8 +42,11 @@ typedef enum {
 } phpser_skey_status;
 
 static phpser_skey_status phpser_session_key_lookup(zend_string **out) {
-    zend_string *key = zend_ini_str_ex("phpser.session_key",
-                                       sizeof("phpser.session_key") - 1, false, NULL);
+    /* zend_ini_get_value() is the lookup that exists on PHP 8.2 through 8.6;
+     * zend_ini_str_ex() is 8.3+ and INI_STR() is gone in 8.6. */
+    zend_string *name = ZSTR_INIT_LITERAL("phpser.session_key", 0);
+    zend_string *key = zend_ini_get_value(name);
+    zend_string_release_ex(name, 0);
     *out = NULL;
     if (!key || ZSTR_LEN(key) == 0) {
         return PHPSER_SKEY_UNSET;
@@ -131,7 +134,7 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
         unsigned char *tail = (unsigned char *) ZSTR_VAL(out) + ZSTR_LEN(out);
         if (UNEXPECTED(phpser_session_tag(key, ZSTR_VAL(out), ZSTR_LEN(out), tail) != 0)) {
             php_error_docref(NULL, E_WARNING,
-                "phpser: $_SESSION not serialized — HMAC signing failed");
+                "phpser: $_SESSION not serialized — no active session ID to sign for");
             zend_string_release(out);
             return zend_string_init(PHPSER_SESSION_TOMBSTONE,
                                    sizeof(PHPSER_SESSION_TOMBSTONE) - 1, 0);

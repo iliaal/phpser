@@ -122,9 +122,13 @@ phpser.session_key = "<64 hex chars, e.g. from: openssl rand -hex 32>"
 Quote the value: an unquoted key containing `=` (base64) is a `php.ini`
 syntax error that drops every line after it. The key must be at least 32
 bytes. A shorter one (including `On`, which INI turns into `"1"`) fails
-closed: every session read is rejected and PHP destroys that session, so a
-typo during rollout logs out everyone it touches. `Off`, `no`, `false`,
-and `none` become an empty value, which means unsigned. `phpser.session_key` is `PHP_INI_SYSTEM | PHP_INI_PERDIR`, so
+closed: every `session_start()` fails, new sessions included, and PHP
+destroys each existing session it reads, so a typo during rollout takes
+sessions down for everyone. `Off`, `no`, `false`, `null`, and `none`
+become an empty value, which means unsigned; `yes` and `true` become
+`"1"`, like `On`. Use a distinct key per application and environment:
+the tag binds a blob to its session ID, not to the app that wrote it.
+`phpser.session_key` is `PHP_INI_SYSTEM | PHP_INI_PERDIR`, so
 `ini_set()` from application code cannot change it. Set it, and the
 handler, for every script that shares the session store: in `php.ini` or
 an FPM pool's `php_admin_value`, not a `.user.ini` that covers only part
