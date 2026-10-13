@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-13
+
 ### Added
 
-- `apc.serializer=phpser` APCu serializer, registered when APCu is loaded.
+- `apc.serializer=phpser` APCu serializer, registered when phpser and APCu load at startup.
 - `phpser.key` INI setting signs APCu values and keyed payloads with HMAC-SHA256 bound to a per-store context; keys under 32 bytes fail closed.
 - `phpser_serialize_keyed()` and `phpser_unserialize_keyed()` sign with `phpser.key`.
 - `php_phpser_api.h` C API (`phpser_api_serialize()`, `phpser_api_unserialize()`, `phpser_api_version()`) for other extensions; failed verification returns its own code.
@@ -388,7 +390,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.8.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.9.0...HEAD
+[0.9.0]: https://github.com/iliaal/phpser/releases/tag/0.9.0
 [0.8.0]: https://github.com/iliaal/phpser/releases/tag/0.8.0
 [0.7.1]: https://github.com/iliaal/phpser/releases/tag/0.7.1
 [0.7.0]: https://github.com/iliaal/phpser/releases/tag/0.7.0
