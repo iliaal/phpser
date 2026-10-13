@@ -405,8 +405,11 @@ alongside igbinary for the A/B bench:
   bench.php
 ```
 
-The `config.m4` auto-detects the session extension and registers phpser
-as a `session.serialize_handler` when available.
+Session integration is compiled when the target PHP headers define
+`HAVE_PHP_SESSION`, with either a `phpize` or `Makefile.dev` build; a
+session-less PHP build omits it. Registration is attempted only when
+phpser is loaded at startup, not through `dl()`. `php --ri phpser` reports
+whether registration succeeded.
 
 ## Limitations / known gaps
 
@@ -493,8 +496,9 @@ as a `session.serialize_handler` when available.
   effective `properties_info_table` order. Adding a parent property can insert
   before child slots and break append-only order.
 - **`session.serialize_handler=phpser` is shipped** (compiled in when
-  `phpize` detects the session extension; gated on `HAVE_PHP_SESSION` so
-  the extension still loads on session-less PHP builds). `phpredis`
+  the target PHP headers define `HAVE_PHP_SESSION`, with either a
+  `phpize` or `Makefile.dev` build; omitted on session-less PHP builds).
+  Registration requires a startup load, not `dl()`. `phpredis`
   integration is not yet wired; call `phpser_serialize_keyed()` /
   `phpser_unserialize_keyed()` (or the unsigned pair) directly when using
   the extension with phpredis. The handler
