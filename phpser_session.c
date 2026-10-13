@@ -31,6 +31,44 @@ static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
     return phpser_decode_buf_opts(str, str_len, out, ALLOWED_ALL, NULL, true);
 }
 
+#define PHPSER_SESSION_KDF_LABEL "phpser:session:v1"
+
+/* Non-NULL only when phpser.session_key is set; signing is then mandatory
+ * for both directions, so an unsigned blob can never be read back. */
+static zend_string *phpser_session_key(void) {
+    zend_string *key = zend_ini_str_ex("phpser.session_key",
+                                       sizeof("phpser.session_key") - 1, false, NULL);
+    return (key && ZSTR_LEN(key) > 0) ? key : NULL;
+}
+
+/* Tag over the frame under a per-session-ID subkey. Binding the ID stops a
+ * store writer from copying another user's validly signed blob into their
+ * own session file; the label keeps session tags distinct from
+ * phpser_serialize_signed() tags under the same key. */
+static int phpser_session_tag(const zend_string *key, const char *frame, size_t frame_len,
+                              unsigned char tag[PHPSER_HMAC_TAG_LEN]) {
+    zend_string *sid = PS(id);
+    if (UNEXPECTED(!sid)) {
+        return -1;
+    }
+    size_t label_len = sizeof(PHPSER_SESSION_KDF_LABEL);
+    size_t msg_len = label_len + ZSTR_LEN(sid);
+    unsigned char *msg = emalloc(msg_len);
+    memcpy(msg, PHPSER_SESSION_KDF_LABEL, label_len);
+    memcpy(msg + label_len, ZSTR_VAL(sid), ZSTR_LEN(sid));
+
+    unsigned char subkey[PHPSER_HMAC_TAG_LEN];
+    int rc = phpser_hmac_sha256((const unsigned char *) ZSTR_VAL(key), ZSTR_LEN(key),
+                                msg, msg_len, subkey);
+    efree(msg);
+    if (rc == 0) {
+        rc = phpser_hmac_sha256(subkey, sizeof(subkey),
+                                (const unsigned char *) frame, frame_len, tag);
+    }
+    ZEND_SECURE_ZERO(subkey, sizeof(subkey));
+    return rc;
+}
+
 PS_SERIALIZER_ENCODE_FUNC(phpser) {
     /* PS(http_session_vars) is the $_SESSION zval reference. Deref before
      * encoding so the wire format stores a plain array, not IS_REFERENCE. */
@@ -41,10 +79,23 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
     /* throw_on_overflow=false: auto-save runs at request shutdown with no
      * execution frame, where an exception becomes an uncaught fatal. Degrade
      * to the E_WARNING session.c uses for write failures. */
+    zend_string *key = phpser_session_key();
     phpser_enc_status status = PHPSER_ENC_OK;
     zend_string *out = phpser_encode_zval_ex(session_vars,
                                              /* throw_on_overflow */ false, &status,
-                                             /* tail_reserve */ 0);
+                                             key ? PHPSER_HMAC_TAG_LEN : 0);
+    if (out && key) {
+        unsigned char *tail = (unsigned char *) ZSTR_VAL(out) + ZSTR_LEN(out);
+        if (UNEXPECTED(phpser_session_tag(key, ZSTR_VAL(out), ZSTR_LEN(out), tail) != 0)) {
+            php_error_docref(NULL, E_WARNING,
+                "phpser: $_SESSION not serialized — HMAC signing failed");
+            zend_string_release(out);
+            return zend_string_init(PHPSER_SESSION_TOMBSTONE,
+                                   sizeof(PHPSER_SESSION_TOMBSTONE) - 1, 0);
+        }
+        ZSTR_LEN(out) += PHPSER_HMAC_TAG_LEN;
+        ZSTR_VAL(out)[ZSTR_LEN(out)] = '\0';
+    }
     if (UNEXPECTED(!out)) {
         switch (status) {
         case PHPSER_ENC_SIZE:
@@ -76,6 +127,19 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
 }
 PS_SERIALIZER_DECODE_FUNC(phpser) {
     zval decoded;
+    zend_string *key = phpser_session_key();
+    if (key && vallen > 0) {
+        unsigned char tag[PHPSER_HMAC_TAG_LEN];
+        if (vallen <= PHPSER_HMAC_TAG_LEN
+            || phpser_session_tag(key, val, vallen - PHPSER_HMAC_TAG_LEN, tag) != 0
+            || !phpser_ct_eq(tag, (const unsigned char *) val + vallen - PHPSER_HMAC_TAG_LEN,
+                             PHPSER_HMAC_TAG_LEN)) {
+            php_error_docref(NULL, E_WARNING,
+                "phpser: session data failed HMAC verification, not decoded");
+            return FAILURE;
+        }
+        vallen -= PHPSER_HMAC_TAG_LEN;
+    }
     if (vallen == 0) {
         /* Empty storage represents a new session; it has no wire version byte. */
         array_init(&decoded);

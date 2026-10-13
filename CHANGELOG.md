@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `phpser.session_key` INI setting signs session frames with HMAC-SHA256 bound to the session ID; tampered, unsigned, and cross-session blobs are rejected before decoding.
+
 ## [0.7.1] - 2026-10-11
 
 ### Security

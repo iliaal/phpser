@@ -227,12 +227,19 @@ PHP_FUNCTION(phpser_unserialize_signed) {
 
 #include "phpser_arginfo.h"
 
+/* SYSTEM|PERDIR keeps the key out of reach of ini_set() in application code;
+ * set it in php.ini or an FPM pool's php_admin_value. */
+PHP_INI_BEGIN()
+    PHP_INI_ENTRY("phpser.session_key", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
+PHP_INI_END()
+
 static PHP_MINIT_FUNCTION(phpser) {
 #if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
     /* Initialize TLS for shared ZTS builds. phpize defines COMPILE_DL_PHPSER;
      * the in-tree Makefile defines ZEND_COMPILE_DL_EXT. */
     ZEND_TSRMLS_CACHE_UPDATE();
 #endif
+    REGISTER_INI_ENTRIES();
 #ifdef HAVE_PHP_SESSION
     PS_SERIALIZER_FUNCS(phpser);
     /* Best-effort: silently skip when the session extension isn't loaded. */
@@ -249,6 +256,7 @@ static PHP_MINIT_FUNCTION(phpser) {
 }
 
 static PHP_MSHUTDOWN_FUNCTION(phpser) {
+    UNREGISTER_INI_ENTRIES();
     phpser_hmac_mshutdown();
     phpser_sha256_ops = NULL;
     return SUCCESS;
@@ -269,6 +277,8 @@ static PHP_MINFO_FUNCTION(phpser) {
     php_info_print_table_row(2, "version", PHP_PHPSER_VERSION);
 #ifdef HAVE_PHP_SESSION
     php_info_print_table_row(2, "session.serialize_handler", "available");
+    php_info_print_table_row(2, "session HMAC signing",
+        INI_STR("phpser.session_key")[0] ? "enabled" : "disabled");
 #else
     php_info_print_table_row(2, "session.serialize_handler", "disabled (compiled without session)");
 #endif

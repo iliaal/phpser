@@ -110,9 +110,23 @@ When decoding attacker-controlled bytes, use one of the two restricted
 modes or the signed entry point. See `SECURITY.md` for the full threat
 model.
 
+Signed sessions. Set a key and every session write carries an
+HMAC-SHA256 tag bound to the session ID; a read whose tag does not verify
+is rejected before decoding, and PHP destroys the session:
+
+```ini
+session.serialize_handler = phpser
+phpser.session_key = "<64 hex chars, e.g. from: openssl rand -hex 32>"
+```
+
+`phpser.session_key` is `PHP_INI_SYSTEM | PHP_INI_PERDIR`: set it in
+`php.ini`, an FPM pool's `php_admin_value`, or `.user.ini`; `ini_set()`
+from application code cannot change it. No application code changes.
+
 ## ✨ Features
 
 - **Signed payloads**: `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input before any decoding runs. Use it whenever the store crosses a trust boundary (memcached, redis, files, cookies), anywhere an attacker who can write to the store could feed your decoder a crafted payload. Both sides reject an empty key, since a keyless HMAC is forgeable.
+- **Signed sessions**: `phpser.session_key` turns on HMAC-SHA256 signing for the session handler. The tag is bound to the session ID, so a forged, corrupted, or copied-from-another-session blob fails verification and is never decoded. One INI line next to `session.serialize_handler = phpser`, no code changes.
 - **Untrusted input limits**: both unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (returns `null`). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled key comparisons and collision chains consume bounded work budgets. TABLE/ROWSET rows and fallback object-property copies have a separate materialization budget. Exhausting a budget rejects the frame; these limits do not bound autoloaders or application hooks. See [SECURITY.md](SECURITY.md) for exact limits and class-resolution costs.
 - **Supported versions**: PHP 8.2+ (8.3, 8.4, 8.5, master). BSD 3-Clause.
 
@@ -377,9 +391,11 @@ as a `session.serialize_handler` when available.
   serializes `$_SESSION` as a single phpser array value; it is **not**
   byte-compatible with the built-in `php`, `php_binary`, or `igbinary`
   session formats, so switching handlers doesn't read back sessions written
-  by another. It also decodes with all classes allowed and magic methods
-  enabled: treat the session store as trusted, exactly as with the native
-  `php_serialize` handler. If session encode fails on coder limits (over-deep
+  by another. It decodes with all classes allowed and magic methods
+  enabled. Without `phpser.session_key`, treat the session store as
+  trusted, exactly as with the native `php_serialize` handler; with it,
+  only blobs this key signed for this session ID are decoded. Setting,
+  changing, or removing the key invalidates every existing session. If session encode fails on coder limits (over-deep
   or oversized input), the handler persists a 29-byte `phpser:session-not-`
   `serialized` tombstone marker instead of the session, so the next read
   fails loudly (engine warning, session destroyed) rather than silently

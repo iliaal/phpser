@@ -125,11 +125,29 @@ who can write the session backend can instantiate arbitrary allowlisted
 classes and trigger their `__wakeup` / `__unserialize` on the next read.
 This is the standard PHP session trust model and is fine for a trusted
 store (a private redis/memcached/file backend). If the session backend
-is attacker-writable, do **not** rely on the open handler. Sign the
-payload at the application level with `phpser_serialize_signed` /
-`phpser_unserialize_signed`, or gate reads through an explicit
-`allowed_classes` allowlist. A future INI-configurable allowlist or
-signed session frames would harden this path but are not shipped today.
+is attacker-writable, set `phpser.session_key`.
+
+**Signed sessions.** With `phpser.session_key` set, the handler appends an
+HMAC-SHA256 tag to every session frame and verifies it, in constant time,
+before any decode work. The tag key is derived per session:
+`HMAC(session_key, "phpser:session:v1\0" || session_id)`. Binding the ID
+means a store writer cannot copy another user's validly signed blob into
+their own session; the label keeps session tags distinct from
+`phpser_serialize_signed()` tags made with the same key. A failed
+verification raises an `E_WARNING` and returns failure to the session
+engine, which destroys the session. Unsigned blobs, including sessions
+written before the key was set, are rejected the same way.
+
+The setting is `PHP_INI_SYSTEM | PHP_INI_PERDIR`, so application code
+cannot replace it with `ini_set()`; it can still read it with
+`ini_get()`, as it can read any other secret in its configuration. On
+shared hosting, set it per pool (`php_admin_value`) so tenants do not
+share or read each other's keys.
+
+Limits: an empty store value still starts a new, empty session, so a store
+writer can log a user out. A store writer can also replay an older blob
+that was validly signed for the same session ID, rolling that session back
+to an earlier state. Session ID regeneration limits this window.
 
 ## Supported versions
 
