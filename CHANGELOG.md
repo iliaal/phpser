@@ -19,6 +19,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - On GCC and Clang, `phpser.so` exports only `get_module` and the C API.
 
+### Fixed
+
+- Loading phpser with `dl()` no longer registers its session serializer, which ext/session would keep calling after the module unloads.
+
 ## [0.8.0] - 2026-10-13
 
 ### Added

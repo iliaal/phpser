@@ -337,11 +337,15 @@ static PHP_MINIT_FUNCTION(phpser) {
     REGISTER_INI_ENTRIES();
 #ifdef HAVE_PHP_SESSION
     PS_SERIALIZER_FUNCS(phpser);
-    /* Best-effort: silently skip when the session extension isn't loaded. */
-    php_session_register_serializer(
-        PHP_PHPSER_EXTNAME,
-        PS_SERIALIZER_ENCODE_NAME(phpser),
-        PS_SERIALIZER_DECODE_NAME(phpser));
+    /* ext/session's serializer table is process-lifetime with no unregister
+     * call, so a dl() load would leave it pointing at unmapped code after the
+     * request. Best-effort otherwise: skipped when session isn't loaded. */
+    if (type == MODULE_PERSISTENT) {
+        php_session_register_serializer(
+            PHP_PHPSER_EXTNAME,
+            PS_SERIALIZER_ENCODE_NAME(phpser),
+            PS_SERIALIZER_DECODE_NAME(phpser));
+    }
 #endif
     /* php_hash_fetch_ops does not retain the name; release it after lookup. */
     zend_string *algo = zend_string_init("sha256", sizeof("sha256") - 1, 0);
