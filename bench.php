@@ -1,7 +1,7 @@
 <?php
 // bench.php: phpser vs igbinary, native serialize(), and msgpack on the
-// shapes that actually show up in cache. igbinary is the reference column;
-// deltas are reported against it.
+// shapes that actually show up in cache. igbinary is the reference column
+// when available, otherwise phpser; deltas are reported against that column.
 //
 // Text (default):
 //   php -d extension=./modules/phpser.so -d extension=igbinary.so bench.php
@@ -1234,6 +1234,11 @@ function extended_html_metrics(string $id): array {
 
 function render_html(array $results, array $serializers, string $ref, array $meta, array $extended = []): void {
     $h = fn($s) => htmlspecialchars((string) $s, ENT_QUOTES);
+    $compared = [];
+    foreach ($serializers as $name) {
+        $label = $name === 'serialize' ? "PHP's native <b>serialize()</b>" : '<b>' . $h($name) . '</b>';
+        $compared[] = $label;
+    }
 
     $metrics = [
         'size' => ['SIZE', 'bytes', false],
@@ -1304,10 +1309,9 @@ function render_html(array $results, array $serializers, string $ref, array $met
 <div class="wrap">
   <h1><span class="ps">phpser</span> benchmarks</h1>
   <p class="lede">A decoder-optimized binary serializer for read-heavy PHP cache
-    workloads, measured against <b>igbinary</b> (the reference), PHP's native
-    <b>serialize()</b>, and <b>msgpack</b> across cache-shaped payloads. Lower is
-    better on every metric. igbinary is the baseline; each percentage is that
-    column's delta vs. igbinary: green beats igbinary, red loses to it.</p>
+    workloads. This report measures <?=implode(', ', $compared)?> across cache-shaped payloads. Lower is
+    better on every metric. <?=$h($ref)?> is the baseline; each percentage is that
+    column's delta vs. <?=$h($ref)?>: green beats <?=$h($ref)?>, red loses to it.</p>
 
   <div class="env">
     <span><b>PHP</b> <?=$h($meta['php'])?></span>
@@ -1334,7 +1338,7 @@ function render_html(array $results, array $serializers, string $ref, array $met
 
   <footer>
     <p>Reproduce: <code>php -d extension=phpser.so -d extension=igbinary.so -d extension=msgpack.so bench.php --html &gt; docs/index.html</code>.
-       igbinary marked <code>*</code> is the reference column.
+       <?=$h($ref)?> marked <code>*</code> is the reference column.
        Shapes: <code>rowset_*</code> mixed assoc rows, <code>packed_*</code> numeric
        arrays, <code>deep_50</code> nested containers, <code>dto_*</code>
        single-class typed-object batches (Laravel-queue-style).</p>
