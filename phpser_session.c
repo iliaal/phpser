@@ -11,9 +11,9 @@
 */
 
 /* -------------------------------------------------------------------------
- * Session serializer integration. Gated on HAVE_PHP_SESSION (set by config.m4
- * when phpize detects the session extension). Compiled out under the local
- * dev Makefile, which doesn't define the macro.
+ * Session serializer integration. Gated on HAVE_PHP_SESSION from the target
+ * PHP build's php_config.h, included through php.h. This applies to both
+ * phpize and Makefile.dev builds; session-less PHP builds compile it out.
  * ------------------------------------------------------------------------- */
 
 #include "phpser_int.h"
