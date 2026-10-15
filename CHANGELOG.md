@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### For contributors
+
+- A/B benchmarks average the two middle samples for even repetition counts, matching `bench.php`; both harnesses retain fractional median GC counters.
+
 ## [0.9.0] - 2026-10-13
 
 ### Added
