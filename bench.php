@@ -1234,6 +1234,11 @@ function extended_html_metrics(string $id): array {
 
 function render_html(array $results, array $serializers, string $ref, array $meta, array $extended = []): void {
     $h = fn($s) => htmlspecialchars((string) $s, ENT_QUOTES);
+    $compared = [];
+    foreach ($serializers as $name) {
+        $label = $name === 'serialize' ? "PHP's native <b>serialize()</b>" : '<b>' . $h($name) . '</b>';
+        $compared[] = $label;
+    }
 
     $metrics = [
         'size' => ['SIZE', 'bytes', false],
@@ -1304,8 +1309,7 @@ function render_html(array $results, array $serializers, string $ref, array $met
 <div class="wrap">
   <h1><span class="ps">phpser</span> benchmarks</h1>
   <p class="lede">A decoder-optimized binary serializer for read-heavy PHP cache
-    workloads, measured against <b>igbinary</b><?php if ($ref === 'igbinary'): ?> (the reference)<?php endif; ?>, PHP's native
-    <b>serialize()</b>, and <b>msgpack</b> across cache-shaped payloads. Lower is
+    workloads. This report measures <?=implode(', ', $compared)?> across cache-shaped payloads. Lower is
     better on every metric. <?=$h($ref)?> is the baseline; each percentage is that
     column's delta vs. <?=$h($ref)?>: green beats <?=$h($ref)?>, red loses to it.</p>
 
