@@ -1,6 +1,16 @@
-# Build against an in-tree PHP checkout; override PHP_SRC to select the tree.
+# Build against an in-tree PHP checkout: make -f Makefile.dev PHP_SRC=/path/to/php-src
 
-PHP_SRC      ?= $(HOME)/php-src-8.4-opt
+PHP_SRC      ?=
+
+ifneq ($(filter-out clean,$(or $(MAKECMDGOALS),all)),)
+ifeq ($(strip $(PHP_SRC)),)
+$(error PHP_SRC is not set; pass PHP_SRC=/path/to/php-src, a php-src checkout built with ./configure && make)
+endif
+ifeq ($(wildcard $(PHP_SRC)/main/php_config.h),)
+$(error PHP_SRC=$(PHP_SRC) is not a configured php-src tree (no main/php_config.h); run ./configure && make there first)
+endif
+endif
+
 CC           ?= cc
 TARGET       := modules/phpser.so
 

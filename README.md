@@ -396,11 +396,13 @@ performance in these areas, all shipped:
 
 ## Local dev build
 
-The hand-rolled `Makefile.dev` builds against an in-tree `~/php-src-8.4-opt`
-checkout without `phpize`/`autoconf`, for working on the extension and PHP
-at the same time:
+The hand-rolled `Makefile.dev` builds against an in-tree php-src checkout
+without `phpize`/`autoconf`, for working on the extension and PHP at the
+same time. Set `PHP_SRC` to a php-src tree that has been configured and
+built; `make` stops with an error if it is unset or unconfigured:
 
 ```sh
+export PHP_SRC=$HOME/php-src   # a configured, built php-src checkout
 make -f Makefile.dev -j$(nproc)  # builds modules/phpser.so
 make -f Makefile.dev test         # runs tests/*.phpt via run-tests.php
 ```
@@ -413,10 +415,14 @@ Override `PHP_SRC=` to target a different in-tree PHP checkout. Run
 settings, so it can otherwise reuse objects or a module from the previous
 build.
 
-Load alongside igbinary for the A/B bench:
+For benchmarks, build `PHP_SRC` without `--enable-debug`; debug builds
+distort timings. For example, in the php-src checkout run
+`./configure --disable-all --enable-cli --enable-session && make -j$(nproc)`,
+then `make -f Makefile.dev clean` and rebuild phpser against it. Load
+alongside igbinary, built against the same PHP, for the A/B bench:
 
 ```sh
-~/php-src-8.4-opt/sapi/cli/php \
+$PHP_SRC/sapi/cli/php \
   -d extension=$HOME/igbinary/modules/igbinary.so \
   -d extension=$(pwd)/modules/phpser.so \
   bench.php
