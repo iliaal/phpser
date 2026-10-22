@@ -234,7 +234,7 @@ PHP_PHPSER_API int phpser_api_serialize(const zval *value,
      * still mutate the objects it reaches, as with any serializer. */
     zend_string *s = phpser_keyed_encode((zval *) value, key, context, context_len);
     if (UNEXPECTED(!s)) {
-        if (!EG(exception)) {
+        if (!EG(exception) && !PHPSER_HAS_OOM()) {
             php_error_docref(NULL, E_WARNING,
                 "phpser: SHA256 hash ops unavailable; value not serialized");
         }
