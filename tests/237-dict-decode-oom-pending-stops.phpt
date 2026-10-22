@@ -30,10 +30,13 @@ function varint(int $v): string {
     return $out . chr($v);
 }
 $n = 600000;
-$dict = '';
-for ($i = 0; $i < $n; $i++) $dict .= "\x03" . chr($i >> 16) . chr(($i >> 8) & 0xff) . chr($i & 0xff);
-$s = "\x01" . varint($n) . $dict . "\x00";
-unset($dict);
+// Each entry is a length byte of 3 and the index as 3 big-endian bytes.
+$parts = [];
+for ($i = 0; $i < $n; $i += 4096) {
+    $parts[] = pack('N*', ...array_map(fn($j) => (3 << 24) | $j, range($i, min($i + 4096, $n) - 1)));
+}
+$s = "\x01" . varint($n) . implode('', $parts) . "\x00";
+unset($parts);
 gc_mem_caches();
 ini_set('memory_limit', (string)(memory_get_usage(true) + 6 * 1024 * 1024));
 phpser_unserialize($s);

@@ -21,7 +21,12 @@ memory_limit=256M
 --FILE--
 <?php
 register_shutdown_function(function () { echo "shutdown\n"; });
-$rows = array_fill(0, 40000, ['a' => 1, 'b' => 2, 'c' => 3, 'd' => 4]);
+// A literal row would be immutable under OPcache, which the gather never
+// duplicates; build it at runtime so every slot shares one refcounted table.
+$row = [];
+foreach (['a', 'b', 'c', 'd'] as $i => $k) $row[$k] = $i + 1;
+$rows = array_fill(0, 40000, $row);
+unset($row);
 gc_mem_caches();
 ini_set('memory_limit', (string)(memory_get_usage(true) + 2 * 1024 * 1024));
 phpser_serialize($rows);

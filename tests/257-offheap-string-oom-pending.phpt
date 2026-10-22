@@ -15,7 +15,7 @@ above its current usage.
 phpser
 --SKIPIF--
 <?php
-if (!function_exists('shell_exec')) die('skip shell_exec disabled');
+if (!function_exists('proc_open')) die('skip proc_open disabled');
 if (getenv('USE_ZEND_ALLOC') === '0' && getenv('USE_TRACKED_ALLOC') !== '1') die('skip memory_limit requires Zend allocator');
 ?>
 --FILE--
@@ -45,14 +45,22 @@ ini_set("memory_limit", (string) (memory_get_usage(true) + 65536));
 phpser_unserialize($s);
 echo "no fatal\n";
 ');
-// -n would also drop the -c file that carries the payload.
+// -n would also drop the -c file that carries the payload, and only the last
+// -c applies, so the payload's follows any inherited one (make test passes
+// its own). An empty scan dir keeps conf.d files out of the child.
 $args = preg_replace('/(^|\s)-n(?=\s|$)/', ' ', (string) getenv('TEST_PHP_EXTRA_ARGS'));
+$env = getenv();
+$env['PHP_INI_SCAN_DIR'] = '';
 foreach ($payloads as $name => $payload) {
     file_put_contents("$dir/$name.ini", 'user_agent="' . $payload . "\"\n");
-    $cmd = 'PHP_INI_SCAN_DIR= ' . escapeshellarg(getenv('TEST_PHP_EXECUTABLE') ?: PHP_BINARY)
-        . ' -c ' . escapeshellarg("$dir/$name.ini") . " $args -d display_errors=1 -d html_errors=0 "
-        . escapeshellarg("$dir/child.php") . ' 2>&1';
-    echo "$name: ", trim((string) shell_exec($cmd)), "\n";
+    $cmd = escapeshellarg(getenv('TEST_PHP_EXECUTABLE') ?: PHP_BINARY)
+        . " $args -d display_errors=1 -d html_errors=0 -c " . escapeshellarg("$dir/$name.ini")
+        . ' ' . escapeshellarg("$dir/child.php");
+    $proc = proc_open($cmd, [1 => ['pipe', 'w'], 2 => ['redirect', 1]], $pipes, null, $env);
+    $out = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    proc_close($proc);
+    echo "$name: ", trim($out), "\n";
 }
 ?>
 --CLEAN--
