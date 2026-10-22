@@ -7,25 +7,35 @@ up to a hard limit that _exit()s the whole process. The decoder must stop at
 the queued error so the request ends with the ordinary fatal and its shutdown
 functions still run.
 
-Each of the 400000 distinct strings repeats, so all of them land in the
-frame's string dictionary, which the decoder materializes before the value.
+The header declares 600k distinct 3-byte strings, which the decoder
+materializes before the value. Their 4.8 MB slot table fits under the limit,
+6 MB above current usage, but the strings themselves need about 19 MB.
 --EXTENSIONS--
 phpser
 --SKIPIF--
 <?php
-if (getenv('USE_ZEND_ALLOC') === '0') die('skip memory_limit requires Zend allocator');
+if (getenv('USE_ZEND_ALLOC') === '0' && getenv('USE_TRACKED_ALLOC') !== '1') die('skip memory_limit requires Zend allocator');
 ?>
 --INI--
 memory_limit=256M
 --FILE--
 <?php
 register_shutdown_function(function () { echo "shutdown\n"; });
-$rows = [];
-for ($i = 0; $i < 400000; $i++) { $k = sprintf('%03x', $i); $rows[] = $k; $rows[] = $k; }
-$s = phpser_serialize($rows);
-unset($rows);
+function varint(int $v): string {
+    $out = '';
+    while ($v >= 0x80) {
+        $out .= chr(($v & 0x7f) | 0x80);
+        $v >>= 7;
+    }
+    return $out . chr($v);
+}
+$n = 600000;
+$dict = '';
+for ($i = 0; $i < $n; $i++) $dict .= "\x03" . chr($i >> 16) . chr(($i >> 8) & 0xff) . chr($i & 0xff);
+$s = "\x01" . varint($n) . $dict . "\x00";
+unset($dict);
 gc_mem_caches();
-ini_set('memory_limit', (string)(memory_get_usage(true) + 1024 * 1024));
+ini_set('memory_limit', (string)(memory_get_usage(true) + 6 * 1024 * 1024));
 phpser_unserialize($s);
 echo "no fatal\n";
 ?>

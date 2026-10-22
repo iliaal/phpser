@@ -1981,6 +1981,17 @@ static zend_never_inline int enc_try_table(
     HashTable **row_pin = NULL;
     uint8_t *row_dup = NULL;
     for (uint32_t r = 0; r < n_used; r++) {
+        /* Duplicating rows that share one table allocates per reference, so
+         * stop here; reporting the table as handled keeps the fallback walk
+         * from duplicating the outer array too. The failed frame is discarded. */
+        if (UNEXPECTED(PHPSER_HAS_OOM())) {
+            efree(col_cells);
+            if (row_pin) enc_free_row_pins(e, row_pin, n_used);
+            if (row_dup) efree(row_dup);
+            efree(key_idx);
+            e->failed = 1;
+            return 1;
+        }
         HashTable *ht = Z_ARRVAL(zp[r]);
         HashTable *pinned = NULL;
         if (!(GC_FLAGS(ht) & GC_IMMUTABLE)) {
@@ -2496,6 +2507,25 @@ static zend_always_inline void *dec_ecalloc(size_t n, size_t unit) {
     return ecalloc(n, unit);
 }
 
+/* A payload buffer outside the Zend heap (APCu shared memory, a C caller's
+ * malloc or mmap) is not charged to memory_limit, so a length it declares can
+ * pass the hard limit in one copy. NULL only with a memory_limit error pending. */
+static zend_always_inline zend_string *dec_string_init(const char *s, size_t len) {
+#ifdef ZEND_HAS_OOM
+    if (DEC_FALLIBLE(len, 1)) return zend_string_finit(s, len, 0, true);
+#endif
+    return zend_string_init(s, len, 0);
+}
+
+static zend_always_inline zend_string *dec_string_init_existing_interned(
+    const char *s, size_t len)
+{
+#ifdef ZEND_HAS_OOM
+    if (DEC_FALLIBLE(len, 1)) return zend_string_finit_existing_interned(s, len, false, true);
+#endif
+    return zend_string_init_existing_interned(s, len, 0);
+}
+
 static zend_never_inline void dec_id_table_grow(decode_ctx *d) {
     uint32_t cap = d->id_table_cap * 2;
     if (d->id_table_heap) {
@@ -2745,7 +2775,8 @@ static zend_always_inline int dec_install_slot_impl(decode_ctx *d, zend_object *
         if (!(!Z_ISREF_P(tmp)
                 && Z_TYPE_P(tmp) != IS_OBJECT
                 && EXPECTED(ZEND_TYPE_CONTAINS_CODE(info->type, Z_TYPE_P(tmp))))
-            && !zend_verify_prop_assignable_by_ref(info, tmp, /*strict*/ 1)) {
+            && (UNEXPECTED(PHPSER_HAS_OOM())
+                || !zend_verify_prop_assignable_by_ref(info, tmp, /*strict*/ 1))) {
             zval_ptr_dtor(tmp);
             return -1;
         }
@@ -2819,7 +2850,8 @@ static int dec_install_prop_resolved(decode_ctx *d, zend_object *obj, HashTable 
             zend_property_info *info =
                 zend_get_typed_property_info_for_slot(obj, slot);
             if (info != NULL) {
-                if (!zend_verify_prop_assignable_by_ref(
+                if (UNEXPECTED(PHPSER_HAS_OOM())
+                    || !zend_verify_prop_assignable_by_ref(
                         info, tmp, /*strict*/ 1)) {
                     zval_ptr_dtor(tmp);
                     return -1;
@@ -2844,6 +2876,13 @@ static int dec_install_prop_resolved(decode_ctx *d, zend_object *obj, HashTable 
             ZVAL_COPY_VALUE(existing, tmp);
         }
     } else {
+        /* Both diagnostics below would compete with a pending memory_limit
+         * error, which is the request's only report. */
+        if (UNEXPECTED(!(obj->ce->ce_flags & ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES)
+                       && PHPSER_HAS_OOM())) {
+            zval_ptr_dtor(tmp);
+            return -1;
+        }
         if (UNEXPECTED(obj->ce->ce_flags & ZEND_ACC_NO_DYNAMIC_PROPERTIES)) {
             zend_throw_error(NULL, "Cannot create dynamic property %s::$%s",
                 ZSTR_VAL(obj->ce->name),
@@ -2959,8 +2998,10 @@ static zend_always_inline int dec_prop_forbidden(
     if (obj_props != NULL && zend_hash_find(obj_props, key) != NULL) {
         return 0;
     }
-    zend_throw_error(NULL, "Cannot create dynamic property %s::$%s",
-        ZSTR_VAL(obj->ce->name), zend_get_unmangled_property_name(key));
+    if (EXPECTED(!PHPSER_HAS_OOM())) {
+        zend_throw_error(NULL, "Cannot create dynamic property %s::$%s",
+            ZSTR_VAL(obj->ce->name), zend_get_unmangled_property_name(key));
+    }
     return 1;
 }
 
@@ -3071,8 +3112,9 @@ static int decode_header(decode_ctx *d) {
         if (slen > UINT32_MAX || slen > d->len - d->pos) return -1;
         /* Reuse engine-interned names to avoid allocations and refcounts on common
          * keys. Both the interned and allocated paths supply a precomputed hash. */
-        d->dict[i] = zend_string_init_existing_interned(
-            (const char *)(d->buf + d->pos), (size_t)slen, 0);
+        d->dict[i] = dec_string_init_existing_interned(
+            (const char *)(d->buf + d->pos), (size_t)slen);
+        if (UNEXPECTED(!d->dict[i])) return -1;
         d->pos += slen;
     }
     return 0;
@@ -3213,9 +3255,10 @@ static int decode_key(decode_ctx *d, key_val *out_key) {
         uint64_t slen;
         if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
         if (slen > UINT32_MAX || slen > d->len - d->pos) return -1;
+        zend_string *zs = dec_string_init((const char *)d->buf + d->pos, (size_t)slen);
+        if (UNEXPECTED(!zs)) return -1;
         out_key->kind = KV_OWNED_STR;
-        out_key->str = zend_string_init(
-            (const char *)d->buf + d->pos, (size_t)slen, 0);
+        out_key->str = zs;
         d->pos += slen;
         return 0;
     }
@@ -3285,8 +3328,8 @@ static int decode_scalar_tag(decode_ctx *d, zval *out, uint8_t tag) {
             uint64_t slen;
             if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
             if (slen > UINT32_MAX || slen > d->len - d->pos) return -1;
-            zend_string *zs = zend_string_init(
-                (const char *)d->buf + d->pos, (size_t)slen, 0);
+            zend_string *zs = dec_string_init((const char *)d->buf + d->pos, (size_t)slen);
+            if (UNEXPECTED(!zs)) return -1;
             d->pos += slen;
             ZVAL_STR(out, zs);
             return 0;
@@ -4623,7 +4666,8 @@ zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
 
     bool cleanup_can_throw = ctx.pins_active;
     enc_ctx_destroy(&ctx);
-    if (UNEXPECTED(cleanup_can_throw && EG(exception))) {
+    /* The frame allocation itself can queue the memory_limit error. */
+    if (UNEXPECTED((cleanup_can_throw && EG(exception)) || PHPSER_HAS_OOM())) {
         zend_string_release(res);
         if (status) *status = PHPSER_ENC_EXCEPTION;
         return NULL;

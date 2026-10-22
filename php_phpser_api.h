@@ -94,8 +94,9 @@ PHP_PHPSER_API unsigned int phpser_api_version(void);
  * non-persistent string owned by the caller, who releases it with
  * zend_string_release(). On PHPSER_API_ERR, *out is NULL and either an
  * exception is pending (a serialization hook threw, or the value exceeds
- * the nesting or 4 GiB size limit) or an E_WARNING was raised (bad context,
- * short key, or SHA-256 unavailable while signing). */
+ * the nesting or 4 GiB size limit), a memory_limit error is pending, or an
+ * E_WARNING was raised (bad context, short key, or SHA-256 unavailable while
+ * signing). */
 PHP_PHPSER_API int phpser_api_serialize(const zval *value,
                                         const char *context, size_t context_len,
                                         zend_string **out);

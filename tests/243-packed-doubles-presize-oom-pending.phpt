@@ -13,7 +13,7 @@ above current usage.
 phpser
 --SKIPIF--
 <?php
-if (getenv('USE_ZEND_ALLOC') === '0') die('skip memory_limit requires Zend allocator');
+if (getenv('USE_ZEND_ALLOC') === '0' && getenv('USE_TRACKED_ALLOC') !== '1') die('skip memory_limit requires Zend allocator');
 ?>
 --INI--
 memory_limit=256M

@@ -8,12 +8,13 @@ the queued error so the request ends with the ordinary fatal and its shutdown
 functions still run.
 
 Each element is a single-use inline string, a scalar the decoder allocates
-without entering the container path.
+without entering the container path. The strings sit in 5000 lists of 100,
+so no list's presize comes near the limit.
 --EXTENSIONS--
 phpser
 --SKIPIF--
 <?php
-if (getenv('USE_ZEND_ALLOC') === '0') die('skip memory_limit requires Zend allocator');
+if (getenv('USE_ZEND_ALLOC') === '0' && getenv('USE_TRACKED_ALLOC') !== '1') die('skip memory_limit requires Zend allocator');
 ?>
 --INI--
 memory_limit=256M
@@ -21,7 +22,11 @@ memory_limit=256M
 <?php
 register_shutdown_function(function () { echo "shutdown\n"; });
 $rows = [];
-for ($i = 0; $i < 500000; $i++) $rows[] = sprintf('%08x', $i);
+for ($i = 0; $i < 5000; $i++) {
+    $chunk = [];
+    for ($j = 0; $j < 100; $j++) $chunk[] = sprintf('%08x', $i * 100 + $j);
+    $rows[] = $chunk;
+}
 $s = phpser_serialize($rows);
 unset($rows);
 gc_mem_caches();

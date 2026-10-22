@@ -240,6 +240,11 @@ PHP_PHPSER_API int phpser_api_serialize(const zval *value,
         }
         return PHPSER_API_ERR;
     }
+    /* Tagging can queue a memory_limit error after the encode succeeded. */
+    if (UNEXPECTED(PHPSER_HAS_OOM())) {
+        zend_string_release(s);
+        return PHPSER_API_ERR;
+    }
     *out = s;
     return PHPSER_API_OK;
 }
@@ -327,10 +332,17 @@ static int phpser_apc_serialize(unsigned char **buf, size_t *buf_len,
                              sizeof(PHPSER_APCU_CONTEXT) - 1, &s) != PHPSER_API_OK) {
         return 0;
     }
-    *buf = emalloc(ZSTR_LEN(s) + 1);
-    memcpy(*buf, ZSTR_VAL(s), ZSTR_LEN(s) + 1);
-    *buf_len = ZSTR_LEN(s);
+    unsigned char *copy = emalloc(ZSTR_LEN(s) + 1);
+    memcpy(copy, ZSTR_VAL(s), ZSTR_LEN(s) + 1);
+    size_t copy_len = ZSTR_LEN(s);
     zend_string_release_ex(s, 0);
+    /* APCu leaves *buf alone on failure, so the copy is ours to free. */
+    if (UNEXPECTED(PHPSER_HAS_OOM())) {
+        efree(copy);
+        return 0;
+    }
+    *buf = copy;
+    *buf_len = copy_len;
     return 1;
 }
 

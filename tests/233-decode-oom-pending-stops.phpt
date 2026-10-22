@@ -10,7 +10,7 @@ functions still run.
 phpser
 --SKIPIF--
 <?php
-if (getenv('USE_ZEND_ALLOC') === '0') die('skip memory_limit requires Zend allocator');
+if (getenv('USE_ZEND_ALLOC') === '0' && getenv('USE_TRACKED_ALLOC') !== '1') die('skip memory_limit requires Zend allocator');
 ?>
 --INI--
 memory_limit=256M
@@ -22,7 +22,7 @@ for ($i = 0; $i < 300000; $i++) $rows[] = [$i];
 $s = phpser_serialize($rows);
 unset($rows);
 gc_mem_caches();
-ini_set('memory_limit', (string)(memory_get_usage(true) + 4 * 1024 * 1024));
+ini_set('memory_limit', (string)(memory_get_usage(true) + 9 * 1024 * 1024));
 phpser_unserialize($s);
 echo "no fatal\n";
 ?>

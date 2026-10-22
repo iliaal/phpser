@@ -14,7 +14,7 @@ become string property names, allocated one per element.
 phpser
 --SKIPIF--
 <?php
-if (getenv('USE_ZEND_ALLOC') === '0') die('skip memory_limit requires Zend allocator');
+if (getenv('USE_ZEND_ALLOC') === '0' && getenv('USE_TRACKED_ALLOC') !== '1') die('skip memory_limit requires Zend allocator');
 ?>
 --INI--
 memory_limit=256M
@@ -27,7 +27,7 @@ class Bag {
     public function __unserialize(array $data): void { $this->v = $data; }
 }
 $v = [];
-for ($i = 0; $i < 300000; $i++) $v[] = $i * 7919 % 1000003;
+for ($i = 0; $i < 300000; $i++) $v[] = (($i % 1000) * 7919) % 1000;
 $s = phpser_serialize(new Bag($v));
 unset($v);
 gc_mem_caches();
