@@ -19,6 +19,23 @@
 #include "php_phpser.h"
 #include "ext/hash/php_hash.h"
 
+/* PHP 8.2.35, 8.3.36, 8.4.27 and 8.5.12 queue a memory_limit error instead of
+ * bailing out; the allocation still succeeds until a hard limit (2x the soft
+ * limit below 1G) that _exit()s the process. Loops that keep allocating must
+ * stop on their own once the error is pending. */
+#ifdef ZEND_HAS_OOM
+# define PHPSER_HAS_OOM() ZEND_HAS_OOM()
+#else
+# define PHPSER_HAS_OOM() 0
+#endif
+
+/* A failed encode, signed decode, or keyed decode has an exception or a
+ * queued memory_limit error pending; RETURN_THROWS() asserts the former. */
+#define PHPSER_RETURN_FAILED() do { \
+        if (PHPSER_HAS_OOM()) { (void) return_value; return; } \
+        RETURN_THROWS(); \
+    } while (0)
+
 /* SHA256 output size; the signed-payload tag length. */
 #define PHPSER_HMAC_TAG_LEN 32
 

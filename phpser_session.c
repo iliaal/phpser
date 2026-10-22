@@ -157,9 +157,12 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
                 "wire-format limit");
             break;
         case PHPSER_ENC_EXCEPTION:
-            /* Hook exceptions propagate to the save caller; persist nothing. */
-            php_error_docref(NULL, E_WARNING,
-                "phpser: $_SESSION not serialized — a serialization hook threw");
+            /* Hook exceptions propagate to the save caller; persist nothing.
+             * A pending memory_limit error reports itself as the fatal. */
+            if (!PHPSER_HAS_OOM()) {
+                php_error_docref(NULL, E_WARNING,
+                    "phpser: $_SESSION not serialized — a serialization hook threw");
+            }
             return NULL;
         case PHPSER_ENC_DEPTH:
             php_error_docref(NULL, E_WARNING,

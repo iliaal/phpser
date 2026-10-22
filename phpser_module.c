@@ -25,7 +25,7 @@ PHP_FUNCTION(phpser_serialize) {
     ZEND_PARSE_PARAMETERS_END();
     zend_string *out = phpser_encode_zval(value, /* throw_on_overflow */ true);
     if (UNEXPECTED(!out)) {
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
     RETVAL_STR(out);
 }
@@ -130,7 +130,7 @@ PHP_FUNCTION(phpser_serialize_signed) {
     zend_string *frame = phpser_encode_zval_ex(value, /* throw_on_overflow */ true,
                                                NULL, PHPSER_HMAC_TAG_LEN);
     if (UNEXPECTED(!frame)) {
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
     /* The encoder allocated the tag slot past the frame; the tag covers the
      * frame bytes only. */
@@ -213,11 +213,11 @@ PHP_FUNCTION(phpser_unserialize_signed) {
     /* Distinguish malformed signed data from a valid signed null. Preserve
      * exceptions already raised by decode hooks. */
     if (rc < 0) {
-        if (!EG(exception)) {
+        if (!EG(exception) && !PHPSER_HAS_OOM()) {
             zend_throw_exception(zend_ce_exception,
                 "phpser: signed payload failed to decode", 0);
         }
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
 }
 
@@ -260,11 +260,11 @@ PHP_FUNCTION(phpser_serialize_keyed) {
     }
     zend_string *out = phpser_keyed_encode(value, key, context, context_len);
     if (UNEXPECTED(!out)) {
-        if (!EG(exception)) {
+        if (!EG(exception) && !PHPSER_HAS_OOM()) {
             zend_throw_exception(zend_ce_exception,
                 "phpser: SHA256 hash ops unavailable (ext/hash not loaded?)", 0);
         }
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
     RETURN_STR(out);
 }
@@ -307,11 +307,11 @@ PHP_FUNCTION(phpser_unserialize_keyed) {
         RETURN_THROWS();
     }
     if (rc != PHPSER_KEYED_OK) {
-        if (!EG(exception)) {
+        if (!EG(exception) && !PHPSER_HAS_OOM()) {
             zend_throw_exception(zend_ce_exception,
                 "phpser: signed payload failed to decode", 0);
         }
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
 }
 
