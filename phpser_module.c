@@ -213,11 +213,11 @@ PHP_FUNCTION(phpser_unserialize_signed) {
     /* Distinguish malformed signed data from a valid signed null. Preserve
      * exceptions already raised by decode hooks. */
     if (rc < 0) {
-        if (!EG(exception)) {
+        if (!EG(exception) && !PHPSER_HAS_OOM()) {
             zend_throw_exception(zend_ce_exception,
                 "phpser: signed payload failed to decode", 0);
         }
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
 }
 
@@ -307,11 +307,11 @@ PHP_FUNCTION(phpser_unserialize_keyed) {
         RETURN_THROWS();
     }
     if (rc != PHPSER_KEYED_OK) {
-        if (!EG(exception)) {
+        if (!EG(exception) && !PHPSER_HAS_OOM()) {
             zend_throw_exception(zend_ce_exception,
                 "phpser: signed payload failed to decode", 0);
         }
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
 }
 

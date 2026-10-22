@@ -2918,6 +2918,7 @@ static int dec_apply_data_as_props(decode_ctx *d, zend_object *obj, HashTable *d
     zend_ulong h;
     zval *val;
     ZEND_HASH_FOREACH_KEY_VAL(data_ht, h, key, val) {
+        if (UNEXPECTED(PHPSER_HAS_OOM())) return -1;
         zval tmp;
         ZVAL_COPY(&tmp, val);  /* addref for the new owner */
         if (key) {
@@ -3003,6 +3004,7 @@ static int decode_header(decode_ctx *d) {
     d->dict = ecalloc((size_t)d->dict_len + 1, sizeof(zend_string *));
     for (uint32_t i = 0; i < d->dict_len; i++) {
         uint64_t slen;
+        if (UNEXPECTED(PHPSER_HAS_OOM())) return -1;
         if (varint_read_u64(d->buf, d->len, &d->pos, &slen) < 0) return -1;
         if (slen > UINT32_MAX || slen > d->len - d->pos) return -1;
         /* Reuse engine-interned names to avoid allocations and refcounts on common
@@ -3243,7 +3245,7 @@ static zend_always_inline void dec_finish_packed(zend_array *arr, uint64_t n, zv
  * recurse and don't need a depth bump. Container tags rewind one byte and
  * fall back to the full path. */
 static zend_always_inline int decode_value_hot(decode_ctx *d, zval *out) {
-    if (UNEXPECTED(d->pos >= d->len)) {
+    if (UNEXPECTED(d->pos >= d->len || PHPSER_HAS_OOM())) {
         ZVAL_UNDEF(out);
         return -1;
     }
@@ -4143,9 +4145,10 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
         if (outer == NULL) {
             outer = zend_new_array((uint32_t)nrows);
             zend_hash_real_init_packed(outer);
+            uint64_t r = 0;
             if (use_add_new) {
                 int tpl_static_keys = 1;
-                for (uint64_t r = 0; r < nrows; r++) {
+                for (; r < nrows && !PHPSER_HAS_OOM(); r++) {
                     zend_array *row = zend_new_array((uint32_t)ncols);
                     zend_hash_real_init_mixed(row);
                     if (tpl_hash == NULL) {
@@ -4188,27 +4191,31 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
                     }
                     ZVAL_ARR(&outer->arPacked[r], row);
                 }
-                /* Every row's buckets borrowed the dict keys above; take the
-                 * nrows references in one bump per non-interned key (interned
+                /* Every built row's buckets borrowed the dict keys above; take
+                 * the r references in one bump per non-interned key (interned
                  * strings carry no refcount). Balanced by the per-bucket
                  * release each row's destroy performs. */
                 for (uint32_t k = 0; k < (uint32_t)ncols; k++) {
                     if (!ZSTR_IS_INTERNED(keys[k])) {
                         GC_SET_REFCOUNT(keys[k],
-                            GC_REFCOUNT(keys[k]) + (uint32_t)nrows);
+                            GC_REFCOUNT(keys[k]) + (uint32_t)r);
                     }
                 }
             } else {
-                for (uint64_t r = 0; r < nrows; r++) {
+                for (; r < nrows && !PHPSER_HAS_OOM(); r++) {
                     ZVAL_ARR(&outer->arPacked[r],
                              zend_new_array((uint32_t)ncols));
                 }
             }
             /* Well-formed now so a later failure destroys rows + scattered
              * cells with one zend_array_destroy. */
-            outer->nNumUsed = (uint32_t)nrows;
-            outer->nNumOfElements = (uint32_t)nrows;
-            outer->nNextFreeElement = (zend_long)nrows;
+            outer->nNumUsed = (uint32_t)r;
+            outer->nNumOfElements = (uint32_t)r;
+            outer->nNextFreeElement = (zend_long)r;
+            if (UNEXPECTED(r != nrows)) {
+                for (uint64_t i = 0; i < nrows; i++) zval_ptr_dtor(&colbuf[i]);
+                goto table_fail;
+            }
         }
         if (use_add_new) {
             for (uint64_t r = 0; r < nrows; r++) {
@@ -4572,7 +4579,7 @@ int phpser_decode_buf_opts(
     }
     /* Signed and session frames require exact consumption before hooks run. The
      * unsigned entry point retains historical trailing-byte tolerance. */
-    if (require_exact && UNEXPECTED(d.pos != d.len)) {
+    if ((require_exact && UNEXPECTED(d.pos != d.len)) || PHPSER_HAS_OOM()) {
         zval_ptr_dtor(out);
         ZVAL_NULL(out);
         decode_destroy(&d, false);
@@ -4599,7 +4606,7 @@ int phpser_decode_buf_opts(
             GC_DEL_FLAGS(obj, IS_OBJ_DESTRUCTOR_CALLED);
         }
         zval_ptr_dtor(&retval);
-        if (UNEXPECTED(EG(exception))) goto done;
+        if (UNEXPECTED(EG(exception) || PHPSER_HAS_OOM())) goto done;
     }
 done:;
     /* Hooks run user code that can detach pinned entities from the result.
@@ -4607,7 +4614,7 @@ done:;
     bool result_live = false;
     if (d.id_table_len) {
         result_live = !d.pins_may_orphan && d.deferred_len == 0
-                      && !EG(exception);
+                      && !EG(exception) && !PHPSER_HAS_OOM();
     }
     /* Only objects and references can close a cycle, and each claims an id.
      * Without one, the fast release skipped nothing that needs a root. */
@@ -4626,7 +4633,7 @@ done:;
     /* C callers, especially the session handler, need failure even when Zend
      * will propagate a pending hook exception. Destroy the graph and set out
      * to NULL to preserve the error contract and avoid leaking it. */
-    if (UNEXPECTED(EG(exception))) {
+    if (UNEXPECTED(EG(exception) || PHPSER_HAS_OOM())) {
         zval_ptr_dtor(out);
         ZVAL_NULL(out);
         return -1;

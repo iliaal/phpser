@@ -29,8 +29,8 @@
 # define PHPSER_HAS_OOM() 0
 #endif
 
-/* An encode that returns NULL has an exception or a queued
- * memory_limit error pending; RETURN_THROWS() asserts the former. */
+/* A failed encode, signed decode, or keyed decode has an exception or a
+ * queued memory_limit error pending; RETURN_THROWS() asserts the former. */
 #define PHPSER_RETURN_FAILED() do { \
         if (PHPSER_HAS_OOM()) { (void) return_value; return; } \
         RETURN_THROWS(); \

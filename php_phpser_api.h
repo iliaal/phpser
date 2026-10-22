@@ -106,7 +106,8 @@ PHP_PHPSER_API int phpser_api_serialize(const zval *value,
  * failure `out` is IS_NULL, never a partial value: PHPSER_API_ERR_TAG means
  * verification failed (E_WARNING raised, nothing decoded); PHPSER_API_ERR
  * means a bad context, a short key (E_WARNING raised), or a frame that does
- * not decode, possibly with an exception from a decode hook pending.
+ * not decode, possibly with an exception from a decode hook or a
+ * memory_limit error pending.
  * Trailing bytes after the value are rejected. `buf` must stay unchanged
  * for the duration of the call. */
 PHP_PHPSER_API int phpser_api_unserialize(const char *buf, size_t buf_len,

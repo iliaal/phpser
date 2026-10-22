@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- On PHP 8.2.35, 8.3.36, 8.4.27, and 8.5.12, `phpser_serialize()`, `phpser_serialize_signed()`, and `phpser_serialize_keyed()` stop encoding once a memory_limit error is pending. The request ends with the ordinary memory_limit fatal and runs its shutdown functions, instead of allocating up to the hard limit and exiting the process.
+- On PHP 8.2.35, 8.3.36, 8.4.27, and 8.5.12, `phpser_serialize()`, `phpser_serialize_signed()`, and `phpser_serialize_keyed()` stop encoding, and `phpser_unserialize()`, `phpser_unserialize_signed()`, `phpser_unserialize_keyed()`, the session handler, and the APCu serializer stop decoding, once a memory_limit error is pending. The request ends with the ordinary memory_limit fatal and runs its shutdown functions, instead of allocating up to the hard limit and exiting the process.
 
 ### For contributors
 
