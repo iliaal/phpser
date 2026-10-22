@@ -103,7 +103,8 @@ $value = phpser_unserialize_signed($payload, $key);
 // needs was removed since signing). A legitimately-signed null decodes to null.
 ```
 
-`allowed_classes` option on both unserialize entry points. Same shape as
+`allowed_classes` is supported by `phpser_unserialize()`,
+`phpser_unserialize_signed()`, and `phpser_unserialize_keyed()`. Same shape as
 PHP's native `unserialize($payload, ['allowed_classes' => ...])`:
 
 ```php
@@ -223,6 +224,11 @@ $redis->set('user:7', phpser_serialize_keyed($user, 'redis'));
 $user = phpser_unserialize_keyed($redis->get('user:7'), 'redis');
 // throws if the payload was tampered, unsigned, or signed for another
 // context or key, and if phpser.key is unset or shorter than 32 bytes
+
+// The optional third argument also supports the class allowlist:
+$user = phpser_unserialize_keyed($redis->get('user:7'), 'redis', [
+    'allowed_classes' => [User::class],
+]);
 ```
 
 The context names the store and must be 1 to 255 bytes, contain no NUL
@@ -430,20 +436,22 @@ whether registration succeeded.
 
 ## Limitations / known gaps
 
-- **The three entry points signal corrupt input differently.** `phpser_unserialize()`
+- **The decoding entry points signal corrupt input differently.** `phpser_unserialize()`
   silently returns `null` on malformed, truncated, or over-deep input,
   indistinguishable from a successfully decoded `null`. Trailing bytes after
   a complete top-level value are tolerated on this path (prefix read).
-  `phpser_unserialize_signed()` throws instead (since 0.4.0), so a
-  legitimately-signed `null` still decodes cleanly, and both the signed and
-  session paths require exact consumption of the frame. The session handler
+  `phpser_unserialize_signed()` (since 0.4.0) and
+  `phpser_unserialize_keyed()` throw instead, so a legitimately-signed `null`
+  still decodes cleanly. Signed, keyed, and session decoding require exact
+  consumption of the frame. The session handler
   reports decode failure to the engine (warning; a scalar-root payload fails
   the read rather than becoming an empty session). When a cache miss must be
-  told apart from a cached `null`, use the signed entry point. `SECURITY.md`
+  told apart from a cached `null`, use a signed or keyed entry point. `SECURITY.md`
   carries the full contract.
 - **Recursion depth is capped at 512** on both encode and decode. On decode,
-  anything deeper than 512 nested containers / refs is rejected (returns
-  `null`) to bound stack consumption against adversarial wire payloads. On
+  anything deeper than 512 nested containers / refs is rejected (`null` for
+  unsigned decoding, an exception for signed or keyed decoding) to bound
+  stack consumption against adversarial wire payloads. On
   encode, input deeper than 512 throws an `Exception` rather than silently
   shipping a truncated payload. Object cycles go through the id table and
   don't count against the cap; only genuinely deep trees hit it. Cache
