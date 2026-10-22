@@ -2437,6 +2437,65 @@ static zend_always_inline int dec_string_hash_chain_exhausted(
     return 0;
 }
 
+/* A payload-declared count sizes one allocation before any element is read,
+ * so the per-element PHPSER_HAS_OOM() checks cannot stop it from passing the
+ * hard limit. Above DEC_FALLIBLE_MIN_BYTES such presizes are fallible: past
+ * memory_limit they fail with the memory_limit error queued. Smaller ones,
+ * at most 2 MiB after power-of-two rounding, charge no more than the fresh
+ * 2 MiB chunk any small allocation can. */
+#ifdef ZEND_HAS_OOM
+# define DEC_FALLIBLE_MIN_BYTES ((size_t)1 << 20)
+# define DEC_FALLIBLE(n, unit) \
+    UNEXPECTED((uint64_t)(n) > DEC_FALLIBLE_MIN_BYTES / (unit))
+#endif
+#define DEC_MIXED_SLOT_BYTES (sizeof(Bucket) + 2 * sizeof(uint32_t))
+
+enum { DEC_INIT_LAZY, DEC_INIT_PACKED, DEC_INIT_MIXED };
+
+#ifdef ZEND_HAS_OOM
+static zend_never_inline zend_array *dec_new_array_fallible(uint32_t n, bool packed) {
+    zend_array *arr = zend_new_array(n);
+    if (zend_hash_real_finit(arr, packed, true) == FAILURE) {
+        zend_array_destroy(arr);
+        return NULL;
+    }
+    return arr;
+}
+#endif
+
+/* NULL only with a memory_limit error pending. A large DEC_INIT_LAZY table is
+ * initialized mixed up front, so its first insert cannot allocate it
+ * infallibly. */
+static zend_always_inline zend_array *dec_new_array(uint32_t n, int init) {
+#ifdef ZEND_HAS_OOM
+    if (DEC_FALLIBLE(n, init == DEC_INIT_PACKED
+                        ? sizeof(zval) : DEC_MIXED_SLOT_BYTES)) {
+        return dec_new_array_fallible(n, init == DEC_INIT_PACKED);
+    }
+#endif
+    zend_array *arr = zend_new_array(n);
+    if (init == DEC_INIT_PACKED) {
+        zend_hash_real_init_packed(arr);
+    } else if (init == DEC_INIT_MIXED) {
+        zend_hash_real_init_mixed(arr);
+    }
+    return arr;
+}
+
+static zend_always_inline void *dec_safe_emalloc(size_t n, size_t unit) {
+#ifdef ZEND_HAS_OOM
+    if (DEC_FALLIBLE(n, unit)) return safe_femalloc(n, unit, 0, true);
+#endif
+    return safe_emalloc(n, unit, 0);
+}
+
+static zend_always_inline void *dec_ecalloc(size_t n, size_t unit) {
+#ifdef ZEND_HAS_OOM
+    if (DEC_FALLIBLE(n, unit)) return fecalloc(n, unit, true);
+#endif
+    return ecalloc(n, unit);
+}
+
 static zend_never_inline void dec_id_table_grow(decode_ctx *d) {
     uint32_t cap = d->id_table_cap * 2;
     if (d->id_table_heap) {
@@ -2596,7 +2655,9 @@ static inline zend_class_entry *dec_class_resolve_ex(
 {
     ZEND_ASSERT(class_idx < d->dict_len);
     if (UNEXPECTED(!d->ce_cache)) {
-        d->ce_cache = ecalloc(d->dict_len, sizeof(zend_class_entry *));
+        /* Fails only with a memory_limit error pending, which fails the decode. */
+        d->ce_cache = dec_ecalloc(d->dict_len, sizeof(zend_class_entry *));
+        if (UNEXPECTED(!d->ce_cache)) return NULL;
     }
     zend_class_entry *ce = d->ce_cache[class_idx];
     if (EXPECTED(ce != NULL)) {
@@ -2977,7 +3038,7 @@ static inline zend_string *dec_get_class_name(decode_ctx *d, uint64_t idx) {
 static int decode_value(decode_ctx *d, zval *out);
 static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *use_add_new);
 /* Returns 1 for unique, 0 for duplicates, -1 when the collision budget is
- * exhausted. */
+ * exhausted or the key set would pass memory_limit. */
 static int dec_schema_keys_are_unique(decode_ctx *d, zend_string **keys, uint64_t nkeys);
 static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out);
 static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out);
@@ -3000,8 +3061,9 @@ static int decode_header(decode_ctx *d) {
      * table spares a small decode an allocation and a free. dec_get_zstr
      * bounds every index by dict_len, so dict stays NULL. */
     if (n == 0) return 0;
+    d->dict = dec_ecalloc((size_t)n + 1, sizeof(zend_string *));
+    if (UNEXPECTED(!d->dict)) return -1;
     d->dict_len = (uint32_t)n;
-    d->dict = ecalloc((size_t)d->dict_len + 1, sizeof(zend_string *));
     for (uint32_t i = 0; i < d->dict_len; i++) {
         uint64_t slen;
         if (UNEXPECTED(PHPSER_HAS_OOM())) return -1;
@@ -3482,8 +3544,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * buffer; otherwise N=2^32 OOMs before parsing fails. */
             if (n > UINT32_MAX || n > d->len - d->pos) return -1;
             /* Pre-sized HT + direct arPacked writes. */
-            zend_array *arr = zend_new_array((uint32_t)n);
-            zend_hash_real_init_packed(arr);
+            zend_array *arr = dec_new_array((uint32_t)n, DEC_INIT_PACKED);
+            if (UNEXPECTED(!arr)) return -1;
             for (uint64_t i = 0; i < n; i++) {
                 int64_t lv;
                 if (varint_read_i64(d->buf, d->len, &d->pos, &lv) < 0
@@ -3501,8 +3563,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
             /* PACKED_DOUBLES needs exactly 8*N bytes. */
             if (n > UINT32_MAX || n > (d->len - d->pos) / 8) return -1;
-            zend_array *arr = zend_new_array((uint32_t)n);
-            zend_hash_real_init_packed(arr);
+            zend_array *arr = dec_new_array((uint32_t)n, DEC_INIT_PACKED);
+            if (UNEXPECTED(!arr)) return -1;
             for (uint64_t i = 0; i < n; i++) {
                 ZVAL_DOUBLE(&arr->arPacked[i], le64_read(d->buf + d->pos));
                 d->pos += 8;
@@ -3514,8 +3576,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
             if (n > UINT32_MAX || n > d->len - d->pos) return -1;
-            zend_array *arr = zend_new_array((uint32_t)n);
-            zend_hash_real_init_packed(arr);
+            zend_array *arr = dec_new_array((uint32_t)n, DEC_INIT_PACKED);
+            if (UNEXPECTED(!arr)) return -1;
             for (uint64_t i = 0; i < n; i++) {
                 uint64_t idx;
                 if (varint_read_u64(d->buf, d->len, &d->pos, &idx) < 0) {
@@ -3538,8 +3600,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             uint64_t n;
             if (varint_read_u64(d->buf, d->len, &d->pos, &n) < 0) return -1;
             if (n > UINT32_MAX || n > d->len - d->pos) return -1;
-            zend_array *arr = zend_new_array((uint32_t)n);
-            zend_hash_real_init_packed(arr);
+            zend_array *arr = dec_new_array((uint32_t)n, DEC_INIT_PACKED);
+            if (UNEXPECTED(!arr)) return -1;
             for (uint64_t i = 0; i < n; i++) {
                 if (decode_value_hot(d, &arr->arPacked[i]) < 0) {
                     arr->nNumUsed = (uint32_t)i;
@@ -3565,8 +3627,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             int64_t base_v, step;
             if (varint_read_i64(d->buf, d->len, &d->pos, &base_v) < 0) return -1;
             if (varint_read_i64(d->buf, d->len, &d->pos, &step) < 0) return -1;
-            zend_array *arr = zend_new_array((uint32_t)n);
-            zend_hash_real_init_packed(arr);
+            zend_array *arr = dec_new_array((uint32_t)n, DEC_INIT_PACKED);
+            if (UNEXPECTED(!arr)) return -1;
             uint64_t acc = (uint64_t)base_v;
             for (uint64_t i = 0; i < n; i++, acc += (uint64_t)step) {
                 if (UNEXPECTED(!dec_i64_fits_zend_long((int64_t)acc))) {
@@ -3894,9 +3956,13 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * form: __unserialize receives the properties array and suppresses
              * __wakeup. Raw property writes would bypass its invariants. */
             if (allowed && hook == HOOK_UNSERIALIZE) {
+                zend_array *data_arr = dec_new_array((uint32_t)nprops, DEC_INIT_MIXED);
+                if (UNEXPECTED(!data_arr)) {
+                    zval_ptr_dtor(out); ZVAL_NULL(out);
+                    return -1;
+                }
                 zval data;
-                array_init_size(&data, (uint32_t)nprops);
-                zend_hash_real_init_mixed(Z_ARRVAL(data));
+                ZVAL_ARR(&data, data_arr);
                 for (uint64_t i = 0; i < nprops; i++) {
                     uint64_t key_idx;
                     if (varint_read_u64(d->buf, d->len, &d->pos, &key_idx) < 0) goto unser_fail;
@@ -3980,7 +4046,11 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             int use_add_new;
             zend_string **keys = dec_read_schema_keys(d, n, &use_add_new);
             if (!keys) return -1;
-            zend_array *arr = zend_new_array((uint32_t)n);
+            zend_array *arr = dec_new_array((uint32_t)n, DEC_INIT_LAZY);
+            if (UNEXPECTED(!arr)) {
+                efree(keys);
+                return -1;
+            }
             for (uint64_t i = 0; i < n; i++) {
                 zval tmp;
                 if (decode_value_hot(d, &tmp) < 0) goto assoc_dict_fail;
@@ -4007,8 +4077,8 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 ZVAL_EMPTY_ARRAY(out);
                 return 0;
             }
-            zend_array *arr = zend_new_array((uint32_t)n);
-            zend_hash_real_init_mixed(arr);
+            zend_array *arr = dec_new_array((uint32_t)n, DEC_INIT_MIXED);
+            if (UNEXPECTED(!arr)) return -1;
             for (uint64_t i = 0; i < n; i++) {
                 key_val k = {0};
                 if (decode_key(d, &k) < 0) goto assoc_fail;
@@ -4069,8 +4139,8 @@ static zend_never_inline int dec_decode_packed_delta(decode_ctx *d, zval *out) {
     /* v0 plus n-1 deltas is at least n wire bytes, the same linear
      * bound as PACKED_LONGS. */
     if (n > UINT32_MAX || n > d->len - d->pos) return -1;
-    zend_array *arr = zend_new_array((uint32_t)n);
-    zend_hash_real_init_packed(arr);
+    zend_array *arr = dec_new_array((uint32_t)n, DEC_INIT_PACKED);
+    if (UNEXPECTED(!arr)) return -1;
     /* First varint is v0, the rest are deltas; acc starts at zero so
      * one wrapping add covers both. Long cells own nothing, so the
      * failure destroy needs no nNumUsed bookkeeping. */
@@ -4131,7 +4201,11 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
     uint32_t *tpl_hash = NULL;   /* hash-slot image, tpl_nslots entries */
     uint32_t tpl_nslots = 0;
 
-    zval *colbuf = (zval *)safe_emalloc((size_t)nrows, sizeof(zval), 0);
+    zval *colbuf = (zval *)dec_safe_emalloc((size_t)nrows, sizeof(zval));
+    if (UNEXPECTED(!colbuf)) {
+        efree(keys);
+        return -1;
+    }
     for (uint64_t c = 0; c < ncols; c++) {
         if (d->pos >= d->len) goto table_fail;
         uint8_t col_tag = d->buf[d->pos++];
@@ -4143,14 +4217,17 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
             goto table_fail;
         }
         if (outer == NULL) {
-            outer = zend_new_array((uint32_t)nrows);
-            zend_hash_real_init_packed(outer);
+            outer = dec_new_array((uint32_t)nrows, DEC_INIT_PACKED);
+            if (UNEXPECTED(!outer)) {
+                for (uint64_t i = 0; i < nrows; i++) zval_ptr_dtor(&colbuf[i]);
+                goto table_fail;
+            }
             uint64_t r = 0;
             if (use_add_new) {
                 int tpl_static_keys = 1;
                 for (; r < nrows && !PHPSER_HAS_OOM(); r++) {
-                    zend_array *row = zend_new_array((uint32_t)ncols);
-                    zend_hash_real_init_mixed(row);
+                    zend_array *row = dec_new_array((uint32_t)ncols, DEC_INIT_MIXED);
+                    if (UNEXPECTED(!row)) break;
                     if (tpl_hash == NULL) {
                         /* First row fixes the geometry; nTableMask is the
                          * negated table size. */
@@ -4269,11 +4346,15 @@ static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out) {
     zend_string **keys = dec_read_schema_keys(d, ncols, &use_add_new);
     if (!keys) return -1;
 
-    zend_array *outer = zend_new_array((uint32_t)nrows);
-    zend_hash_real_init_packed(outer);
+    zend_array *outer = dec_new_array((uint32_t)nrows, DEC_INIT_PACKED);
+    if (UNEXPECTED(!outer)) {
+        efree(keys);
+        return -1;
+    }
     uint64_t r;
     for (r = 0; r < nrows; r++) {
-        zend_array *row = zend_new_array((uint32_t)ncols);
+        zend_array *row = dec_new_array((uint32_t)ncols, DEC_INIT_LAZY);
+        if (UNEXPECTED(!row)) goto rowset_fail;
         for (uint64_t c = 0; c < ncols; c++) {
             zend_string *zs = keys[c];
             zval tmp;
@@ -4330,6 +4411,13 @@ static int dec_schema_keys_are_unique(decode_ctx *d, zend_string **keys, uint64_
 
     HashTable seen;
     zend_hash_init(&seen, (uint32_t)nkeys, NULL, NULL, 0);
+#ifdef ZEND_HAS_OOM
+    if (DEC_FALLIBLE(nkeys, DEC_MIXED_SLOT_BYTES)
+        && zend_hash_real_finit_mixed(&seen, true) == FAILURE) {
+        zend_hash_destroy(&seen);
+        return -1;
+    }
+#endif
     for (uint64_t i = 0; i < nkeys; i++) {
         if (UNEXPECTED(dec_string_hash_chain_exhausted(d, &seen, keys[i]))) {
             zend_hash_destroy(&seen);
@@ -4345,7 +4433,8 @@ static int dec_schema_keys_are_unique(decode_ctx *d, zend_string **keys, uint64_
 }
 
 static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *use_add_new) {
-    zend_string **keys = (zend_string **)safe_emalloc((size_t)nkeys, sizeof(zend_string *), 0);
+    zend_string **keys = (zend_string **)dec_safe_emalloc((size_t)nkeys, sizeof(zend_string *));
+    if (UNEXPECTED(!keys)) return NULL;
     int has_numeric = 0;
     for (uint64_t i = 0; i < nkeys; i++) {
         uint64_t idx;
