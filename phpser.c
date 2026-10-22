@@ -927,7 +927,8 @@ static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
                             uint32_t flags) {
     /* After a hook throws, placeholders preserve container counts until the
      * caller discards the frame. */
-    if (UNEXPECTED(e->failed)) {
+    if (UNEXPECTED(e->failed || PHPSER_HAS_OOM())) {
+        e->failed = 1;
         smart_str_appendc(body, TAG_NULL);
         return;
     }
@@ -4466,7 +4467,7 @@ zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
      * throwing object was); the exception stays pending for the caller. Check
      * before the overflow branches so we never raise a competing depth/size
      * exception on top of the userland one. */
-    if (UNEXPECTED(ctx.failed
+    if (UNEXPECTED(ctx.failed || PHPSER_HAS_OOM()
         || (ctx.pins_active && EG(exception)))) {
         smart_str_free(&body);
         enc_ctx_destroy(&ctx);
