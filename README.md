@@ -53,8 +53,20 @@ cd phpser
 phpize && ./configure --enable-phpser
 make -j$(nproc)
 sudo make install
-echo 'extension=phpser.so' | sudo tee /etc/php/conf.d/phpser.ini
+php --ini
 ```
+
+Enable the extension in the configuration used by your PHP installation: add
+`extension=phpser.so` to a `phpser.ini` file in the scan directory reported by
+`php --ini`, or to the loaded `php.ini` if no scan directory is configured.
+Configuration paths vary by installation; `/etc/php/conf.d` is not universal.
+If neither is configured, create a `php.ini` using PHP's
+[configuration-file search rules](https://www.php.net/manual/en/configuration.file.php).
+Verify the CLI configuration with `php --ri phpser`.
+
+`php --ini` reports the CLI configuration only. PHP-FPM and Apache may use
+different configuration files or scan directories; enable the extension in
+the configuration for the SAPI you use and restart that service.
 
 ### Pre-built binaries
 
