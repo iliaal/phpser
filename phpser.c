@@ -1044,6 +1044,27 @@ static int enc_sleep_find_prop(HashTable *props, zend_object *obj,
     return r;
 }
 
+#if PHP_VERSION_ID >= 80400
+/* A nested hook can reset a proxy and free the owner of IS_INDIRECT slots.
+ * Recover it without initializing a backing instance that skips serialization
+ * initialization. Keep this rare lookup out of the generic encoder. */
+static zend_never_inline ZEND_COLD zend_object *enc_pin_lazy_instance(zend_object *obj, HashTable *props)
+{
+    zval *bv;
+    ZEND_HASH_FOREACH_VAL(props, bv) {
+        if (Z_TYPE_P(bv) != IS_INDIRECT) continue;
+        zval *slot = Z_INDIRECT_P(bv);
+        zend_property_info *pi =
+            zend_lazy_object_get_property_info_for_slot(obj, slot);
+        if (!pi) return NULL;
+        zend_object *inst = (zend_object *)((char *)slot - pi->offset);
+        GC_ADDREF(inst);
+        return inst;
+    } ZEND_HASH_FOREACH_END();
+    return NULL;
+}
+#endif
+
 /* Keep the __sleep snapshot's key/value ownership and cleanup rules together. */
 static zend_never_inline void enc_encode_sleep_object(
     smart_str *body, encode_ctx *e, zend_object *obj,
@@ -1582,6 +1603,12 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                 smart_str_appendc(body, TAG_NULL);
                 return;
             }
+            zend_object *inst = NULL;
+#if PHP_VERSION_ID >= 80400
+            if (props && zend_object_is_lazy_proxy(obj) && zend_lazy_object_initialized(obj)) {
+                inst = enc_pin_lazy_instance(obj, props);
+            }
+#endif
             /* Single bucket walk; nprops back-patched after the loop. See
              * enc_obj_prop_val for the IS_INDIRECT / IS_UNDEF skip rules. */
             smart_str_appendc(body, TAG_OBJECT);
@@ -1610,6 +1637,7 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             }
             enc_patch_nprops(body, nprops_off, nprops);
             zend_release_properties(props);
+            if (inst) OBJ_RELEASE(inst);
             return;
         }
         default:

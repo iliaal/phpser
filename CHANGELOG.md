@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Fixed a use-after-free when a nested serialization callback resets a lazy proxy on PHP 8.4+ (reported by Henry Paradiz).
 - On PHP 8.2.35, 8.3.36, 8.4.27, and 8.5.12, `phpser_serialize()`, `phpser_serialize_signed()`, and `phpser_serialize_keyed()` stop encoding, and `phpser_unserialize()`, `phpser_unserialize_signed()`, `phpser_unserialize_keyed()`, the session handler, and the APCu serializer stop decoding, once a memory_limit error is pending. The request ends with the ordinary memory_limit fatal and runs its shutdown functions, instead of allocating up to the hard limit and exiting the process. A payload whose declared element count or string length would size an allocation past memory_limit ends the same way, before that allocation is made, including a payload in APCu shared memory.
 
 ### Documentation
