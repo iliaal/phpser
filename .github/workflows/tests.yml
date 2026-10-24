@@ -359,7 +359,16 @@ jobs:
       # with "cannot run C compiled programs."
       - name: Resolve clang runtime dir
         id: clang_rt
-        run: echo "dir=$(clang -print-runtime-dir)" >> "$GITHUB_OUTPUT"
+        run: |
+          # Ask clang where the shared ASan runtime lives rather than using
+          # -print-runtime-dir: Ubuntu's clang 21 reports the per-target
+          # lib/x86_64-pc-linux-gnu dir but ships the runtime in lib/linux.
+          lib=$(clang -print-file-name="libclang_rt.asan-$(uname -m).so")
+          [ -f "$lib" ] || lib=$(clang -print-file-name=libclang_rt.asan.so)
+          if [ ! -f "$lib" ]; then
+            echo "::error::clang shared ASan runtime not found"; exit 1
+          fi
+          echo "dir=$(dirname "$lib")" >> "$GITHUB_OUTPUT"
 
       - name: Build PHP with ASAN (-shared-libasan keeps __cxa_throw resolvable across dlopen)
         env:
