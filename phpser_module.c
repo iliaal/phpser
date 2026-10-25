@@ -31,10 +31,11 @@ PHP_FUNCTION(phpser_serialize) {
 }
 
 /* Parse a phpser_unserialize options array. On success, *out_set may be
- * non-NULL and the caller must free it. Returns -1 on type error (an
+ * non-NULL and the caller must free it. Returns -1 on invalid options (an
  * exception is already thrown). param_idx is the arg position for the
- * error message (2 for unserialize, 3 for unserialize_signed); fname is
- * the calling function's name for the TypeError text. */
+ * error message (2 for unserialize, 3 for unserialize_signed or
+ * unserialize_keyed); fname is the calling function's name for the
+ * TypeError text. */
 static int parse_unserialize_options(
     HashTable *options_ht, int param_idx, const char *fname,
     int *out_mode, HashTable **out_set)
