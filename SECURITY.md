@@ -353,11 +353,12 @@ semantics, with these intentional differences:
   decode failure (malformed bytes, truncation, over-depth), which is
   indistinguishable from a successfully-decoded `null`. Native
   `unserialize()` returns `false` plus an `E_WARNING`.
-  `phpser_unserialize_signed()` instead *throws* on failure (since
-  0.4.0), so the signed path, the one you use for untrusted bytes,
-  is unambiguous. The session handler reports decode failure to the
-  engine (warning; a scalar-root payload fails the read rather than
-  becoming an empty session). Prefer the signed entry point when you
+  `phpser_unserialize_signed()` (since 0.4.0) and
+  `phpser_unserialize_keyed()` instead *throw* on failure, so signed and
+  keyed decoding distinguish failures from legitimately-signed `null`
+  values. The session handler reports decode failure to the engine
+  (warning; a scalar-root payload fails the read rather than becoming
+  an empty session). Prefer a signed or keyed entry point when you
   need to distinguish a decode failure from a legitimate `null`.
 
 - **A shared array is captured at its first visit.** Native `serialize()`

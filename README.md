@@ -103,7 +103,8 @@ $value = phpser_unserialize_signed($payload, $key);
 // needs was removed since signing). A legitimately-signed null decodes to null.
 ```
 
-`allowed_classes` option on both unserialize entry points. Same shape as
+`allowed_classes` is supported by `phpser_unserialize()`,
+`phpser_unserialize_signed()`, and `phpser_unserialize_keyed()`. Same shape as
 PHP's native `unserialize($payload, ['allowed_classes' => ...])`:
 
 ```php
@@ -223,6 +224,11 @@ $redis->set('user:7', phpser_serialize_keyed($user, 'redis'));
 $user = phpser_unserialize_keyed($redis->get('user:7'), 'redis');
 // throws if the payload was tampered, unsigned, or signed for another
 // context or key, and if phpser.key is unset or shorter than 32 bytes
+
+// The optional third argument also supports the class allowlist:
+$user = phpser_unserialize_keyed($redis->get('user:7'), 'redis', [
+    'allowed_classes' => [User::class],
+]);
 ```
 
 The context names the store and must be 1 to 255 bytes, contain no NUL
@@ -248,7 +254,7 @@ phpser.
 - **Signed payloads**: `phpser_serialize_signed($value, $key)` wraps the payload in an HMAC-SHA256 frame; `phpser_unserialize_signed($payload, $key)` verifies in constant time and rejects tampered or foreign-keyed input before any decoding runs. Use it whenever the store crosses a trust boundary (memcached, redis, files, cookies), anywhere an attacker who can write to the store could feed your decoder a crafted payload. Both sides reject an empty key, since a keyless HMAC is forgeable.
 - **Signed sessions**: `phpser.session_key` turns on HMAC-SHA256 signing for the session handler. The tag is bound to the session ID, so a forged, corrupted, or copied-from-another-session blob fails verification and is never decoded. One INI line next to `session.serialize_handler = phpser`, no code changes. It does not stop rollback to an older blob signed for the same ID, so keep authorization state outside the session.
 - **APCu serializer and keyed signing**: `apc.serializer = phpser` stores APCu arrays and objects as phpser frames. Set `phpser.key` and the values APCu serializes carry an HMAC-SHA256 tag bound to the key and the `apcu` context, verified before decoding, so one FPM pool cannot make another pool's `apcu_fetch()` instantiate objects. Scalars are not signed. `phpser_serialize_keyed()` / `phpser_unserialize_keyed()` apply the same key to Redis, memcached, or any other store, and `php_phpser_api.h` exposes it to other extensions.
-- **Untrusted input limits**: both unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (returns `null`). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled key comparisons and collision chains consume bounded work budgets. TABLE/ROWSET rows and fallback object-property copies have a separate materialization budget. Exhausting a budget rejects the frame; these limits do not bound autoloaders or application hooks. See [SECURITY.md](SECURITY.md) for exact limits and class-resolution costs.
+- **Untrusted input limits**: all three userland unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (`null` for unsigned decoding, an exception for signed or keyed decoding). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled key comparisons and collision chains consume bounded work budgets. TABLE/ROWSET rows and fallback object-property copies have a separate materialization budget. Exhausting a budget rejects the frame; these limits do not bound autoloaders or application hooks. See [SECURITY.md](SECURITY.md) for exact limits and class-resolution costs.
 - **Supported versions**: PHP 8.2+ (8.3, 8.4, 8.5, master). BSD 3-Clause.
 
 ## Bench (PHP 8.4.25 aarch64, idle box, 1000 iters, median of 35)
@@ -436,20 +442,22 @@ whether registration succeeded.
 
 ## Limitations / known gaps
 
-- **The three entry points signal corrupt input differently.** `phpser_unserialize()`
+- **The decoding entry points signal corrupt input differently.** `phpser_unserialize()`
   silently returns `null` on malformed, truncated, or over-deep input,
   indistinguishable from a successfully decoded `null`. Trailing bytes after
   a complete top-level value are tolerated on this path (prefix read).
-  `phpser_unserialize_signed()` throws instead (since 0.4.0), so a
-  legitimately-signed `null` still decodes cleanly, and both the signed and
-  session paths require exact consumption of the frame. The session handler
+  `phpser_unserialize_signed()` (since 0.4.0) and
+  `phpser_unserialize_keyed()` throw instead, so a legitimately-signed `null`
+  still decodes cleanly. Signed, keyed, and session decoding require exact
+  consumption of the frame. The session handler
   reports decode failure to the engine (warning; a scalar-root payload fails
   the read rather than becoming an empty session). When a cache miss must be
-  told apart from a cached `null`, use the signed entry point. `SECURITY.md`
+  told apart from a cached `null`, use a signed or keyed entry point. `SECURITY.md`
   carries the full contract.
 - **Recursion depth is capped at 512** on both encode and decode. On decode,
-  anything deeper than 512 nested containers / refs is rejected (returns
-  `null`) to bound stack consumption against adversarial wire payloads. On
+  anything deeper than 512 nested containers / refs is rejected (`null` for
+  unsigned decoding, an exception for signed or keyed decoding) to bound
+  stack consumption against adversarial wire payloads. On
   encode, input deeper than 512 throws an `Exception` rather than silently
   shipping a truncated payload. Object cycles go through the id table and
   don't count against the cap; only genuinely deep trees hit it. Cache

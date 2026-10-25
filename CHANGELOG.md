@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Include keyed decoding in the class-allowlist, failure-signaling, and recursion-depth contracts throughout the README and security guide.
 - Source installation instructions locate the active PHP configuration instead of assuming `/etc/php/conf.d`, and distinguish CLI from server SAPIs.
 
 ### For contributors
