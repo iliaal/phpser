@@ -325,7 +325,9 @@ Regenerate it with `php ... bench.php --html > docs/index.html`.
   those encode smaller; wrapping mod-2^64 arithmetic keeps every int64
   sequence exact with no overflow checks.
 - **Refcount reuse of zend_strings on decode**: a per-decode cache parallels
-  the dict. The first reference allocates; later ones `addref`.
+  the dict. Header parsing resolves every entry up front, reusing an engine-
+  interned string when available and allocating otherwise. Value references
+  reuse those strings; non-interned strings receive an added reference.
 - **Eligible shared arrays stay shared**: a nested array held in several
   places (a literal list on every row, an Eloquent model's `attributes` and
   `original`) can reuse one encoded and decoded table. Sharing requires a
@@ -380,12 +382,16 @@ performance in these areas, all shipped:
    sign a handcrafted frame. `TAG_ASSOC` therefore always uses update
    semantics; schema-based paths use `add_new` only after validating distinct,
    non-numeric keys once at schema read.
-6. **Inline-short-string tag with upgrade-on-second-encounter.**
-   `TAG_STR_INLINE` (0x0c) and `KEY_STR_INLINE` (0x02) are emitted on a
-   string's first occurrence; the next occurrence triggers an in-place
-   upgrade to a dict entry, and all subsequent ones emit `TAG_STR_DICT`.
-   Singletons (e.g. `row_X` values in a rowset) never hit the upgrade
-   branch. They cost nothing in the dict header. The intern cache
+6. **Inline string tags with dictionary promotion.**
+   On the generic tagged-string path, a string absent from both the pointer
+   cache and the active content map emits `TAG_STR_INLINE` (0x0c) or
+   `KEY_STR_INLINE` (0x02). Seeing the same string pointer again promotes its
+   cache slot to a dictionary entry; that occurrence and later hits emit
+   dictionary references. The earlier inline bytes are not rewritten.
+   Paths requiring dictionary indices, such as class/property names and
+   rowset schemas, can intern strings directly on their first occurrence.
+   Single-use strings emitted inline cost nothing in the dict header,
+   but still occupy pointer-cache slots. The intern cache
    doubles as the "seen once?" signal: high bit of `idx` distinguishes
    `INLINE_EMITTED` from `DICT_IDX`. No pre-pass; single walk of the
    zval tree as before.
@@ -494,13 +500,16 @@ whether registration succeeded.
   Encoding a longer value fails loud (throws for the userland API, an
   `E_WARNING` for the session handler) rather than emitting bytes the decoder
   would reject. No single cache value realistically approaches this.
-- **Encode memory is O(distinct strings), uncapped.** The encoder interns
-  every distinct string it emits into a cache that grows without eviction
-  for the duration of the call (pre-sized from the top-level value, so the
-  common shapes never regrow mid-encode). A value with N unique strings
-  holds N entries until the encode returns; nothing is retained between
-  calls. Unusually string-diverse values cost temporary memory proportional
-  to their diversity; chunk the value if that matters.
+- **The per-encode string cache grows without eviction.** It tracks
+  `zend_string*` identities, including strings first emitted inline, rather
+  than just distinct byte contents. Separately allocated equal strings can
+  therefore occupy separate slots; content-map hits may reuse a dictionary
+  entry without adding a pointer-cache slot. The initial capacity is
+  estimated from the top-level value, but larger workloads can still grow
+  the cache. Cache and dictionary state is released at the end of each call.
+  These tables are only part of encode memory: output buffers and container
+  identity/snapshot tracking also consume space. Chunk large values if
+  temporary memory matters.
 - **Wire integers outside the target `zend_long` range are rejected on 32-bit
   builds.** A payload written by a 64-bit process can carry values a 32-bit
   `zend_long` cannot hold. Decode returns `null` instead of narrowing them, so
