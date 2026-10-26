@@ -80,16 +80,16 @@ jobs:
           - ubuntu-24.04-arm
         php: ['8.4', '8.5']
         include:
-          # Official Docker images. The oldest-patch image is digest-pinned
-          # because it produces the shipped binary. The newest-patch image
-          # follows its minor's tag on purpose: the gate must load the binary
-          # on whatever patch is current.
+          # Official Docker images, digest-pinned. The oldest-patch image
+          # produces the shipped binary. The newest-patch image is the gate
+          # that loads it on the current patch; bump it when a newer patch
+          # ships.
           - php: '8.4'
             oldest-image: php:8.4.1-cli-bookworm@sha256:246d2ca7e9cf21c4e7c354ce87e87bf1ad6d41b2061c77668845e04a8f8889d4
-            newest-image: php:8.4-cli
+            newest-image: php:8.4.27-cli@sha256:debadc2e36b857657846e2e952cbaf52702e55482dd3c2c43806f68d8c534a70
           - php: '8.5'
             oldest-image: php:8.5.0-cli-bookworm@sha256:4ff93cd1b053c4d5ff468ced40962092a350a8c86798fee96e807bc9b383ec75
-            newest-image: php:8.5-cli
+            newest-image: php:8.5.12-cli@sha256:635a4b998025ab269194639a5549c6fdcd9b4f88ec8cd761b092de8653d40663
     env:
       OLDEST: ${{ matrix.oldest-image }}
       NEWEST: ${{ matrix.newest-image }}
@@ -103,16 +103,16 @@ jobs:
       # Anonymous pulls from shared runner IPs hit both Docker Hub's and ECR
       # Public's per-IP limits. ghcr.io/iliaal/php and ECR Public mirror the
       # official images under the same digests, so any source yields the
-      # pinned build image. The GHCR copy holds only the pinned tags, so an
-      # unpinned reference skips it.
+      # pinned build image. A reference without a digest is rejected.
       - name: Pull the oldest and newest patch images
         run: |
           set -euo pipefail
           pull() {
             local delay reg
-            local -a regs=(docker.io/library public.ecr.aws/docker/library)
-            if [[ "$2" == php:*@sha256:* ]]; then
-              regs=(ghcr.io/iliaal "${regs[@]}")
+            local -a regs=(ghcr.io/iliaal docker.io/library public.ecr.aws/docker/library)
+            if [[ "$2" != php:*@sha256:* ]]; then
+              echo "::error::$1 is not digest-pinned: $2"
+              return 1
             fi
             for delay in 10 30 60 0; do
               for reg in "${regs[@]}"; do
