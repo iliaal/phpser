@@ -343,7 +343,7 @@ typedef struct {
     uint8_t depth_exceeded;
     /* Reject strings beyond the decoder's UINT32_MAX limit during encode. */
     uint8_t size_exceeded;
-    /* A hook exception invalidates the entire frame, including session saves. */
+    /* An encode exception invalidates the entire frame, including session saves. */
     uint8_t failed;
     /* Set when the body uses a v2-only tag; header version becomes 0x02. */
     uint8_t wire_v2;
@@ -925,7 +925,7 @@ static void encode_value(smart_str *body, encode_ctx *e, zval *v) {
 
 static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
                             uint32_t flags) {
-    /* After a hook throws, placeholders preserve container counts until the
+    /* After encoding fails, placeholders preserve container counts until the
      * caller discards the frame. */
     if (UNEXPECTED(e->failed || PHPSER_HAS_OOM())) {
         e->failed = 1;
@@ -1344,10 +1344,13 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
         }
         case IS_OBJECT: {
             zend_object *obj = Z_OBJ_P(v);
-            /* NOT_SERIALIZABLE classes (Closure, Generator, etc.) can't be
-             * rebuilt by object_init_ex. Emit NULL; native serialize() throws
-             * here instead. */
+            /* Match native serialization: unsupported objects must not become
+             * successful NULL cache values, including inside a larger graph. */
             if (obj->ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
+                zend_throw_exception_ex(zend_ce_exception, 0,
+                    "Serialization of '%s' is not allowed", ZSTR_VAL(obj->ce->name));
+                e->failed = 1;
+                /* Preserve container counts during cleanup; discard the frame. */
                 smart_str_appendc(body, TAG_NULL);
                 return;
             }
@@ -4629,7 +4632,7 @@ zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
     smart_str_alloc(&body, body_estimate, 0);
     encode_value(&body, &ctx, value);
 
-    /* A userland __serialize/__sleep/Serializable::serialize threw mid-walk.
+    /* An unsupported object or a throwing serialization hook failed mid-walk.
      * Never hand back the truncated frame (it has a TAG_NULL hole where the
      * throwing object was); the exception stays pending for the caller. Check
      * before the overflow branches so we never raise a competing depth/size

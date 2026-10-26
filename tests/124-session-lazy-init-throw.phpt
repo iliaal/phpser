@@ -54,6 +54,6 @@ echo file_exists($file) ? "bytes=" . filesize($file) . "\n" : "no file\n";
 @unlink(sys_get_temp_dir() . '/sess_probe124');
 ?>
 --EXPECTF--
-Warning: session_write_close(): phpser: $_SESSION not serialized — a serialization hook threw in %s on line %d
+Warning: session_write_close(): phpser: $_SESSION not serialized — an exception was thrown during serialization in %s on line %d
 threw: init boom
 bytes=0

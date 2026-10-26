@@ -19,10 +19,15 @@ echo $rt instanceof ArrayObject && count($rt) === 1
     ? "arrayobject_state OK\n" : "arrayobject_state FAIL\n";
 
 
-// --- Closures and resources emit NULL, no crash ---
+// --- Closures throw; resource encoding remains unchanged ---
 $f = function () { return 42; };
-$rt = phpser_unserialize(phpser_serialize($f));
-echo $rt === null ? "closure_null OK\n" : "closure_null FAIL\n";
+try {
+    phpser_serialize($f);
+    echo "closure_throw FAIL\n";
+} catch (Exception $e) {
+    echo $e->getMessage() === "Serialization of 'Closure' is not allowed"
+        ? "closure_throw OK\n" : "closure_throw FAIL\n";
+}
 
 $r = fopen('php://memory', 'r');
 $rt = phpser_unserialize(phpser_serialize($r));
@@ -31,5 +36,5 @@ fclose($r);
 ?>
 --EXPECT--
 arrayobject_state OK
-closure_null OK
+closure_throw OK
 resource_null OK

@@ -58,6 +58,6 @@ echo ($old_frame !== '' && $stored === $expected) ? "partial_commit OK\n" : "par
 @rmdir($dir);
 ?>
 --EXPECTF--
-Warning: session_write_close(): phpser: $_SESSION not serialized — a serialization hook threw in %s on line %d
+Warning: session_write_close(): phpser: $_SESSION not serialized — an exception was thrown during serialization in %s on line %d
 exception OK
 partial_commit OK

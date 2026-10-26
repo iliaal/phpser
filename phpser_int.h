@@ -146,9 +146,9 @@ const char *phpser_sha256_backend(void);
 int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n);
 
 /* Reusable encode: produce a framed payload zend_string from a zval.
- * Caller owns the returned zend_string. Returns NULL when a hook throws or
- * cleanup raises, or when depth/size limits would make the frame
- * undecodable. With throw_on_overflow, the userland entry points turn limit
+ * Caller owns the returned zend_string. Returns NULL when a non-serializable
+ * object is rejected, a hook throws or cleanup raises, or when depth/size
+ * limits would make the frame undecodable. With throw_on_overflow, the userland entry points turn limit
  * failures into exceptions; the session handler passes false and degrades
  * them to warnings, because request-shutdown auto-save may have no
  * execution frame to catch one.

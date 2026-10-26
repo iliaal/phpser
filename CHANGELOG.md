@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **Compatibility change:** encoding `Closure` and other objects marked not serializable now throws an `Exception`, matching native `serialize()`, instead of silently encoding `NULL`. Nested occurrences abort the entire frame across plain, signed, keyed, C API, and session encoding. Resource handling is unchanged. Callers must handle the exception before writing cache values.
+
 ### Fixed
 
 - Fixed a use-after-free when a nested serialization callback resets a lazy proxy on PHP 8.4+ (reported by Henry Paradiz).

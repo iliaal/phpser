@@ -67,12 +67,16 @@ $rt = phpser_unserialize(phpser_serialize($box));
 // Mutating through the ref's value must reach back through identity preservation.
 echo ($rt->parent->name === "B1") ? "ref_cycle OK\n" : "ref_cycle FAIL\n";
 
-// --- Failed-serialize object referenced twice: PHP emits N; for both slots.
-// Our equivalent: NOT_SERIALIZABLE classes emit TAG_NULL, no id claimed. ---
-$f = function() {};  // closure: NOT_SERIALIZABLE
+// --- A repeated non-serializable object rejects the whole frame. ---
+$f = function() {};
 $arr = [$f, $f];
-$rt = phpser_unserialize(phpser_serialize($arr));
-echo ($rt[0] === null && $rt[1] === null) ? "fail_ser_refs OK\n" : "fail_ser_refs FAIL\n";
+try {
+    phpser_serialize($arr);
+    echo "fail_ser_refs FAIL\n";
+} catch (Exception $e) {
+    echo $e->getMessage() === "Serialization of 'Closure' is not allowed"
+        ? "fail_ser_refs OK\n" : "fail_ser_refs FAIL\n";
+}
 
 // --- Long shared-ref chain: stress id table growth via refs. ---
 $shared = "value";
