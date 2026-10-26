@@ -7,9 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-26
+
 ### Changed
 
-- **Compatibility change:** encoding `Closure` and other objects marked not serializable now throws an `Exception`, matching native `serialize()`, instead of silently encoding `NULL`. Nested occurrences abort the entire frame across plain, signed, keyed, C API, and session encoding. Resource handling is unchanged. Callers must handle the exception before writing cache values.
+- **Compatibility change:** encoding `Closure` and other objects marked not serializable now throws an `Exception`, matching native `serialize()`, instead of silently encoding `NULL`. Nested occurrences abort the entire frame across plain, signed, keyed, C API, and session encoding. Resource handling is unchanged. Callers must handle the exception before writing cache values. Sessions are affected too: on PHP 8.5 and earlier, an explicit save (for example `session_write_close()`) of a session that holds such an object throws and stores an empty session, so the whole session is lost on the next request; PHP 8.6+ skips the write and keeps the previous data, and an automatic save at shutdown ends the request with an uncaught exception. Check `$_SESSION` for closures before upgrading.
 
 ### Fixed
 
@@ -20,10 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Include keyed decoding in the class-allowlist, failure-signaling, and recursion-depth contracts throughout the README and security guide.
 - Source installation instructions locate the active PHP configuration instead of assuming `/etc/php/conf.d`, and distinguish CLI from server SAPIs.
+- On 32-bit builds, `phpser_unserialize_signed()` and `phpser_unserialize_keyed()` throw an `Exception` for out-of-range wire integers, where `phpser_unserialize()` returns `null`.
+- String dictionary promotion and per-encode string cache memory are described as implemented.
+- Session serializer support follows the target PHP's `HAVE_PHP_SESSION` for both `phpize` and `Makefile.dev` builds, and registration requires a startup load.
 
 ### For contributors
 
 - A/B benchmarks average the two middle samples for even repetition counts, matching `bench.php`; both harnesses retain fractional median GC counters.
+- `bench.php --html` names the reference column actually measured instead of always naming igbinary.
+- `Makefile.dev` requires `PHP_SRC` to point at a configured php-src tree instead of defaulting to `~/php-src-8.4-opt`; run `make -f Makefile.dev clean` after changing `PHP_SRC`, `CC`, `CFLAGS`, or `LDFLAGS`.
 
 ## [0.9.0] - 2026-10-13
 
@@ -408,7 +415,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.9.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.10.0...HEAD
+[0.10.0]: https://github.com/iliaal/phpser/releases/tag/0.10.0
 [0.9.0]: https://github.com/iliaal/phpser/releases/tag/0.9.0
 [0.8.0]: https://github.com/iliaal/phpser/releases/tag/0.8.0
 [0.7.1]: https://github.com/iliaal/phpser/releases/tag/0.7.1
