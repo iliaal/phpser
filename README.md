@@ -512,10 +512,12 @@ whether registration succeeded.
   temporary memory matters.
 - **Wire integers outside the target `zend_long` range are rejected on 32-bit
   builds.** A payload written by a 64-bit process can carry values a 32-bit
-  `zend_long` cannot hold. Decode returns `null` instead of narrowing them, so
-  a cache shared between 32-bit and 64-bit processes has to stay inside the
-  32-bit range. This covers scalars, packed runs, table columns, and array
-  keys; encoding is unaffected.
+  `zend_long` cannot hold. `phpser_unserialize()` returns `null` instead of
+  narrowing them; `phpser_unserialize_signed()` and
+  `phpser_unserialize_keyed()` throw an `Exception` when an authenticated
+  frame contains such a value. A cache shared between 32-bit and 64-bit
+  processes has to stay inside the 32-bit range. This covers scalars, packed
+  runs, table columns, and array keys; encoding is unaffected.
 - **`TAG_OBJECT_SLOTS` is positional.** Eligible typed objects encode their
   declared properties as values in `properties_info_table` (declaration)
   order with no per-property names; decode installs them back in that order.
