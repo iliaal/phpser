@@ -101,15 +101,21 @@ jobs:
           persist-credentials: false
 
       # Anonymous pulls from shared runner IPs hit both Docker Hub's and ECR
-      # Public's per-IP limits. ECR Public mirrors the official images under
-      # the same digests, so either source yields the pinned build image.
+      # Public's per-IP limits. ghcr.io/iliaal/php and ECR Public mirror the
+      # official images under the same digests, so any source yields the
+      # pinned build image. The GHCR copy holds only the pinned tags, so an
+      # unpinned reference skips it.
       - name: Pull the oldest and newest patch images
         run: |
           set -euo pipefail
           pull() {
             local delay reg
+            local -a regs=(docker.io/library public.ecr.aws/docker/library)
+            if [[ "$2" == php:*@sha256:* ]]; then
+              regs=(ghcr.io/iliaal "${regs[@]}")
+            fi
             for delay in 10 30 60 0; do
-              for reg in docker.io/library public.ecr.aws/docker/library; do
+              for reg in "${regs[@]}"; do
                 if docker pull -q "$reg/$2" > /dev/null; then
                   echo "$1=$reg/$2" >> "$GITHUB_ENV"
                   docker image inspect --format "$1: {{index .RepoDigests 0}}" "$reg/$2"
