@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-10-26
+
 ### Fixed
 
 - The 0.10.0 Linux and macOS prebuilt binaries failed on PHP 8.4 releases before 8.4.27 and 8.5 releases before 8.5.12 with an undefined-symbol error (`smart_str_ferealloc`), because they were compiled against the newest patch release; source builds were unaffected. Prebuilt binaries now compile against the oldest patch release of each PHP minor (8.4.1, 8.5.0), so they omit the memory_limit stop described under 0.10.0; build from source to get it on 8.4.27+ and 8.5.12+.
@@ -419,7 +421,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.10.0...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.10.1...HEAD
+[0.10.1]: https://github.com/iliaal/phpser/releases/tag/0.10.1
 [0.10.0]: https://github.com/iliaal/phpser/releases/tag/0.10.0
 [0.9.0]: https://github.com/iliaal/phpser/releases/tag/0.9.0
 [0.8.0]: https://github.com/iliaal/phpser/releases/tag/0.8.0
