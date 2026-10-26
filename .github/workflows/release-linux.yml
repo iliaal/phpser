@@ -80,8 +80,8 @@ jobs:
           - ubuntu-24.04-arm
         php: ['8.4', '8.5']
         include:
-          # Official Docker images, pulled from the ECR Public mirror to stay
-          # clear of Docker Hub's anonymous pull limit. The oldest-patch image
+          # Official Docker images from the ECR Public mirror, which serves
+          # the same digests as Docker Hub. The oldest-patch image
           # is digest-pinned because it produces the shipped binary. The
           # newest-patch image follows its minor's tag on purpose: the gate
           # must load the binary on whatever patch is current.
@@ -104,6 +104,12 @@ jobs:
       - name: Build against the oldest patch and check its imports
         run: |
           set -euo pipefail
+          # Anonymous registry pulls from shared runner IPs hit rate limits.
+          for delay in 5 15 30 60 0; do
+            docker pull -q "$OLDEST_IMAGE" && break
+            [ "$delay" -gt 0 ] || exit 1
+            sleep "$delay"
+          done
           docker run --rm -i -e CONFIGURE_FLAGS -e HOST_OWNER="$(id -u):$(id -g)" \
             -v "$PWD:/src" -w /src "$OLDEST_IMAGE" bash -euo pipefail -s <<'EOF'
           export LC_ALL=C
@@ -138,7 +144,11 @@ jobs:
           status=0
           for image in "$OLDEST_IMAGE" "$NEWEST_IMAGE"; do
             echo "::group::$image"
-            docker pull -q "$image"
+            for delay in 5 15 30 60 0; do
+              docker pull -q "$image" && break
+              [ "$delay" -gt 0 ] || exit 1
+              sleep "$delay"
+            done
             docker image inspect --format '{{index .RepoDigests 0}}' "$image"
             rc=0
             out=$(docker run --rm -v "$PWD/modules/phpser.so:/ext.so:ro" "$image" \
@@ -156,7 +166,7 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          suffix=$(docker run --rm "$OLDEST_IMAGE" php -n -r \
+          suffix=$(docker run --rm --pull never "$OLDEST_IMAGE" php -n -r \
             'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION, PHP_DEBUG ? "-debug" : "", ZEND_THREAD_SAFE ? "-zts" : "";')
           case "$suffix" in
             "$MATRIX_PHP"*) ;;
