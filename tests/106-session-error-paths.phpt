@@ -53,7 +53,7 @@ session_write_close();
 echo "DONE\n";
 ?>
 --EXPECTF--
-Warning: session_encode(): phpser: $_SESSION not serialized — a serialization hook threw in %s on line %d
+Warning: session_encode(): phpser: $_SESSION not serialized — an exception was thrown during serialization in %s on line %d
 encode_hook_throw: boom-encode
 
 Warning: session_decode(): Failed to decode session object. Session has been destroyed in %s on line %d

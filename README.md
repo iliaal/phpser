@@ -468,13 +468,17 @@ whether registration succeeded.
   shipping a truncated payload. Object cycles go through the id table and
   don't count against the cap; only genuinely deep trees hit it. Cache
   workloads typically nest 5-10 deep.
-- **Closures, other non-serializable objects, and resources encode as
-  `NULL`.** Native `serialize()` throws for `Closure`, `Generator`, `Fiber`,
-  and other classes marked not serializable, and writes every resource as
-  `i:0;`, so native `unserialize()` returns `int(0)` where phpser returns
-  `NULL`. Neither serializer stores the resource id or can restore an open
-  stream or other resource handle. phpser treats all of these as unsupported
-  cache values and writes `NULL`.
+- **Non-serializable objects throw on encode**, matching native `serialize()`.
+  This includes `Closure`, `Generator`, `Fiber`, `WeakMap`, `WeakReference`,
+  and other classes marked not serializable. The entire encode fails even
+  when the object is nested; no partial frame is returned. This applies to
+  plain, signed, keyed, C API, and session encoding. Versions through 0.9.0
+  instead silently encoded these objects as `NULL`; callers must now handle
+  the exception before attempting a cache write.
+- **Resources still encode as `NULL`.** Native `serialize()` writes every
+  resource as `i:0;`, so native `unserialize()` returns `int(0)` where phpser
+  returns `NULL`. Neither serializer stores the resource id or can restore
+  an open stream or other resource handle.
 - **Unknown classes at decode become `__PHP_Incomplete_Class`** with the
   original name preserved, matching PHP native `unserialize()`. This holds
   for plain objects and `__serialize`-based objects, and for any shape whose
@@ -555,11 +559,14 @@ whether registration succeeded.
   encode fails on coder limits (over-deep or oversized input), the handler
   persists a 29-byte `phpser:session-not-serialized` tombstone marker
   instead of the session, so the next read fails loudly (engine warning,
-  session destroyed) rather than silently resuming an empty session. When a
-  serialization hook throws, the exception propagates and the handler
-  returns no data: PHP 8.6+ then skips the write and the previous session
+  session destroyed) rather than silently resuming an empty session. When
+  encoding throws (including for a non-serializable object or from a
+  serialization hook), the exception propagates to an explicit save caller
+  and the handler returns no data: PHP 8.6+ then skips the write and the previous session
   survives, while PHP 8.5 and earlier write an empty session, which the next
-  request reads as new.
+  request reads as new. An uncaught exception during automatic shutdown
+  saving terminates the request; applications should handle unsupported
+  values before shutdown.
 
 - **APCu signing covers what APCu serializes.** APCu stores `null`,
   booleans, integers, floats, and strings itself without calling a
