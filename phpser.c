@@ -699,8 +699,8 @@ static void enc_icache_grow(encode_ctx *e) {
 }
 
 /* Insert `zs` (which the caller has confirmed absent via enc_cache_find) and
- * return its slot. No eviction: the cache grows with the payload's distinct
- * string count, so every pointer-shared repeat stays cached. The caller writes
+ * return its slot. No eviction: entries track string pointer identities,
+ * including first encounters emitted inline. The caller writes
  * .idx immediately; no enc_cache_alloc_slot call may intervene before that
  * write, so the returned pointer can't be invalidated by a rehash. */
 static inline intern_slot *enc_cache_alloc_slot(encode_ctx *e, zend_string *zs) {
@@ -831,7 +831,7 @@ static zend_always_inline int enc_emit_str_tagged(
             emit_tag_and_varint(body, dict_tag, SLOT_DICT_IDX(*s));
             return 0;
         }
-        /* INLINE_EMITTED: upgrade in place. */
+        /* INLINE_EMITTED: promote this cache slot, not the earlier wire bytes. */
         s->idx = enc_dict_append(e, zs);  /* writes into low 31 bits; high bit cleared */
         emit_tag_and_varint(body, dict_tag, s->idx);
         return 0;
