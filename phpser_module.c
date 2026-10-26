@@ -13,6 +13,7 @@
 #include "phpser_int.h"
 #include "ext/standard/info.h"
 #include "Zend/zend_exceptions.h"
+#include "main/php_main.h"
 
 #ifdef HAVE_PHP_SESSION
 # include "ext/session/php_session.h"
@@ -338,6 +339,18 @@ static PHP_MINIT_FUNCTION(phpser) {
     /* Initialize TLS for shared ZTS builds. phpize defines COMPILE_DL_PHPSER;
      * the in-tree Makefile defines ZEND_COMPILE_DL_EXT. */
     ZEND_TSRMLS_CACHE_UPDATE();
+#endif
+#if PHP_VERSION_ID >= 80300
+    /* Headers from a newer patch can make inline helpers call symbols an older
+     * patch does not export; ELF binds them lazily, so without this check the
+     * process dies on first use instead of at startup. */
+    if (php_version_id() < PHP_VERSION_ID) {
+        php_error_docref(NULL, E_CORE_WARNING,
+            "phpser was built for PHP " PHP_VERSION " and cannot run on PHP %s; "
+            "install a build for this PHP version or build from source",
+            php_version());
+        return FAILURE;
+    }
 #endif
     REGISTER_INI_ENTRIES();
 #ifdef HAVE_PHP_SESSION
