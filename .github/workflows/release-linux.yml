@@ -238,6 +238,8 @@ jobs:
       - name: Build against the oldest patch
         run: |
           set -euo pipefail
+          # phpize needs autoconf, which the runner image does not ship.
+          brew install autoconf
           bin="$RUNNER_TEMP/php-oldest/bin"
           read -ra flags <<< "$CONFIGURE_FLAGS"
           "$bin/phpize"
