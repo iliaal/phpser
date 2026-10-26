@@ -2,9 +2,25 @@ name: Release Linux & macOS binaries
 
 # Triggered when a GitHub Release is published. Builds .so binaries for
 # Linux glibc (x86_64 + arm64) and macOS (arm64) at the PHP versions in
-# the matrix (NTS only; ZTS lives in the Windows lane), uploads each
-# as a release asset via php/pie-ext-binary-builder using PIE's
-# pre-packaged-binary naming convention.
+# the matrix (NTS only; ZTS lives in the Windows lane), gates each one, then
+# uploads all of them as release assets using PIE's pre-packaged-binary
+# naming convention (php_phpser-<tag>_php<x.y>-<arch>-<os>-<libc>.zip).
+#
+# Each binary compiles against the OLDEST patch release of its PHP minor.
+# Headers from a newer patch can declare symbols the older patches do not
+# export (8.4.27 and 8.5.12 added the fallible allocators behind
+# ZEND_HAS_OOM), and a module built against them dies with "undefined
+# symbol" on every earlier patch. PHP 8.4.0 was never released, so 8.4.1 is
+# the oldest 8.4 patch. Linux builds inside the digest-pinned official
+# image; macOS builds PHP from the checksum-pinned php.net release tarball,
+# because setup-php only installs the newest patch of a minor.
+#
+# Before anything uploads, every binary must load and round-trip a payload
+# large enough to grow the encoder's smart_str on both the oldest and the
+# newest patch of its minor, and every symbol a Linux .so imports must be
+# exported by the oldest patch's php binary or a library loaded with it.
+# The upload job runs only after every build passes, so a failed gate
+# attaches no Linux or macOS asset.
 #
 # macOS Intel (macos-13) is absent: GitHub's Intel runner pool queues 30+
 # min on busy days, and macOS 26 drops Intel. Linux musl (Alpine) is absent
@@ -15,11 +31,9 @@ name: Release Linux & macOS binaries
 #   "download-url-method": ["pre-packaged-binary", "composer-default"]
 # so PIE prefers the prebuilt asset and falls back to source-build when
 # no asset matches.
-
-# workflow_dispatch compiles the same matrix and asserts the module loads
-# without uploading. php/pie-ext-binary-builder builds and uploads in one
-# step and needs a release tag, so the dispatch path runs a plain
-# phpize/configure/make on a candidate commit before the tag exists.
+#
+# workflow_dispatch runs the same builds and gates on a candidate commit
+# before the tag exists, and uploads nothing.
 
 on:
   release:
@@ -29,9 +43,19 @@ on:
 permissions: {}
 
 env:
-  # Shared by the dispatch build below and the release upload action, so the
-  # two paths cannot drift into configuring the extension differently.
+  # Shared by every build, so the Linux and macOS binaries cannot drift into
+  # configuring the extension differently.
   CONFIGURE_FLAGS: '--enable-phpser'
+  # 4096 distinct strings encode to well over 64 KiB, growing the encoder's
+  # smart_str through repeated reallocations.
+  SMOKE_PHP: |
+    if (!extension_loaded('phpser')) { fwrite(STDERR, "phpser did not load\n"); exit(1); }
+    $v = [];
+    for ($i = 0; $i < 4096; $i++) { $v["k$i"] = "value-$i-" . str_repeat(chr(65 + $i % 26), 24); }
+    $s = phpser_serialize($v);
+    if (strlen($s) < 65536) { fwrite(STDERR, 'payload too small: ' . strlen($s) . "\n"); exit(1); }
+    if (phpser_unserialize($s) !== $v) { fwrite(STDERR, "round trip mismatch\n"); exit(1); }
+    echo 'PHP ', PHP_VERSION, ' phpser ', phpversion('phpser'), ': ', strlen($s), "-byte round trip ok\n";
 
 concurrency:
   # tag_name is empty on a dispatch run; fall back to the ref so two
@@ -40,53 +64,270 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  linux:
     name: ${{ matrix.os }} php ${{ matrix.php }}
     runs-on: ${{ matrix.os }}
-    env:
-      # Builds on macos-15 because setup-php's Homebrew install fails on
-      # macos-14 runners; the macOS asset still targets macOS 14 as its
-      # minimum. Linux compilers ignore the variable.
-      MACOSX_DEPLOYMENT_TARGET: '14.0'
     permissions:
-      contents: write # Uploads binary assets to the published release.
+      contents: read # Checks out the source; uploads go through the upload job.
     strategy:
       fail-fast: false
       matrix:
-        # ubuntu-24.04 (x86_64), ubuntu-24.04-arm (arm64),
-        # macos-15 (Apple Silicon arm64). Pinned over `*-latest` so the
-        # toolchain and glibc baseline can't shift without a repo diff.
+        # ubuntu-24.04 (x86_64), ubuntu-24.04-arm (arm64). The build runs in
+        # the pinned bookworm image, so the binary's glibc baseline is
+        # bookworm's 2.36, not the runner's.
         os:
           - ubuntu-24.04
           - ubuntu-24.04-arm
-          - macos-15
         php: ['8.4', '8.5']
+        include:
+          # Official Docker images. The oldest-patch image is digest-pinned
+          # because it produces the shipped binary. The newest-patch image
+          # follows its minor's tag on purpose: the gate must load the binary
+          # on whatever patch is current.
+          - php: '8.4'
+            oldest-image: php:8.4.1-cli-bookworm@sha256:246d2ca7e9cf21c4e7c354ce87e87bf1ad6d41b2061c77668845e04a8f8889d4
+            newest-image: php:8.4-cli
+          - php: '8.5'
+            oldest-image: php:8.5.0-cli-bookworm@sha256:4ff93cd1b053c4d5ff468ced40962092a350a8c86798fee96e807bc9b383ec75
+            newest-image: php:8.5-cli
+    env:
+      OLDEST: ${{ matrix.oldest-image }}
+      NEWEST: ${{ matrix.newest-image }}
+      MATRIX_PHP: ${{ matrix.php }}
+      RELEASE_TAG: ${{ github.event.release.tag_name || 'dispatch' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Setup PHP
+      # Anonymous pulls from shared runner IPs hit both Docker Hub's and ECR
+      # Public's per-IP limits. ECR Public mirrors the official images under
+      # the same digests, so either source yields the pinned build image.
+      - name: Pull the oldest and newest patch images
+        run: |
+          set -euo pipefail
+          pull() {
+            local delay reg
+            for delay in 10 30 60 0; do
+              for reg in docker.io/library public.ecr.aws/docker/library; do
+                if docker pull -q "$reg/$2" > /dev/null; then
+                  echo "$1=$reg/$2" >> "$GITHUB_ENV"
+                  docker image inspect --format "$1: {{index .RepoDigests 0}}" "$reg/$2"
+                  return 0
+                fi
+              done
+              [ "$delay" -gt 0 ] || return 1
+              sleep "$delay"
+            done
+          }
+          pull OLDEST_IMAGE "$OLDEST"
+          pull NEWEST_IMAGE "$NEWEST"
+
+      - name: Build against the oldest patch and check its imports
+        run: |
+          set -euo pipefail
+          docker run --pull never --rm -i -e CONFIGURE_FLAGS -e HOST_OWNER="$(id -u):$(id -g)" \
+            -v "$PWD:/src" -w /src "$OLDEST_IMAGE" bash -euo pipefail -s <<'EOF'
+          export LC_ALL=C
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends $PHPIZE_DEPS > /dev/null
+          phpize
+          ./configure $CONFIGURE_FLAGS
+          make -j"$(nproc)"
+          chown -R "$HOST_OWNER" /src
+
+          php_bin=$(command -v php)
+          so=modules/phpser.so
+          { ldd "$php_bin"; ldd "$so"; } \
+            | awk '$2 == "=>" && $3 ~ /^\// { print $3 } $1 ~ /^\// { print $1 }' \
+            | sort -u > /tmp/libs
+          { nm -D --defined-only "$php_bin"; xargs -r nm -D --defined-only < /tmp/libs; } \
+            | awk 'NF >= 3 { sub(/@@/, "@", $3); print $3 }' | sort -u > /tmp/provided
+          nm -D --undefined-only "$so" | awk '$1 == "U" { print $2 }' | sort -u > /tmp/imports
+          comm -23 /tmp/imports /tmp/provided > /tmp/missing
+          version=$(php -n -r 'echo PHP_VERSION;')
+          if [ -s /tmp/missing ]; then
+            echo "::error::$so imports symbols that PHP $version does not export:"
+            cat /tmp/missing
+            exit 1
+          fi
+          echo "$(wc -l < /tmp/imports) imports, all exported by PHP $version or its libraries"
+          EOF
+
+      - name: Load on the oldest and newest patch
+        run: |
+          set -euo pipefail
+          status=0
+          for image in "$OLDEST_IMAGE" "$NEWEST_IMAGE"; do
+            echo "::group::$image"
+            rc=0
+            out=$(docker run --pull never --rm -v "$PWD/modules/phpser.so:/ext.so:ro" "$image" \
+              php -n -d extension=/ext.so -r "$SMOKE_PHP" 2>&1) || rc=$?
+            printf '%s\n' "$out"
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -qi 'undefined symbol'; then
+              echo "::error::phpser.so failed on $image (exit $rc)"
+              status=1
+            fi
+          done
+          exit "$status"
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          suffix=$(docker run --rm --pull never "$OLDEST_IMAGE" php -n -r \
+            'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION, PHP_DEBUG ? "-debug" : "", ZEND_THREAD_SAFE ? "-zts" : "";')
+          case "$suffix" in
+            "$MATRIX_PHP"*) ;;
+            *) echo "::error::build PHP $suffix does not match matrix PHP $MATRIX_PHP"; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            x86_64) arch=x86_64 ;;
+            aarch64) arch=arm64 ;;
+            *) echo "::error::unsupported architecture $(uname -m)"; exit 1 ;;
+          esac
+          php_mm=${suffix%%-*}
+          rest=${suffix#"$php_mm"}
+          pkg="php_phpser-${RELEASE_TAG}_php${php_mm}-${arch}-linux-glibc${rest}.zip"
+          zip -j "$pkg" modules/phpser.so
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ steps.package.outputs.pkg }}
+          path: ${{ steps.package.outputs.pkg }}
+          if-no-files-found: error
+          retention-days: 7
+
+  macos:
+    name: macos-15 php ${{ matrix.php }}
+    # Builds on macos-15 because setup-php's Homebrew install fails on
+    # macos-14 runners; the asset still targets macOS 14 as its minimum.
+    runs-on: macos-15
+    permissions:
+      contents: read # Checks out the source; uploads go through the upload job.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # php.net release tarballs and their published SHA-256 sums.
+          - php: '8.4'
+            oldest: '8.4.1'
+            oldest-sha256: 94c8a4fd419d45748951fa6d73bd55f6bdf0adaefb8814880a67baa66027311f
+          - php: '8.5'
+            oldest: '8.5.0'
+            oldest-sha256: 39cb6e4acd679b574d3d3276f148213e935fc25f90403eb84fb1b836a806ef1e
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '14.0'
+      OLDEST: ${{ matrix.oldest }}
+      OLDEST_SHA256: ${{ matrix.oldest-sha256 }}
+      MATRIX_PHP: ${{ matrix.php }}
+      RELEASE_TAG: ${{ github.event.release.tag_name || 'dispatch' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build PHP ${{ matrix.oldest }} from the release tarball
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -fsSL --retry 3 -o php-src.tar.xz "https://www.php.net/distributions/php-${OLDEST}.tar.xz"
+          echo "${OLDEST_SHA256}  php-src.tar.xz" | shasum -a 256 -c -
+          tar -xJf php-src.tar.xz
+          cd "php-${OLDEST}"
+          # session supplies HAVE_PHP_SESSION, which the extension's session
+          # serializer compiles against; everything else is irrelevant here.
+          ./configure --prefix="$RUNNER_TEMP/php-oldest" --disable-all --enable-session \
+            --disable-cgi --disable-phpdbg > /dev/null
+          make -j"$(sysctl -n hw.ncpu)" > /dev/null
+          make install > /dev/null
+          "$RUNNER_TEMP/php-oldest/bin/php" -n -v
+
+      - name: Build against the oldest patch
+        run: |
+          set -euo pipefail
+          # phpize needs autoconf, which the runner image does not ship.
+          brew install autoconf
+          bin="$RUNNER_TEMP/php-oldest/bin"
+          read -ra flags <<< "$CONFIGURE_FLAGS"
+          "$bin/phpize"
+          ./configure --with-php-config="$bin/php-config" "${flags[@]}"
+          make -j"$(sysctl -n hw.ncpu)"
+
+      - name: Load on the oldest patch
+        run: |
+          set -euo pipefail
+          rc=0
+          out=$("$RUNNER_TEMP/php-oldest/bin/php" -n -d extension="$PWD/modules/phpser.so" -r "$SMOKE_PHP" 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -Eqi 'undefined symbol|symbol not found'; then
+            echo "::error::phpser.so failed on PHP $OLDEST (exit $rc)"
+            exit 1
+          fi
+
+      - name: Setup newest PHP ${{ matrix.php }}
         uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
         with:
           php-version: ${{ matrix.php }}
           coverage: none
 
-      # Dispatch path: prove the toolchain builds a loadable module. No
-      # release exists yet, so there is nothing to upload into.
-      - name: Build and verify (no upload)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Load on the newest patch
         run: |
-          set -eux
-          phpize
-          ./configure $CONFIGURE_FLAGS
-          make -j"$(getconf _NPROCESSORS_ONLN)"
-          php -n -d extension="$PWD/modules/phpser.so" --ri phpser
+          set -euo pipefail
+          rc=0
+          out=$(php -n -d extension="$PWD/modules/phpser.so" -r "$SMOKE_PHP" 2>&1) || rc=$?
+          printf '%s\n' "$out"
+          if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -Eqi 'undefined symbol|symbol not found'; then
+            echo "::error::phpser.so failed on the newest PHP $MATRIX_PHP (exit $rc)"
+            exit 1
+          fi
 
-      - name: Build and upload prebuilt binary
-        if: github.event_name == 'release'
-        uses: php/pie-ext-binary-builder@cbe134360897f23793f23c2edc7602261d205a25 # 0.0.4
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          suffix=$("$RUNNER_TEMP/php-oldest/bin/php" -n -r \
+            'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION, PHP_DEBUG ? "-debug" : "", ZEND_THREAD_SAFE ? "-zts" : "";')
+          case "$suffix" in
+            "$MATRIX_PHP"*) ;;
+            *) echo "::error::build PHP $suffix does not match matrix PHP $MATRIX_PHP"; exit 1 ;;
+          esac
+          test "$(uname -m)" = arm64
+          php_mm=${suffix%%-*}
+          rest=${suffix#"$php_mm"}
+          pkg="php_phpser-${RELEASE_TAG}_php${php_mm}-arm64-darwin-bsdlibc${rest}.zip"
+          zip -j "$pkg" modules/phpser.so
+          echo "pkg=$pkg" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          release-tag: ${{ github.event.release.tag_name }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          configure-flags: ${{ env.CONFIGURE_FLAGS }}
+          name: ${{ steps.package.outputs.pkg }}
+          path: ${{ steps.package.outputs.pkg }}
+          if-no-files-found: error
+          retention-days: 7
+
+  upload:
+    name: Upload binaries to the release
+    needs: [linux, macos]
+    # Only the release event has a tag to upload into.
+    if: github.event_name == 'release'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # Uploads binary assets to the published release.
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: php_phpser-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          ls -l dist
+          gh release upload "$RELEASE_TAG" dist/*.zip --repo "$GITHUB_REPOSITORY"
