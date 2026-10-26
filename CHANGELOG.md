@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- On PHP 8.3+, the extension refuses to start when the running PHP is an older patch release than the one it was compiled against, with a startup warning naming both versions, instead of loading and later ending the process with an undefined-symbol error. PHP reports `Unable to start phpser module` and exits; install a build for the running PHP version or build from source.
+
 ## [0.10.1] - 2026-10-26
 
 ### Fixed
