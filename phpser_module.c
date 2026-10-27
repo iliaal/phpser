@@ -439,10 +439,8 @@ zend_module_entry phpser_module_entry = {
     STANDARD_MODULE_PROPERTIES,
 };
 
-/* Shared ZTS builds need an extension-local TLS cache. */
-ZEND_TSRMLS_CACHE_DEFINE()
-
-/* Both shared-build paths need get_module; static builds must omit it. */
 #if defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)
+/* Static ZTS builds use the cache defined by Zend. */
+ZEND_TSRMLS_CACHE_DEFINE()
 ZEND_GET_MODULE(phpser)
 #endif
