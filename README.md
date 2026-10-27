@@ -356,10 +356,10 @@ performance in these areas, all shipped:
    `zend_new_array(N)` and write directly into `arPacked` with `ZVAL_*`
    macros. Skips N `zend_hash_next_index_insert` calls, including their
    hash computation, growth checks, and capacity tuning.
-2. **Tagged scalar runs.** `[1, 2, 3, ...]` (1000 longs) emits as a
-   single `PACKED_LONGS` header + N zigzag varints, not 1000 `(tag,
-   varint)` pairs. Decode is one tight loop with no per-element tag
-   dispatch.
+2. **Tagged scalar runs.** For example, serializing `range(1, 1000)` by
+   itself emits a `PACKED_AFFINE` header, the length, and two zigzag varints
+   (base and step), not 1000 `(tag, varint)` pairs. Decode expands the run
+   in one tight loop with no per-element tag dispatch.
 3. **O(1) pointer-hash intern.** Open-addressed `zend_string* → slot`
    hash, grown without eviction. Hit rate near 100% on literal rowset shapes (PHP
    interns literals; the same `"id"` zend_string pointer flows through
