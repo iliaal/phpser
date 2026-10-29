@@ -442,6 +442,10 @@ if ($MODE === 'gc') {
     $keep = max(10, (int)(getenv('BENCH_GC_KEEP') ?: 200));
     foreach ($shapes as $name => $data) {
         $blob = phpser_serialize($data);
+        if (serialize(phpser_unserialize($blob)) !== serialize($data)) {
+            fwrite(STDERR, "MISMATCH $name\n");
+            exit(1);
+        }
         [$dec, $runs] = med_retained($blob, $keep, $REPS);
         printf("%-12s size=%7d keep=%4d dec_gc=%9.1f gc_runs=%s\n", $name, strlen($blob), $keep, $dec, $runs);
     }
