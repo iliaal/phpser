@@ -2006,9 +2006,10 @@ static zend_never_inline int enc_try_table(
      * each live bucket's column without rescanning rows. */
     zval **col_cells = (zval **)safe_emalloc((size_t)ncols * n_used, sizeof(zval *), 0);
     /* Mixed-column hooks can mutate ArrayObject/ArrayIterator storage without
-     * COW. Duplicate shared rows to prevent bucket reallocation; pin nested
-     * RC-1 rows against deletion from the outer storage. Top-level RC-1 rows
-     * and immutable rows need no pin. Gather reads zp before any hook runs. */
+     * COW, including the top-level array when it is such storage. Duplicate
+     * shared rows to prevent bucket reallocation; pin RC-1 rows against
+     * deletion from the outer storage. Immutable rows need no pin. Gather
+     * reads zp before any hook runs. */
     HashTable **row_pin = NULL;
     uint8_t *row_dup = NULL;
     for (uint32_t r = 0; r < n_used; r++) {
@@ -2031,8 +2032,8 @@ static zend_never_inline int enc_try_table(
                 ht = pinned;
                 if (!row_dup) row_dup = (uint8_t *)ecalloc(n_used, 1);
                 row_dup[r] = 1;
-            } else if (e->depth > 1) {
-                GC_ADDREF(ht);                 /* pin a nested RC-1 row against free */
+            } else {
+                GC_ADDREF(ht);                 /* pin an RC-1 row against free */
                 pinned = ht;
             }
         }
