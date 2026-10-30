@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Security
+
+- Decoding a positional object of a class denied by `allowed_classes` no longer lowercases and hashes its whole class name again for each object. A 1 MB payload that repeated a long class name could take a minute of CPU (CWE-400; contributed by Nicolas Grekas).
+
 ### Changed
 
 - On PHP 8.3+, the extension refuses to start when the running PHP is an older patch release than the one it was compiled against, with a startup warning naming both versions, instead of loading and later ending the process with an undefined-symbol error. PHP reports `Unable to start phpser module` and exits; install a build for the running PHP version or build from source.

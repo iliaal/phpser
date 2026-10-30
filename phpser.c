@@ -2403,6 +2403,10 @@ typedef struct {
      * to dict_len, lazy-allocated on first class-carrying tag. Invalid names
      * abort the decode, so only "valid" is ever stored. */
     uint8_t *cname_cache;
+    /* Lowercased class names by dictionary index for lookups that must not
+     * autoload. A miss is not cached, so each repeat lookup would otherwise
+     * lowercase and hash the whole name again. */
+    zend_string **lc_cache;
     /* C-stack recursion guard for container tags that recurse through
      * decode_value. Uncapped, a crafted payload blows the pthread stack at
      * ~100K nested frames. */
@@ -2724,7 +2728,18 @@ static inline zend_class_entry *dec_class_resolve_ex(
     if (EXPECTED(ce != NULL)) {
         return ce;
     }
-    ce = zend_lookup_class_ex(class_name, NULL,
+    zend_string *lc_name = NULL;
+    if (!autoload) {
+        if (UNEXPECTED(!d->lc_cache)) {
+            d->lc_cache = dec_ecalloc(d->dict_len, sizeof(zend_string *));
+            if (UNEXPECTED(!d->lc_cache)) return NULL;
+        }
+        lc_name = d->lc_cache[class_idx];
+        if (!lc_name) {
+            lc_name = d->lc_cache[class_idx] = zend_string_tolower(class_name);
+        }
+    }
+    ce = zend_lookup_class_ex(class_name, lc_name,
                               autoload ? 0 : ZEND_FETCH_CLASS_NO_AUTOLOAD);
     if (ce) {
         d->ce_cache[class_idx] = ce;
@@ -3239,6 +3254,12 @@ static void decode_destroy(decode_ctx *d, bool result_live) {
     if (d->ce_cache) efree(d->ce_cache);
     if (d->allow_cache) efree(d->allow_cache);
     if (d->cname_cache) efree(d->cname_cache);
+    if (d->lc_cache) {
+        for (uint32_t i = 0; i < d->dict_len; i++) {
+            if (d->lc_cache[i]) zend_string_release(d->lc_cache[i]);
+        }
+        efree(d->lc_cache);
+    }
 }
 
 /* Assoc key: int, dict-indexed string, or owned inline string. The owned
