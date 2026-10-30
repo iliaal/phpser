@@ -353,6 +353,7 @@ static PHP_MINIT_FUNCTION(phpser) {
     }
 #endif
     REGISTER_INI_ENTRIES();
+    register_phpser_symbols(module_number);
 #ifdef HAVE_PHP_SESSION
     PS_SERIALIZER_FUNCS(phpser);
     /* ext/session's serializer table is process-lifetime with no unregister

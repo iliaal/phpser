@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Decoding a positional object of a class denied by `allowed_classes` no longer lowercases and hashes its whole class name again for each object. A 1 MB payload that repeated a long class name could take a minute of CPU (CWE-400; contributed by Nicolas Grekas).
 - Encode no longer reads freed heap when a `__serialize` hook deletes a later row of a top-level `ArrayObject` or `ArrayIterator` storage array. The columnar path now pins top-level rows like nested ones (CWE-416; contributed by Nicolas Grekas).
+- `phpser_serialize_signed()` and `phpser_unserialize_signed()` mark their `$key` parameter with `#[\SensitiveParameter]`, so exception traces no longer contain the signing key (CWE-532; contributed by Nicolas Grekas).
 
 ### Changed
 

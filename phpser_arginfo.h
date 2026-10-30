@@ -1,5 +1,7 @@
 /* This is a generated file, edit phpser.stub.php instead.
- * Stub hash: 1906350e2f15801988385b98fdd56ae9a1c915e5 */
+ * Stub hash: 0d75eb4c494e6a9a9407b036148a9c7c955cc921 */
+
+#include "zend_attributes.h"
 
 ZEND_BEGIN_ARG_WITH_RETURN_TYPE_INFO_EX(arginfo_phpser_serialize, 0, 1, IS_STRING, 0)
 	ZEND_ARG_TYPE_INFO(0, value, IS_MIXED, 0)
@@ -48,3 +50,11 @@ static const zend_function_entry ext_functions[] = {
 	ZEND_FE(phpser_unserialize_keyed, arginfo_phpser_unserialize_keyed)
 	ZEND_FE_END
 };
+
+static void register_phpser_symbols(int module_number)
+{
+
+	zend_add_parameter_attribute(zend_hash_str_find_ptr(CG(function_table), "phpser_serialize_signed", sizeof("phpser_serialize_signed") - 1), 1, ZSTR_KNOWN(ZEND_STR_SENSITIVEPARAMETER), 0);
+
+	zend_add_parameter_attribute(zend_hash_str_find_ptr(CG(function_table), "phpser_unserialize_signed", sizeof("phpser_unserialize_signed") - 1), 1, ZSTR_KNOWN(ZEND_STR_SENSITIVEPARAMETER), 0);
+}
