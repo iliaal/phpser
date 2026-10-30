@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-10-30
+
 ### Security
 
 - Decoding a positional object of a class denied by `allowed_classes` no longer lowercases and hashes its whole class name again for each object. A 1 MB payload that repeated a long class name could take a minute of CPU (CWE-400; contributed by Nicolas Grekas).
@@ -436,7 +438,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.10.1...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.10.2...HEAD
+[0.10.2]: https://github.com/iliaal/phpser/releases/tag/0.10.2
 [0.10.1]: https://github.com/iliaal/phpser/releases/tag/0.10.1
 [0.10.0]: https://github.com/iliaal/phpser/releases/tag/0.10.0
 [0.9.0]: https://github.com/iliaal/phpser/releases/tag/0.9.0
