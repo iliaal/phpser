@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - On PHP 8.3+, the extension refuses to start when the running PHP is an older patch release than the one it was compiled against, with a startup warning naming both versions, instead of loading and later ending the process with an undefined-symbol error. PHP reports `Unable to start phpser module` and exits; install a build for the running PHP version or build from source.
+- Linux and macOS prebuilt binaries are built against PHP 8.4.27 and 8.5.12, so they include the memory_limit stop described under 0.10.0, and require PHP 8.4.27+ or 8.5.12+. On an earlier patch the extension refuses to start with the warning above; PIE still selects the prebuilt binary there, so build from source on those patches.
+
+### Fixed
+
+- Building phpser statically into a ZTS PHP no longer fails to link with a duplicate `_tsrm_ls_cache` symbol.
 
 ## [0.10.1] - 2026-10-26
 

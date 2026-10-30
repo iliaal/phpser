@@ -6,21 +6,24 @@ name: Release Linux & macOS binaries
 # uploads all of them as release assets using PIE's pre-packaged-binary
 # naming convention (php_phpser-<tag>_php<x.y>-<arch>-<os>-<libc>.zip).
 #
-# Each binary compiles against the OLDEST patch release of its PHP minor.
-# Headers from a newer patch can declare symbols the older patches do not
-# export (8.4.27 and 8.5.12 added the fallible allocators behind
-# ZEND_HAS_OOM), and a module built against them dies with "undefined
-# symbol" on every earlier patch. PHP 8.4.0 was never released, so 8.4.1 is
-# the oldest 8.4 patch. Linux builds inside the digest-pinned official
-# image; macOS builds PHP from the checksum-pinned php.net release tarball,
-# because setup-php only installs the newest patch of a minor.
+# Each binary compiles against a pinned NEWEST patch release of its PHP
+# minor (8.4.27, 8.5.12), so it carries the memory_limit stop behind
+# ZEND_HAS_OOM. Those headers make the module import symbols that earlier
+# patches do not export, so the binaries require 8.4.27+ / 8.5.12+. On an
+# older patch the extension refuses to start with a warning (MINIT compares
+# php_version_id() against the build's PHP_VERSION_ID) instead of dying
+# with "undefined symbol" on first use. Linux builds inside the
+# digest-pinned official bookworm image; macOS builds PHP from the
+# checksum-pinned php.net release tarball, so a later patch release cannot
+# raise the floor without a repo diff.
 #
 # Before anything uploads, every binary must load and round-trip a payload
-# large enough to grow the encoder's smart_str on both the oldest and the
-# newest patch of its minor, and every symbol a Linux .so imports must be
-# exported by the oldest patch's php binary or a library loaded with it.
-# The upload job runs only after every build passes, so a failed gate
-# attaches no Linux or macOS asset.
+# large enough to grow the encoder's smart_str on the build patch, every
+# symbol a Linux .so imports must be exported by that patch's php binary or
+# a library loaded with it, and a Linux .so must refuse to start, not crash,
+# on the oldest patch of its minor (PHP 8.4.0 was never released, so 8.4.1
+# is the oldest 8.4 patch). The upload job runs only after every build
+# passes, so a failed gate attaches no Linux or macOS asset.
 #
 # macOS Intel (macos-13) is absent: GitHub's Intel runner pool queues 30+
 # min on busy days, and macOS 26 drops Intel. Linux musl (Alpine) is absent
@@ -80,16 +83,16 @@ jobs:
           - ubuntu-24.04-arm
         php: ['8.4', '8.5']
         include:
-          # Official Docker images, digest-pinned. The oldest-patch image
-          # produces the shipped binary. The newest-patch image is the gate
-          # that loads it on the current patch; bump it when a newer patch
-          # ships.
+          # Official Docker images, digest-pinned. The newest-patch image
+          # produces the shipped binary and sets its PHP floor; bumping it
+          # raises that floor. The oldest-patch image is the gate that the
+          # binary refuses to start below the floor.
           - php: '8.4'
             oldest-image: php:8.4.1-cli-bookworm@sha256:246d2ca7e9cf21c4e7c354ce87e87bf1ad6d41b2061c77668845e04a8f8889d4
-            newest-image: php:8.4.27-cli@sha256:debadc2e36b857657846e2e952cbaf52702e55482dd3c2c43806f68d8c534a70
+            newest-image: php:8.4.27-cli-bookworm@sha256:54b467ede1db96c66675e7b78457dd43729d0e7be31978d4a1e5c069ceabcf76
           - php: '8.5'
             oldest-image: php:8.5.0-cli-bookworm@sha256:4ff93cd1b053c4d5ff468ced40962092a350a8c86798fee96e807bc9b383ec75
-            newest-image: php:8.5.12-cli@sha256:635a4b998025ab269194639a5549c6fdcd9b4f88ec8cd761b092de8653d40663
+            newest-image: php:8.5.12-cli-bookworm@sha256:104890ada56869090c9cd0ec709fe205834d3e383b46d9995dc16cd6388a9302
     env:
       OLDEST: ${{ matrix.oldest-image }}
       NEWEST: ${{ matrix.newest-image }}
@@ -129,11 +132,11 @@ jobs:
           pull OLDEST_IMAGE "$OLDEST"
           pull NEWEST_IMAGE "$NEWEST"
 
-      - name: Build against the oldest patch and check its imports
+      - name: Build against the newest patch and check its imports
         run: |
           set -euo pipefail
           docker run --pull never --rm -i -e CONFIGURE_FLAGS -e HOST_OWNER="$(id -u):$(id -g)" \
-            -v "$PWD:/src" -w /src "$OLDEST_IMAGE" bash -euo pipefail -s <<'EOF'
+            -v "$PWD:/src" -w /src "$NEWEST_IMAGE" bash -euo pipefail -s <<'EOF'
           export LC_ALL=C
           apt-get update -qq
           apt-get install -y -qq --no-install-recommends $PHPIZE_DEPS > /dev/null
@@ -160,29 +163,39 @@ jobs:
           echo "$(wc -l < /tmp/imports) imports, all exported by PHP $version or its libraries"
           EOF
 
-      - name: Load on the oldest and newest patch
+      - name: Load on the newest patch, refuse the oldest
         run: |
           set -euo pipefail
-          status=0
-          for image in "$OLDEST_IMAGE" "$NEWEST_IMAGE"; do
-            echo "::group::$image"
+          run() {
             rc=0
-            out=$(docker run --pull never --rm -v "$PWD/modules/phpser.so:/ext.so:ro" "$image" \
+            out=$(docker run --pull never --rm -v "$PWD/modules/phpser.so:/ext.so:ro" "$1" \
               php -n -d extension=/ext.so -r "$SMOKE_PHP" 2>&1) || rc=$?
             printf '%s\n' "$out"
-            echo "::endgroup::"
-            if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -qi 'undefined symbol'; then
-              echo "::error::phpser.so failed on $image (exit $rc)"
-              status=1
-            fi
-          done
+          }
+          status=0
+          echo "::group::$NEWEST_IMAGE"
+          run "$NEWEST_IMAGE"
+          echo "::endgroup::"
+          if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -qi 'undefined symbol'; then
+            echo "::error::phpser.so failed on $NEWEST_IMAGE (exit $rc)"
+            status=1
+          fi
+          echo "::group::$OLDEST_IMAGE"
+          run "$OLDEST_IMAGE"
+          echo "::endgroup::"
+          if [ "$rc" -eq 0 ] || printf '%s\n' "$out" | grep -qi 'undefined symbol' \
+              || ! printf '%s\n' "$out" | grep -q 'phpser was built for PHP .* and cannot run on PHP' \
+              || ! printf '%s\n' "$out" | grep -q 'Unable to start phpser module'; then
+            echo "::error::phpser.so did not refuse to start on $OLDEST_IMAGE (exit $rc)"
+            status=1
+          fi
           exit "$status"
 
       - name: Package
         id: package
         run: |
           set -euo pipefail
-          suffix=$(docker run --rm --pull never "$OLDEST_IMAGE" php -n -r \
+          suffix=$(docker run --rm --pull never "$NEWEST_IMAGE" php -n -r \
             'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION, PHP_DEBUG ? "-debug" : "", ZEND_THREAD_SAFE ? "-zts" : "";')
           case "$suffix" in
             "$MATRIX_PHP"*) ;;
@@ -217,17 +230,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # php.net release tarballs and their published SHA-256 sums.
+          # php.net release tarballs and their published SHA-256 sums. Keep
+          # these patches equal to the Linux newest-image patches.
           - php: '8.4'
-            oldest: '8.4.1'
-            oldest-sha256: 94c8a4fd419d45748951fa6d73bd55f6bdf0adaefb8814880a67baa66027311f
+            newest: '8.4.27'
+            newest-sha256: dcf93923b0e38e0d5252b25b796520b5a47761a08b3488b6d0b5d1115764d3f0
           - php: '8.5'
-            oldest: '8.5.0'
-            oldest-sha256: 39cb6e4acd679b574d3d3276f148213e935fc25f90403eb84fb1b836a806ef1e
+            newest: '8.5.12'
+            newest-sha256: 08bc2eba2a588654ade1357174aa646b761556c862dda0678345ee29ed481209
     env:
       MACOSX_DEPLOYMENT_TARGET: '14.0'
-      OLDEST: ${{ matrix.oldest }}
-      OLDEST_SHA256: ${{ matrix.oldest-sha256 }}
+      NEWEST: ${{ matrix.newest }}
+      NEWEST_SHA256: ${{ matrix.newest-sha256 }}
       MATRIX_PHP: ${{ matrix.php }}
       RELEASE_TAG: ${{ github.event.release.tag_name || 'dispatch' }}
     steps:
@@ -235,58 +249,41 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Build PHP ${{ matrix.oldest }} from the release tarball
+      - name: Build PHP ${{ matrix.newest }} from the release tarball
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP"
-          curl -fsSL --retry 3 -o php-src.tar.xz "https://www.php.net/distributions/php-${OLDEST}.tar.xz"
-          echo "${OLDEST_SHA256}  php-src.tar.xz" | shasum -a 256 -c -
+          curl -fsSL --retry 3 -o php-src.tar.xz "https://www.php.net/distributions/php-${NEWEST}.tar.xz"
+          echo "${NEWEST_SHA256}  php-src.tar.xz" | shasum -a 256 -c -
           tar -xJf php-src.tar.xz
-          cd "php-${OLDEST}"
+          cd "php-${NEWEST}"
           # session supplies HAVE_PHP_SESSION, which the extension's session
           # serializer compiles against; everything else is irrelevant here.
-          ./configure --prefix="$RUNNER_TEMP/php-oldest" --disable-all --enable-session \
+          ./configure --prefix="$RUNNER_TEMP/php-newest" --disable-all --enable-session \
             --disable-cgi --disable-phpdbg > /dev/null
           make -j"$(sysctl -n hw.ncpu)" > /dev/null
           make install > /dev/null
-          "$RUNNER_TEMP/php-oldest/bin/php" -n -v
+          "$RUNNER_TEMP/php-newest/bin/php" -n -v
 
-      - name: Build against the oldest patch
+      - name: Build against the newest patch
         run: |
           set -euo pipefail
           # phpize needs autoconf, which the runner image does not ship.
           brew install autoconf
-          bin="$RUNNER_TEMP/php-oldest/bin"
+          bin="$RUNNER_TEMP/php-newest/bin"
           read -ra flags <<< "$CONFIGURE_FLAGS"
           "$bin/phpize"
           ./configure --with-php-config="$bin/php-config" "${flags[@]}"
           make -j"$(sysctl -n hw.ncpu)"
 
-      - name: Load on the oldest patch
-        run: |
-          set -euo pipefail
-          rc=0
-          out=$("$RUNNER_TEMP/php-oldest/bin/php" -n -d extension="$PWD/modules/phpser.so" -r "$SMOKE_PHP" 2>&1) || rc=$?
-          printf '%s\n' "$out"
-          if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -Eqi 'undefined symbol|symbol not found'; then
-            echo "::error::phpser.so failed on PHP $OLDEST (exit $rc)"
-            exit 1
-          fi
-
-      - name: Setup newest PHP ${{ matrix.php }}
-        uses: shivammathur/setup-php@eb7c497e18156a6bbabfef1d3a82760b9eda3962 # 2.40.0
-        with:
-          php-version: ${{ matrix.php }}
-          coverage: none
-
       - name: Load on the newest patch
         run: |
           set -euo pipefail
           rc=0
-          out=$(php -n -d extension="$PWD/modules/phpser.so" -r "$SMOKE_PHP" 2>&1) || rc=$?
+          out=$("$RUNNER_TEMP/php-newest/bin/php" -n -d extension="$PWD/modules/phpser.so" -r "$SMOKE_PHP" 2>&1) || rc=$?
           printf '%s\n' "$out"
           if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -Eqi 'undefined symbol|symbol not found'; then
-            echo "::error::phpser.so failed on the newest PHP $MATRIX_PHP (exit $rc)"
+            echo "::error::phpser.so failed on PHP $NEWEST (exit $rc)"
             exit 1
           fi
 
@@ -294,7 +291,7 @@ jobs:
         id: package
         run: |
           set -euo pipefail
-          suffix=$("$RUNNER_TEMP/php-oldest/bin/php" -n -r \
+          suffix=$("$RUNNER_TEMP/php-newest/bin/php" -n -r \
             'echo PHP_MAJOR_VERSION, ".", PHP_MINOR_VERSION, PHP_DEBUG ? "-debug" : "", ZEND_THREAD_SAFE ? "-zts" : "";')
           case "$suffix" in
             "$MATRIX_PHP"*) ;;
