@@ -2766,13 +2766,24 @@ static zend_class_entry *dec_class_resolve_obj(
     if (ce || EG(exception)) {
         return ce;
     }
+    zval user_func, retval, arg;
+/* API 20260924 (8.6.0RC2) is the first API number with the zend_string
+ * global; 8.6-dev between 2026-07-19 and RC2 reports 20250926 and takes the
+ * char * branch wrongly. */
+#if PHP_API_VERSION > 20250926
+    zend_string *func = PG(unserialize_callback_func);
+    if (func == NULL || ZSTR_LEN(func) == 0) {
+        return NULL;
+    }
+    /* The callback may change the INI value and release this string. */
+    ZVAL_STR(&user_func, zend_string_dup(func, false));
+#else
     const char *func = PG(unserialize_callback_func);
     if (func == NULL || func[0] == '\0') {
         return NULL;
     }
-
-    zval user_func, retval, arg;
     ZVAL_STRING(&user_func, func);
+#endif
     ZVAL_STR(&arg, class_name);
     BG(serialize_lock)++;
     call_user_function(NULL, NULL, &user_func, &retval, 1, &arg);
