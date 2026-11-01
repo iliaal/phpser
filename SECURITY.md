@@ -272,7 +272,10 @@ Limits:
 
 | Version | Supported          |
 |---------|--------------------|
-| 0.7.x   | :white_check_mark: |
+| 0.10.x  | :white_check_mark: |
+| 0.9.x   | :x:                |
+| 0.8.x   | :x:                |
+| 0.7.x   | :x:                |
 | 0.6.x   | :x:                |
 | 0.5.x   | :x:                |
 | 0.4.x   | :x:                |
