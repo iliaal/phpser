@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-11-01
+
 ### Fixed
 
 - Call `unserialize_callback_func` for object classes that autoloading cannot find, as native `unserialize()` does; frameworks that throw there to turn a stale cached class into a cache miss got an incomplete object or `null` instead.
@@ -444,7 +446,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.10.2...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.10.3...HEAD
+[0.10.3]: https://github.com/iliaal/phpser/releases/tag/0.10.3
 [0.10.2]: https://github.com/iliaal/phpser/releases/tag/0.10.2
 [0.10.1]: https://github.com/iliaal/phpser/releases/tag/0.10.1
 [0.10.0]: https://github.com/iliaal/phpser/releases/tag/0.10.0
