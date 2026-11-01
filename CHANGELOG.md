@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Call `unserialize_callback_func` for object classes that autoloading cannot find, as native `unserialize()` does; frameworks that throw there to turn a stale cached class into a cache miss got an incomplete object or `null` instead.
+- Autoloaders that run during a phpser decode now get their own `serialize()`/`unserialize()` reference tables, as with native `unserialize()`; a nested call could emit or resolve back-references against the outer table.
 - Correct the security support table to reflect the latest-minor-only policy for 0.10.x.
 
 ## [0.10.2] - 2026-10-30

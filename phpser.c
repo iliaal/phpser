@@ -2740,8 +2740,12 @@ static inline zend_class_entry *dec_class_resolve_ex(
             lc_name = d->lc_cache[class_idx] = zend_string_tolower(class_name);
         }
     }
+    /* Autoloaders that call native unserialize() must get their own var_hash,
+     * as native O: lookups arrange. */
+    if (autoload) BG(serialize_lock)++;
     ce = zend_lookup_class_ex(class_name, lc_name,
                               autoload ? 0 : ZEND_FETCH_CLASS_NO_AUTOLOAD);
+    if (autoload) BG(serialize_lock)--;
     if (ce) {
         d->ce_cache[class_idx] = ce;
     }
@@ -2751,6 +2755,40 @@ static inline zend_class_entry *dec_class_resolve(
     decode_ctx *d, uint64_t class_idx, zend_string *class_name)
 {
     return dec_class_resolve_ex(d, class_idx, class_name, /* autoload */ 1);
+}
+
+/* Object tags fall back to unserialize_callback_func after autoload, like
+ * native O: and C:. Enums do not, like native E:. Callers check EG(exception). */
+static zend_class_entry *dec_class_resolve_obj(
+    decode_ctx *d, uint64_t class_idx, zend_string *class_name)
+{
+    zend_class_entry *ce = dec_class_resolve(d, class_idx, class_name);
+    if (ce || EG(exception)) {
+        return ce;
+    }
+    const char *func = PG(unserialize_callback_func);
+    if (func == NULL || func[0] == '\0') {
+        return NULL;
+    }
+
+    zval user_func, retval, arg;
+    ZVAL_STRING(&user_func, func);
+    ZVAL_STR(&arg, class_name);
+    BG(serialize_lock)++;
+    call_user_function(NULL, NULL, &user_func, &retval, 1, &arg);
+    BG(serialize_lock)--;
+    zval_ptr_dtor(&retval);
+
+    if (!EG(exception)) {
+        ce = dec_class_resolve(d, class_idx, class_name);
+        if (!ce && !EG(exception)) {
+            php_error_docref(NULL, E_WARNING,
+                "Function %s() hasn't defined the class it was called for",
+                Z_STRVAL(user_func));
+        }
+    }
+    zval_ptr_dtor(&user_func);
+    return ce;
 }
 
 /* Returns 1 if `class_name` (dict slot class_idx) is allowed by the current
@@ -3755,7 +3793,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
                 dec_register(d, out);
                 return 0;
             }
-            zend_class_entry *ce = dec_class_resolve(d, class_idx, class_name);
+            zend_class_entry *ce = dec_class_resolve_obj(d, class_idx, class_name);
             if (UNEXPECTED(EG(exception))) return -1;
             if (!ce || ce->unserialize == NULL) {
                 /* Unknown class or no C-level unserializer: skip the payload,
@@ -3792,7 +3830,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * properties, keeping encounter ids aligned. */
             int allowed = dec_class_allowed(d, class_idx, class_name);
             zend_class_entry *ce = allowed
-                ? dec_class_resolve(d, class_idx, class_name) : NULL;
+                ? dec_class_resolve_obj(d, class_idx, class_name) : NULL;
             if (UNEXPECTED(EG(exception))) return -1;
             /* Unknown class: decode to __PHP_Incomplete_Class with the original
              * name preserved, like a denied class, so a re-encode can recover
@@ -3933,7 +3971,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * class has none, so consume the values into a property-less
              * incomplete, as on the denied+unloaded path; the id still claims a
              * slot and later TAG_REFs resolve. */
-            zend_class_entry *ce = dec_class_resolve(d, class_idx, class_name);
+            zend_class_entry *ce = dec_class_resolve_obj(d, class_idx, class_name);
             if (UNEXPECTED(EG(exception))) return -1;
             if (!ce) {
                 if (dec_make_incomplete(out, class_name) < 0) return -1;
@@ -4017,7 +4055,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * original name in the magic property. */
             int allowed = dec_class_allowed(d, class_idx, class_name);
             zend_class_entry *ce = allowed
-                ? dec_class_resolve(d, class_idx, class_name) : NULL;
+                ? dec_class_resolve_obj(d, class_idx, class_name) : NULL;
             if (UNEXPECTED(EG(exception))) return -1;
             /* Unknown class: __PHP_Incomplete_Class with the original name
              * preserved, uniform with MAGIC/SLOTS. */

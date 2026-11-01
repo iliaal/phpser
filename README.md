@@ -498,7 +498,10 @@ whether registration succeeded.
   the incomplete, and only when the class is unavailable are the unnamed slot
   values dropped (phpser does not autoload a class for the sole purpose of
   recovering property names). Evolve classes append-only if cached payloads
-  must outlive a schema change.
+  must outlive a schema change. Before falling back, an allowed object class
+  that autoloading cannot find is passed to `unserialize_callback_func`, as in
+  native `unserialize()`. An exception thrown there aborts the decode. Denied
+  classes and enums never reach the callback.
 - **Enum cases are filtered by `allowed_classes`.** Native `unserialize()` does
   not consult the allowlist on its enum path, so a serialized enum is always
   resurrected there. phpser applies the filter: a disallowed enum decodes to

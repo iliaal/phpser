@@ -96,8 +96,11 @@ its own limit.
 
 Class resolution is *not* memoized on a miss, so a payload naming an unknown
 class once per object triggers one autoloader invocation per object rather
-than one per payload. This matches native `unserialize()`, which also calls
-`zend_lookup_class` per object. Each lookup can scan and lowercase the class
+than one per payload. When `unserialize_callback_func` is set and does not
+throw, each unresolved object also calls it once, autoloads a second time, and
+raises a warning. This matches native `unserialize()`, which does the same per
+object, but phpser object tags are shorter, so a payload of a given size can
+trigger several times as many lookups. Each lookup can scan and lowercase the class
 name even when no autoloader is registered. A long dictionary name reused
 by many object tags can therefore make class resolution quadratic in payload
 size; the key-comparison budgets do not bound that work or application
