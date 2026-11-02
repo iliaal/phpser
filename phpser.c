@@ -1081,8 +1081,8 @@ static zend_never_inline void enc_encode_sleep_object(
          * the whole frame. */
         if (!EG(exception) && Z_TYPE(names_zv) != IS_ARRAY) {
             php_error_docref(NULL, E_WARNING,
-                "%s::__sleep() should return an array only containing the names of instance-variables to serialize",
-                ZSTR_VAL(obj->ce->name));
+                PHPSER_ZSTR_FMT "::__sleep() should return an array only containing the names of instance-variables to serialize",
+                PHPSER_ZSTR_ARG(obj->ce->name));
         }
         zval_ptr_dtor(&names_zv);
         enc_unvisit_last(e, obj, identity_tracked);
@@ -1151,8 +1151,8 @@ static zend_never_inline void enc_encode_sleep_object(
         ZVAL_DEREF(zv_name);
         if (Z_TYPE_P(zv_name) != IS_STRING) {
             php_error_docref(NULL, E_WARNING,
-                "%s::__sleep() should return an array only containing the names of instance-variables to serialize",
-                ZSTR_VAL(obj->ce->name));
+                PHPSER_ZSTR_FMT "::__sleep() should return an array only containing the names of instance-variables to serialize",
+                PHPSER_ZSTR_ARG(obj->ce->name));
         }
         zend_string *tmp_name;
         zend_string *nm = zval_get_tmp_string(zv_name, &tmp_name);
@@ -1168,8 +1168,8 @@ static zend_never_inline void enc_encode_sleep_object(
                 break;
             }
             php_error_docref(NULL, E_WARNING,
-                "\"%s\" returned as member variable from __sleep() but does not exist",
-                ZSTR_VAL(nm));
+                "\"" PHPSER_ZSTR_FMT "\" returned as member variable from __sleep() but does not exist",
+                PHPSER_ZSTR_ARG(nm));
             zend_tmp_string_release(tmp_name);
             continue;
         }
@@ -1195,7 +1195,8 @@ static zend_never_inline void enc_encode_sleep_object(
         }
         if (seen[bi / 64] & ((uint64_t)1 << (bi % 64))) {
             php_error_docref(NULL, E_WARNING,
-                "\"%s\" is returned from __sleep() multiple times", ZSTR_VAL(nm));
+                "\"" PHPSER_ZSTR_FMT "\" is returned from __sleep() multiple times",
+                PHPSER_ZSTR_ARG(nm));
             zend_tmp_string_release(tmp_name);
             continue;
         }
@@ -1348,7 +1349,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
              * successful NULL cache values, including inside a larger graph. */
             if (obj->ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
                 zend_throw_exception_ex(zend_ce_exception, 0,
-                    "Serialization of '%s' is not allowed", ZSTR_VAL(obj->ce->name));
+                    "Serialization of '" PHPSER_ZSTR_FMT "' is not allowed",
+                    PHPSER_ZSTR_ARG(obj->ce->name));
                 e->failed = 1;
                 /* Preserve container counts during cleanup; discard the frame. */
                 smart_str_appendc(body, TAG_NULL);
@@ -1439,8 +1441,8 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
                      * exception the hook already raised. */
                     if (!EG(exception) && Z_TYPE(retval) != IS_ARRAY) {
                         zend_type_error(
-                            "%s::__serialize() must return an array",
-                            ZSTR_VAL(obj->ce->name));
+                            PHPSER_ZSTR_FMT "::__serialize() must return an array",
+                            PHPSER_ZSTR_ARG(obj->ce->name));
                     }
                     zval_ptr_dtor(&retval);
                     enc_unvisit_last(e, obj, identity_tracked);
@@ -2794,8 +2796,8 @@ static zend_class_entry *dec_class_resolve_obj(
         ce = dec_class_resolve(d, class_idx, class_name);
         if (!ce && !EG(exception)) {
             php_error_docref(NULL, E_WARNING,
-                "Function %s() hasn't defined the class it was called for",
-                Z_STRVAL(user_func));
+                "Function " PHPSER_ZSTR_FMT "() hasn't defined the class it was called for",
+                PHPSER_ZSTR_ARG(Z_STR(user_func)));
         }
     }
     zval_ptr_dtor(&user_func);
@@ -2980,15 +2982,15 @@ static int dec_install_prop_resolved(decode_ctx *d, zend_object *obj, HashTable 
             return -1;
         }
         if (UNEXPECTED(obj->ce->ce_flags & ZEND_ACC_NO_DYNAMIC_PROPERTIES)) {
-            zend_throw_error(NULL, "Cannot create dynamic property %s::$%s",
-                ZSTR_VAL(obj->ce->name),
+            zend_throw_error(NULL, "Cannot create dynamic property " PHPSER_ZSTR_FMT "::$%s",
+                PHPSER_ZSTR_ARG(obj->ce->name),
                 zend_get_unmangled_property_name(key));
             zval_ptr_dtor(tmp);
             return -1;
         }
         if (!(obj->ce->ce_flags & ZEND_ACC_ALLOW_DYNAMIC_PROPERTIES)) {
-            zend_error(E_DEPRECATED, "Creation of dynamic property %s::$%s is deprecated",
-                ZSTR_VAL(obj->ce->name),
+            zend_error(E_DEPRECATED, "Creation of dynamic property " PHPSER_ZSTR_FMT "::$%s is deprecated",
+                PHPSER_ZSTR_ARG(obj->ce->name),
                 zend_get_unmangled_property_name(key));
             if (UNEXPECTED(EG(exception))) {
                 zval_ptr_dtor(tmp);
@@ -3095,8 +3097,8 @@ static zend_always_inline int dec_prop_forbidden(
         return 0;
     }
     if (EXPECTED(!PHPSER_HAS_OOM())) {
-        zend_throw_error(NULL, "Cannot create dynamic property %s::$%s",
-            ZSTR_VAL(obj->ce->name), zend_get_unmangled_property_name(key));
+        zend_throw_error(NULL, "Cannot create dynamic property " PHPSER_ZSTR_FMT "::$%s",
+            PHPSER_ZSTR_ARG(obj->ce->name), zend_get_unmangled_property_name(key));
     }
     return 1;
 }
