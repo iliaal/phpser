@@ -73,6 +73,18 @@ static int parse_unserialize_options(
 #endif
                 return -1;
             }
+#if PHP_VERSION_ID >= 80400
+            /* Match native unserialize's PHP 8.4+ class-name validation. */
+            if (!zend_is_valid_class_name(Z_STR_P(cn))) {
+                zend_hash_destroy(*out_set);
+                efree(*out_set);
+                *out_set = NULL;
+                zend_value_error(
+                    "%s(): allowed_classes option must be an array of class names, \"%s\" given",
+                    fname, Z_STRVAL_P(cn));
+                return -1;
+            }
+#endif
             zend_string *lc = zend_string_tolower(Z_STR_P(cn));
             zval one; ZVAL_TRUE(&one);
             zend_hash_add(*out_set, lc, &one);

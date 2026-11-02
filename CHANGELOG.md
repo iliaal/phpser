@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Reject invalid class names in `allowed_classes` with `ValueError` on PHP 8.4 and later, matching native `unserialize()`, before any decode hooks run. This applies to plain, signed, and keyed decoding; PHP 8.2 and 8.3 behavior is unchanged.
+
 ## [0.10.3] - 2026-11-01
 
 ### Fixed
