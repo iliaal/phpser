@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- On PHP 8.6, `__sleep` warnings and the anonymous-class "Serialization of ... is not allowed" exception now print names with embedded NUL bytes in full, as native `serialize()` does; phpser cut them at the first NUL, so a duplicate protected member was reported as `""`.
+
 ## [0.10.3] - 2026-11-01
 
 ### Fixed

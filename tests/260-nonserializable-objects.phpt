@@ -24,6 +24,7 @@ $values = [
     new Fiber(function () {}),
     new WeakMap(),
     WeakReference::create($target),
+    new class {},
 ];
 $key = 'nonserializable-key-0123456789abcdef';
 $wrappers = [

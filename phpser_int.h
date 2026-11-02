@@ -29,6 +29,17 @@
 # define PHPSER_HAS_OOM() 0
 #endif
 
+/* Native serialize()/unserialize() diagnostics print names with %pS from
+ * PHP 8.6, keeping embedded NULs (mangled property names, anonymous class
+ * names); earlier versions print them with %s and stop at the first NUL. */
+#if PHP_VERSION_ID >= 80600
+# define PHPSER_ZSTR_FMT "%pS"
+# define PHPSER_ZSTR_ARG(s) (s)
+#else
+# define PHPSER_ZSTR_FMT "%s"
+# define PHPSER_ZSTR_ARG(s) ZSTR_VAL(s)
+#endif
+
 /* A failed encode, signed decode, or keyed decode has an exception or a
  * queued memory_limit error pending; RETURN_THROWS() asserts the former. */
 #define PHPSER_RETURN_FAILED() do { \
