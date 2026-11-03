@@ -33,14 +33,14 @@ PHP_FUNCTION(phpser_serialize) {
 
 /* Parse a phpser_unserialize options array. On success, *out_set may be
  * non-NULL and the caller must free it. Returns -1 on invalid options (an
- * exception is already thrown). param_idx is the arg position for the
- * error message (2 for unserialize, 3 for unserialize_signed or
- * unserialize_keyed); fname is the calling function's name for the
- * TypeError text. */
+ * exception is already thrown). fname is the calling function's name for
+ * diagnostics. PHP 8.4+ accepts stringable objects like native unserialize;
+ * older PHP keeps phpser's historical string-only entry restriction. */
 static int parse_unserialize_options(
-    HashTable *options_ht, int param_idx, const char *fname,
+    HashTable *options_ht, const char *fname,
     int *out_mode, HashTable **out_set)
 {
+    HashTable *classes = NULL;
     *out_mode = ALLOWED_ALL;
     *out_set = NULL;
     if (!options_ht) return 0;
@@ -55,15 +55,19 @@ static int parse_unserialize_options(
         *out_set = emalloc(sizeof(HashTable));
         zend_hash_init(*out_set, zend_hash_num_elements(Z_ARRVAL_P(ac)),
                        NULL, NULL, 0);
+        /* __toString may replace a referenced option or mutate its array. */
+        classes = Z_ARRVAL_P(ac);
+        GC_TRY_ADDREF(classes);
         zval *cn;
-        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(ac), cn) {
+        ZEND_HASH_FOREACH_VAL(classes, cn) {
             ZVAL_DEREF(cn);
-            if (Z_TYPE_P(cn) != IS_STRING) {
-                zend_hash_destroy(*out_set);
-                efree(*out_set);
-                *out_set = NULL;
+            if (Z_TYPE_P(cn) != IS_STRING
+#if PHP_VERSION_ID >= 80400
+                && Z_TYPE_P(cn) != IS_OBJECT
+#endif
+            ) {
                 zend_type_error(
-                    "%s(): allowed_classes option must "
+                    "%s(): Option \"allowed_classes\" must "
                     "be an array of class names, %s given",
                     fname,
 #if PHP_VERSION_ID >= 80300
@@ -71,30 +75,53 @@ static int parse_unserialize_options(
 #else
                     zend_zval_type_name(cn));
 #endif
-                return -1;
+                goto invalid;
             }
 #if PHP_VERSION_ID >= 80400
-            /* Match native unserialize's PHP 8.4+ class-name validation. */
-            if (!zend_is_valid_class_name(Z_STR_P(cn))) {
-                zend_hash_destroy(*out_set);
-                efree(*out_set);
-                *out_set = NULL;
+            zend_string *tmp;
+            zend_string *name = zval_try_get_tmp_string(cn, &tmp);
+            if (!name) goto invalid;
+            if (!zend_is_valid_class_name(name)) {
                 zend_value_error(
-                    "%s(): allowed_classes option must be an array of class names, \"%s\" given",
-                    fname, Z_STRVAL_P(cn));
-                return -1;
-            }
+#if PHP_VERSION_ID >= 80600
+                    "%s(): Option \"allowed_classes\" must be an array of class names, \"%pS\" given",
+                    fname, name);
+#else
+                    "%s(): Option \"allowed_classes\" must be an array of class names, \"%s\" given",
+                    fname, ZSTR_VAL(name));
 #endif
+                zend_tmp_string_release(tmp);
+                goto invalid;
+            }
+            zend_string *lc = zend_string_tolower(name);
+            zend_tmp_string_release(tmp);
+#else
             zend_string *lc = zend_string_tolower(Z_STR_P(cn));
+#endif
             zval one; ZVAL_TRUE(&one);
             zend_hash_add(*out_set, lc, &one);
             zend_string_release(lc);
         } ZEND_HASH_FOREACH_END();
+        zend_array_release(classes);
+        classes = NULL;
+        /* Replacing the option can leave its objects owned only by our snapshot. */
+        if (EG(exception)) goto invalid;
         return 0;
     }
-    *out_set = NULL;
-    zend_argument_value_error(param_idx,
-        "allowed_classes option must be array or bool");
+    zend_type_error("%s(): Option \"allowed_classes\" must be of type array|bool, %s given",
+        fname,
+#if PHP_VERSION_ID >= 80300
+        zend_zval_value_name(ac));
+#else
+        zend_zval_type_name(ac));
+#endif
+invalid:
+    if (classes) zend_array_release(classes);
+    if (*out_set) {
+        zend_hash_destroy(*out_set);
+        efree(*out_set);
+        *out_set = NULL;
+    }
     return -1;
 }
 
@@ -110,7 +137,7 @@ PHP_FUNCTION(phpser_unserialize) {
 
     int allowed_mode;
     HashTable *allowed_set;
-    if (parse_unserialize_options(options_ht, 2, "phpser_unserialize",
+    if (parse_unserialize_options(options_ht, "phpser_unserialize",
                                   &allowed_mode, &allowed_set) < 0) {
         RETURN_THROWS();
     }
@@ -211,7 +238,7 @@ PHP_FUNCTION(phpser_unserialize_signed) {
 
     int allowed_mode;
     HashTable *allowed_set;
-    if (parse_unserialize_options(options_ht, 3, "phpser_unserialize_signed",
+    if (parse_unserialize_options(options_ht, "phpser_unserialize_signed",
                                   &allowed_mode, &allowed_set) < 0) {
         RETURN_THROWS();
     }
@@ -302,7 +329,7 @@ PHP_FUNCTION(phpser_unserialize_keyed) {
     }
     int allowed_mode;
     HashTable *allowed_set;
-    if (parse_unserialize_options(options_ht, 3, "phpser_unserialize_keyed",
+    if (parse_unserialize_options(options_ht, "phpser_unserialize_keyed",
                                   &allowed_mode, &allowed_set) < 0) {
         RETURN_THROWS();
     }

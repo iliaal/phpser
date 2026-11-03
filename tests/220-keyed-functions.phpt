@@ -144,7 +144,7 @@ oracle_raw_key_signed: Exception: phpser: signature verification failed
 oracle_control: accepted 3 [autoload GhostZzz]:seen [unserialize ran]:seen [wakeup ran]:seen
 signed_null: accepted null
 allowed_classes: __PHP_Incomplete_Class
-bad_option: ValueError: phpser_unserialize_keyed(): Argument #3 ($options) allowed_classes option must be array or bool
+bad_option: TypeError: phpser_unserialize_keyed(): Option "allowed_classes" must be of type array|bool, int given
 context "": ValueError: phpser_serialize_keyed(): Argument #2 ($context) must be 1 to 255 bytes, without NUL bytes, and not "session"
 context "a\u0000b": ValueError: phpser_serialize_keyed(): Argument #2 ($context) must be 1 to 255 bytes, without NUL bytes, and not "session"
 context "session": ValueError: phpser_serialize_keyed(): Argument #2 ($context) must be 1 to 255 bytes, without NUL bytes, and not "session"

@@ -52,5 +52,5 @@ try {
 serialize_depth OK
 serialize_signed_depth OK
 shallow_roundtrip OK
-phpser_unserialize(): allowed_classes option must be an array of class names, int given
-phpser_unserialize_signed(): allowed_classes option must be an array of class names, int given
+phpser_unserialize(): Option "allowed_classes" must be an array of class names, int given
+phpser_unserialize_signed(): Option "allowed_classes" must be an array of class names, int given

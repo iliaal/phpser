@@ -10,13 +10,13 @@ $rows = [["tags" => ["a", "b"], "id" => 1]];
 $rt = phpser_unserialize(phpser_serialize($rows));
 echo ($rt == $rows) ? "prebind_single_row OK\n" : "prebind_single_row FAIL\n";
 
-// A non-array/non-bool allowed_classes option is a ValueError with a
+// A non-array/non-bool allowed_classes option is a TypeError with a
 // determinate (NULL) out-set: no crash, and the engine stays usable after.
 try {
     phpser_unserialize(phpser_serialize(1), ["allowed_classes" => 42]);
-    echo "valueerror FAIL (no throw)\n";
-} catch (ValueError $e) {
-    echo "valueerror OK\n";
+    echo "typeerror FAIL (no throw)\n";
+} catch (TypeError $e) {
+    echo "typeerror OK\n";
 }
 echo (phpser_unserialize(phpser_serialize("hi")) === "hi") ? "after_error OK\n" : "after_error FAIL\n";
 
@@ -35,7 +35,7 @@ echo ($rt === null) ? "hugelen_key OK\n" : "hugelen_key FAIL\n";
 ?>
 --EXPECT--
 prebind_single_row OK
-valueerror OK
+typeerror OK
 after_error OK
 hugelen_inline OK
 hugelen_legacy OK
