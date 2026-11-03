@@ -124,6 +124,13 @@ $value = phpser_unserialize($payload, ['allowed_classes' => true]);
 $value = phpser_unserialize($payload);  // same as above
 ```
 
+On PHP 8.4+, allowlist entries accept strings and stringable objects, with
+native class-name validation and diagnostics. On PHP 8.2 and 8.3, phpser
+keeps its historical string-only entry restriction rather than native
+PHP's scalar/object coercion. Invalid option types throw `TypeError`.
+String conversion uses a retained allowlist snapshot, so replacing a referenced
+option or modifying the array during `__toString()` cannot invalidate traversal.
+
 When decoding attacker-controlled bytes, use one of the two restricted
 modes or the signed entry point. See `SECURITY.md` for the full threat
 model.

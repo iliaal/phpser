@@ -102,7 +102,7 @@ echo ($rt instanceof Container && $rt->inner instanceof __PHP_Incomplete_Class)
 $threw = false;
 try {
     phpser_unserialize(phpser_serialize($a), ['allowed_classes' => 42]);
-} catch (ValueError $e) {
+} catch (TypeError $e) {
     $threw = true;
 }
 echo $threw ? "invalid_option OK\n" : "invalid_option FAIL\n";

@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Match native `allowed_classes` option-type errors and PHP 8.4+ stringable entries and exact diagnostics, including PHP 8.6 embedded-NUL names. Retain the allowlist during string conversion; PHP 8.2/8.3 keep their string-only entry restriction.
+
 - Reject invalid class names in `allowed_classes` with `ValueError` on PHP 8.4 and later, matching native `unserialize()`, before any decode hooks run. This applies to plain, signed, and keyed decoding; PHP 8.2 and 8.3 behavior is unchanged.
 - On PHP 8.6, `__sleep` warnings and the anonymous-class "Serialization of ... is not allowed" exception now print names with embedded NUL bytes in full, as native `serialize()` does; phpser cut them at the first NUL, so a duplicate protected member was reported as `""`.
 
