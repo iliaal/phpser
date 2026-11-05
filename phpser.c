@@ -3175,7 +3175,7 @@ static inline zend_string *dec_get_class_name(decode_ctx *d, uint64_t idx) {
 }
 
 static int decode_value(decode_ctx *d, zval *out);
-static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *use_add_new);
+static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys);
 /* Returns 1 for unique, 0 for duplicates, -1 when the collision budget is
  * exhausted or the key set would pass memory_limit. */
 static int dec_schema_keys_are_unique(decode_ctx *d, zend_string **keys, uint64_t nkeys);
@@ -4190,8 +4190,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
              * one byte of key idx and one byte of value tag. */
             if (n > UINT32_MAX || n > (d->len - d->pos) / 2) return -1;
             /* Schema validation rejects duplicate and numeric keys before insertion. */
-            int use_add_new;
-            zend_string **keys = dec_read_schema_keys(d, n, &use_add_new);
+            zend_string **keys = dec_read_schema_keys(d, n);
             if (!keys) return -1;
             zend_array *arr = dec_new_array((uint32_t)n, DEC_INIT_LAZY);
             if (UNEXPECTED(!arr)) {
@@ -4201,11 +4200,7 @@ static int decode_value_inner(decode_ctx *d, zval *out) {
             for (uint64_t i = 0; i < n; i++) {
                 zval tmp;
                 if (decode_value_hot(d, &tmp) < 0) goto assoc_dict_fail;
-                if (use_add_new) {
-                    zend_hash_add_new(arr, keys[i], &tmp);
-                } else {
-                    zend_symtable_update(arr, keys[i], &tmp);
-                }
+                zend_hash_add_new(arr, keys[i], &tmp);
             }
             efree(keys);
             ZVAL_ARR(out, arr);
@@ -4329,8 +4324,7 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
     /* Each of the nrows*ncols cells is at least one byte on the wire. */
     if (nrows > (d->len - d->pos) / ncols) return -1;
 
-    int use_add_new;
-    zend_string **keys = dec_read_schema_keys(d, ncols, &use_add_new);
+    zend_string **keys = dec_read_schema_keys(d, ncols);
     if (!keys) return -1;
 
     /* Scatter one decoded column at a time to bound temporary memory to one
@@ -4370,65 +4364,58 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
                 goto table_fail;
             }
             uint64_t r = 0;
-            if (use_add_new) {
-                int tpl_static_keys = 1;
-                for (; r < nrows && !PHPSER_HAS_OOM(); r++) {
-                    zend_array *row = dec_new_array((uint32_t)ncols, DEC_INIT_MIXED);
-                    if (UNEXPECTED(!row)) break;
-                    if (tpl_hash == NULL) {
-                        /* First row fixes the geometry; nTableMask is the
-                         * negated table size. */
-                        tpl_nslots = (uint32_t)-(int32_t)row->nTableMask;
-                        tpl_hash = (uint32_t *)safe_emalloc(
-                            tpl_nslots, sizeof(uint32_t), 0);
-                        memset(tpl_hash, 0xFF,
-                               (size_t)tpl_nslots * sizeof(uint32_t));
-                        for (uint32_t k = 0; k < (uint32_t)ncols; k++) {
-                            zend_ulong h = zend_string_hash_val(keys[k]);
-                            uint32_t slot = (uint32_t)h & (tpl_nslots - 1);
-                            Bucket *b = &row->arData[k];
-                            b->h = h;
-                            b->key = keys[k];
-                            ZVAL_UNDEF(&b->val);
-                            Z_NEXT(b->val) = tpl_hash[slot];
-                            tpl_hash[slot] = HT_IDX_TO_HASH(k);
-                            if (!ZSTR_IS_INTERNED(keys[k])) {
-                                tpl_static_keys = 0;
-                            }
-                        }
-                    }
-                    memcpy((uint32_t *)row->arData - tpl_nslots, tpl_hash,
+            int tpl_static_keys = 1;
+            for (; r < nrows && !PHPSER_HAS_OOM(); r++) {
+                zend_array *row = dec_new_array((uint32_t)ncols, DEC_INIT_MIXED);
+                if (UNEXPECTED(!row)) break;
+                if (tpl_hash == NULL) {
+                    /* First row fixes the geometry; nTableMask is the
+                     * negated table size. */
+                    tpl_nslots = (uint32_t)-(int32_t)row->nTableMask;
+                    tpl_hash = (uint32_t *)safe_emalloc(
+                        tpl_nslots, sizeof(uint32_t), 0);
+                    memset(tpl_hash, 0xFF,
                            (size_t)tpl_nslots * sizeof(uint32_t));
-                    if (r != 0) {
-                        Bucket *first = Z_ARR(outer->arPacked[0])->arData;
-                        switch (ncols) {
-                            case 1: memcpy(row->arData, first, sizeof(Bucket)); break;
-                            case 2: memcpy(row->arData, first, 2 * sizeof(Bucket)); break;
-                            case 3: memcpy(row->arData, first, 3 * sizeof(Bucket)); break;
-                            default: memcpy(row->arData, first, (size_t)ncols * sizeof(Bucket)); break;
+                    for (uint32_t k = 0; k < (uint32_t)ncols; k++) {
+                        zend_ulong h = zend_string_hash_val(keys[k]);
+                        uint32_t slot = (uint32_t)h & (tpl_nslots - 1);
+                        Bucket *b = &row->arData[k];
+                        b->h = h;
+                        b->key = keys[k];
+                        ZVAL_UNDEF(&b->val);
+                        Z_NEXT(b->val) = tpl_hash[slot];
+                        tpl_hash[slot] = HT_IDX_TO_HASH(k);
+                        if (!ZSTR_IS_INTERNED(keys[k])) {
+                            tpl_static_keys = 0;
                         }
                     }
-                    row->nNumUsed = (uint32_t)ncols;
-                    row->nNumOfElements = (uint32_t)ncols;
-                    if (!tpl_static_keys) {
-                        HT_FLAGS(row) &= ~HASH_FLAG_STATIC_KEYS;
-                    }
-                    ZVAL_ARR(&outer->arPacked[r], row);
                 }
-                /* Every built row's buckets borrowed the dict keys above; take
-                 * the r references in one bump per non-interned key (interned
-                 * strings carry no refcount). Balanced by the per-bucket
-                 * release each row's destroy performs. */
-                for (uint32_t k = 0; k < (uint32_t)ncols; k++) {
-                    if (!ZSTR_IS_INTERNED(keys[k])) {
-                        GC_SET_REFCOUNT(keys[k],
-                            GC_REFCOUNT(keys[k]) + (uint32_t)r);
+                memcpy((uint32_t *)row->arData - tpl_nslots, tpl_hash,
+                       (size_t)tpl_nslots * sizeof(uint32_t));
+                if (r != 0) {
+                    Bucket *first = Z_ARR(outer->arPacked[0])->arData;
+                    switch (ncols) {
+                        case 1: memcpy(row->arData, first, sizeof(Bucket)); break;
+                        case 2: memcpy(row->arData, first, 2 * sizeof(Bucket)); break;
+                        case 3: memcpy(row->arData, first, 3 * sizeof(Bucket)); break;
+                        default: memcpy(row->arData, first, (size_t)ncols * sizeof(Bucket)); break;
                     }
                 }
-            } else {
-                for (; r < nrows && !PHPSER_HAS_OOM(); r++) {
-                    ZVAL_ARR(&outer->arPacked[r],
-                             zend_new_array((uint32_t)ncols));
+                row->nNumUsed = (uint32_t)ncols;
+                row->nNumOfElements = (uint32_t)ncols;
+                if (!tpl_static_keys) {
+                    HT_FLAGS(row) &= ~HASH_FLAG_STATIC_KEYS;
+                }
+                ZVAL_ARR(&outer->arPacked[r], row);
+            }
+            /* Every built row's buckets borrowed the dict keys above; take
+             * the r references in one bump per non-interned key (interned
+             * strings carry no refcount). Balanced by the per-bucket
+             * release each row's destroy performs. */
+            for (uint32_t k = 0; k < (uint32_t)ncols; k++) {
+                if (!ZSTR_IS_INTERNED(keys[k])) {
+                    GC_SET_REFCOUNT(keys[k],
+                        GC_REFCOUNT(keys[k]) + (uint32_t)r);
                 }
             }
             /* Well-formed now so a later failure destroys rows + scattered
@@ -4441,16 +4428,9 @@ static zend_never_inline int dec_decode_table(decode_ctx *d, zval *out) {
                 goto table_fail;
             }
         }
-        if (use_add_new) {
-            for (uint64_t r = 0; r < nrows; r++) {
-                Bucket *b = Z_ARR(outer->arPacked[r])->arData + (uint32_t)c;
-                ZVAL_COPY_VALUE(&b->val, &colbuf[r]);
-            }
-        } else {
-            zend_string *zs = keys[c];
-            for (uint64_t r = 0; r < nrows; r++) {
-                zend_symtable_update(Z_ARR(outer->arPacked[r]), zs, &colbuf[r]);
-            }
+        for (uint64_t r = 0; r < nrows; r++) {
+            Bucket *b = Z_ARR(outer->arPacked[r])->arData + (uint32_t)c;
+            ZVAL_COPY_VALUE(&b->val, &colbuf[r]);
         }
         /* colbuf[r] were moved into the rows; the next dec_table_column call
          * overwrites the buffer, so leaving the stale copies is fine. */
@@ -4489,8 +4469,7 @@ static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out) {
         return -1;
     }
 
-    int use_add_new;
-    zend_string **keys = dec_read_schema_keys(d, ncols, &use_add_new);
+    zend_string **keys = dec_read_schema_keys(d, ncols);
     if (!keys) return -1;
 
     zend_array *outer = dec_new_array((uint32_t)nrows, DEC_INIT_PACKED);
@@ -4509,11 +4488,7 @@ static zend_never_inline int dec_decode_rowset(decode_ctx *d, zval *out) {
                 zend_array_destroy(row);
                 goto rowset_fail;
             }
-            if (use_add_new) {
-                zend_hash_add_new(row, zs, &tmp);
-            } else {
-                zend_symtable_update(row, zs, &tmp);
-            }
+            zend_hash_add_new(row, zs, &tmp);
         }
         ZVAL_ARR(&outer->arPacked[r], row);
     }
@@ -4579,7 +4554,7 @@ static int dec_schema_keys_are_unique(decode_ctx *d, zend_string **keys, uint64_
     return 1;
 }
 
-static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *use_add_new) {
+static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys) {
     zend_string **keys = (zend_string **)dec_safe_emalloc((size_t)nkeys, sizeof(zend_string *));
     if (UNEXPECTED(!keys)) return NULL;
     int has_numeric = 0;
@@ -4607,7 +4582,6 @@ static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys, int *us
         efree(keys);
         return NULL;
     }
-    *use_add_new = 1;
     return keys;
 }
 
