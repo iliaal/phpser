@@ -902,6 +902,9 @@ function bench_gc_retained(array $cases, array $serializers, int $keep_cap, int 
         foreach ($serializers as $name => [$enc, $dec]) {
             try {
                 $blobs[$name] = $enc(case_data($case));
+                if (!is_string($blobs[$name]) || $blobs[$name] === '') {
+                    throw new RuntimeException('empty payload');
+                }
                 $m0 = memory_get_usage();
                 $probe = $dec($blobs[$name]);
                 $bytes = max($bytes, memory_get_usage() - $m0);
