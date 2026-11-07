@@ -891,6 +891,11 @@ function run_isolated(callable $fn): array {
     if (!is_array($res)) {
         throw new RuntimeException('forked sample exited without a result');
     }
+    // A valid result can be written before a shutdown callback fails or kills
+    // the child. Do not report that incomplete process as a successful sample.
+    if (!pcntl_wifexited($status) || pcntl_wexitstatus($status) !== 0) {
+        throw new RuntimeException('forked sample exited unsuccessfully');
+    }
     return $res + ['isolated' => true];
 }
 
