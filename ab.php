@@ -23,6 +23,19 @@ function mk_rowset(int $rows): array {
     ];
     return $out;
 }
+// Match bench.php's equal strings with separate allocations, including tags.
+function mk_rowset_distinct(int $rows): array {
+    $out = mk_rowset($rows);
+    $rowCount = count($out);
+    for ($i = 0; $i < $rowCount; $i++) {
+        $out[$i]['created_at'] = distinct_string($out[$i]['created_at']);
+        $tagCount = count($out[$i]['tags']);
+        for ($j = 0; $j < $tagCount; $j++) {
+            $out[$i]['tags'][$j] = distinct_string($out[$i]['tags'][$j]);
+        }
+    }
+    return $out;
+}
 function mk_numeric_packed(int $n): array { return range(0, $n - 1); }
 function mk_numeric_rand(int $n): array {
     mt_srand(42);
@@ -79,7 +92,7 @@ function mk_dto_mixed(int $users): array {
     return $out;
 }
 
-// BENCH_APP=1 fixtures, byte-comparable copies of the bench.php builders.
+// Additional fixture helpers, byte-comparable copies of the bench.php builders.
 
 function distinct_string(string $value): string {
     return substr($value . "\0", 0, strlen($value));
@@ -423,6 +436,7 @@ function med_retained(string $blob, int $keep, int $r): array {
 $shapes = [
     'rowset_100'  => mk_rowset(100),
     'rowset_1000' => mk_rowset(1000),
+    'rowset_distinct_1000' => mk_rowset_distinct(1000),
     'packed_1k'   => mk_numeric_packed(1000),
     'packed_10k'  => mk_numeric_packed(10000),
     'packed_rand_10k' => mk_numeric_rand(10000),

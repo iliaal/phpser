@@ -37,7 +37,7 @@ PHP;
     echo $mode, "\n";
     if ($mode === 'healthy') {
         var_dump($status === 0, $err === '',
-            substr_count($out, 'dec_gc=') === 11,
+            substr_count($out, 'dec_gc=') === 12,
             str_contains($out, 'wallet'));
     } else {
         var_dump($status === 1, $out === '', $err === "MISMATCH rowset_100\n");
