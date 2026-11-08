@@ -12,7 +12,7 @@ ob_start();
 require dirname(__DIR__) . '/ab.php';
 $output = ob_get_clean();
 var_dump($ITERS);
-var_dump(substr_count($output, 'size=') === 9);
+var_dump(substr_count($output, 'size=') === 10);
 
 // Count work instead of asserting noisy elapsed times. Both encode and decode
 // call med() with this configured iteration count.
