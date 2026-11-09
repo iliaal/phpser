@@ -28,9 +28,8 @@ $ab = load_shapes('ab.php', 'AbFixtureParity');
 var_dump(array_keys($ab) === array_keys($bench));
 $distinct = $ab['rowset_distinct_1000'] ?? null;
 var_dump(serialize($distinct) === serialize($bench['rowset_distinct_1000']));
-// Equal values are not enough: literal and separately allocated strings use
-// different encode paths. Their wire representations must match the source
-// fixture too, and differ from the ordinary rowset fixture.
+// Check the encoded structure too. Content deduplication can hide shared
+// timestamps, so wire equality alone does not prove separate allocations.
 var_dump(phpser_serialize($distinct) === phpser_serialize($bench['rowset_distinct_1000']));
 var_dump(phpser_serialize($distinct) !== phpser_serialize($ab['rowset_1000']));
 $noReferences = is_array($distinct);
@@ -41,6 +40,25 @@ foreach ($distinct ?? [] as $i => $row) {
     }
 }
 var_dump($noReferences);
+
+function has_unshared_timestamps(array $rows): bool {
+    foreach ($rows as $row) {
+        ob_start();
+        debug_zval_dump($row['created_at']);
+        $dump = ob_get_clean();
+        // One owner in the row plus debug_zval_dump's argument. A shared heap
+        // string has more owners; a reused literal is reported as interned.
+        if (!preg_match('/ refcount\(2\)\s*$/D', $dump)) return false;
+    }
+    return true;
+}
+// Check both builders independently so identical allocation regressions in
+// the two harnesses cannot pass by agreeing with each other. Single-character
+// tags are interned by PHP; only their containing arrays are distinct.
+echo "main timestamps: ";
+var_dump(has_unshared_timestamps($bench['rowset_distinct_1000']));
+echo "A/B timestamps: ";
+var_dump(has_unshared_timestamps($distinct));
 ?>
 --EXPECT--
 bool(true)
@@ -48,3 +66,5 @@ bool(true)
 bool(true)
 bool(true)
 bool(true)
+main timestamps: bool(true)
+A/B timestamps: bool(true)
