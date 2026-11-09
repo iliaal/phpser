@@ -23,7 +23,7 @@ function mk_rowset(int $rows): array {
     ];
     return $out;
 }
-// Match bench.php's equal strings with separate allocations, including tags.
+// Match bench.php's separately allocated timestamps and tags arrays.
 function mk_rowset_distinct(int $rows): array {
     $out = mk_rowset($rows);
     $rowCount = count($out);

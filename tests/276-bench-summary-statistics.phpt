@@ -20,10 +20,8 @@ ob_end_clean();
 
 // Keep the actual aggregation code; only sample production is deterministic.
 $lines = file($argv[0]);
-foreach (['median', 'median_sorted', 'percentile_sorted', 'iqr', 'iqr_sorted',
+foreach (['median', 'median_sorted', 'percentile_sorted', 'iqr_sorted',
     'serializer_order', 'case_data', 'bench_matrix', 'bench_gc_retained'] as $name) {
-    // Also run unchanged on the base harness to verify preserved statistics.
-    if (!function_exists($name)) continue;
     $function = new \ReflectionFunction($name);
     $source = implode('', array_slice($lines, $function->getStartLine() - 1,
         $function->getEndLine() - $function->getStartLine() + 1));
