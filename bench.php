@@ -722,11 +722,15 @@ function bench_matrix(array $cases, array $serializers, int|array $iters, int $r
         foreach ($serializers as $name => [$enc, $dec]) {
             try {
                 $data = case_data($case);
+                $expected = serialize($data);
                 $blob = $enc($data);
                 if (!is_string($blob) || $blob === '') {
                     throw new RuntimeException('empty payload');
                 }
-                $dec($blob); // smoke test; a throw drops this cell to n/a
+                // A non-throwing decoder can still discard or alter the value.
+                if (serialize($dec($blob)) !== $expected) {
+                    throw new RuntimeException('round-trip mismatch');
+                }
                 $prepared[$name] = [$enc, $dec, $blob, $data];
                 $results[$label][$name] = [
                     'size' => strlen($blob),
@@ -736,6 +740,7 @@ function bench_matrix(array $cases, array $serializers, int|array $iters, int $r
             } catch (\Throwable $e) {
                 $results[$label][$name] = ['err' => $e->getMessage()];
             }
+            unset($expected);
         }
 
         $names = array_keys($prepared);
@@ -906,16 +911,25 @@ function bench_gc_retained(array $cases, array $serializers, int $keep_cap, int 
         $bytes = 1;
         foreach ($serializers as $name => [$enc, $dec]) {
             try {
-                $blobs[$name] = $enc(case_data($case));
+                $data = case_data($case);
+                $expected = serialize($data);
+                $blobs[$name] = $enc($data);
+                unset($data);
                 if (!is_string($blobs[$name]) || $blobs[$name] === '') {
                     throw new RuntimeException('empty payload');
                 }
                 $m0 = memory_get_usage();
                 $probe = $dec($blobs[$name]);
-                $bytes = max($bytes, memory_get_usage() - $m0);
-                unset($probe);
+                // Measure before validation allocates its comparison string.
+                $decoded_bytes = memory_get_usage() - $m0;
+                if (serialize($probe) !== $expected) {
+                    throw new RuntimeException('round-trip mismatch');
+                }
+                $bytes = max($bytes, $decoded_bytes);
             } catch (\Throwable $e) {
                 $results[$label][$name] = ['err' => $e->getMessage()];
+            } finally {
+                unset($data, $probe, $expected);
             }
         }
         $keep = max(10, min($keep_cap, intdiv($mem_budget, $bytes)));
