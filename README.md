@@ -104,9 +104,12 @@ $payload = phpser_serialize_signed($cacheValue, $key);
 // ... later, possibly across a process boundary ...
 $value = phpser_unserialize_signed($payload, $key);
 // throws an Exception if the payload was tampered or signed with a different key,
-// or if it verifies but the body then fails to decode (corruption, or a class it
-// needs was removed since signing). A legitimately-signed null decodes to null.
+// or if it verifies but the body fails to decode (for example, a missing enum).
+// A legitimately-signed null decodes to null.
 ```
+
+Plain, signed, and keyed decoding share the [missing-class behavior](#limitations--known-gaps)
+described below, including incomplete objects for ordinary missing classes.
 
 `allowed_classes` is supported by `phpser_unserialize()`,
 `phpser_unserialize_signed()`, and `phpser_unserialize_keyed()`. Same shape as
