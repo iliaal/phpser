@@ -1199,6 +1199,18 @@ function render_text_tables(array $results, array $serializers, string $ref, arr
         }
         echo "\n";
     }
+
+    // Keep wide exception messages out of the metric columns, but do not
+    // hide the reason a cell was excluded from the benchmark.
+    $errors = [];
+    foreach ($results as $shape => $row) {
+        foreach ($serializers as $s) {
+            if (isset($row[$s]['err'])) {
+                $errors[] = "  $shape / $s: " . $row[$s]['err'];
+            }
+        }
+    }
+    if ($errors) echo "Errors:\n" . implode("\n", $errors) . "\n\n";
 }
 
 function extended_metrics(string $id): array {
@@ -1410,7 +1422,7 @@ function html_metric_sections(array $results, array $serializers, string $ref, a
             $cell = $row[$s] ?? ['err' => 'n/a'];
             $isPhpser = $s === 'phpser';
             if (isset($cell['err'])): ?>
-            <td class="<?=$isPhpser?'phpser-col ':''?>"><span class="na">n/a</span></td>
+            <td class="<?=$isPhpser?'phpser-col ':''?>"><span class="na" title="<?=$h($cell['err'])?>">n/a</span></td>
             <?php continue; endif;
             $v = $cell[$metric];
             $isBest = abs($v - $min) < 1e-9;
