@@ -630,6 +630,10 @@ $EXTENDED = $ONLY_EXTENDED || in_array('--extended', $argv, true);
 
 function median(array $xs): float {
     sort($xs);
+    return median_sorted($xs);
+}
+
+function median_sorted(array $xs): float {
     $n = count($xs);
     $m = intdiv($n, 2);
     return ($n % 2) ? $xs[$m] : ($xs[$m - 1] + $xs[$m]) / 2.0;
@@ -644,8 +648,7 @@ function percentile_sorted(array $sorted, float $q): float {
     return $lo === $hi ? $sorted[$lo] : $sorted[$lo] + ($sorted[$hi] - $sorted[$lo]) * ($pos - $lo);
 }
 
-function iqr(array $xs): float {
-    sort($xs);
+function iqr_sorted(array $xs): float {
     return percentile_sorted($xs, 0.75) - percentile_sorted($xs, 0.25);
 }
 
@@ -782,13 +785,15 @@ function bench_matrix(array $cases, array $serializers, int|array $iters, int $r
 
         foreach ($names as $name) {
             if (isset($results[$label][$name]['err'])) continue;
-            $results[$label][$name]['enc'] = median(
+            sort($results[$label][$name]['enc_samples']);
+            sort($results[$label][$name]['dec_samples']);
+            $results[$label][$name]['enc'] = median_sorted(
                 $results[$label][$name]['enc_samples']);
-            $results[$label][$name]['dec'] = median(
+            $results[$label][$name]['dec'] = median_sorted(
                 $results[$label][$name]['dec_samples']);
-            $results[$label][$name]['enc_iqr'] = iqr(
+            $results[$label][$name]['enc_iqr'] = iqr_sorted(
                 $results[$label][$name]['enc_samples']);
-            $results[$label][$name]['dec_iqr'] = iqr(
+            $results[$label][$name]['dec_iqr'] = iqr_sorted(
                 $results[$label][$name]['dec_samples']);
             unset(
                 $results[$label][$name]['enc_samples'],
@@ -960,8 +965,9 @@ function bench_gc_retained(array $cases, array $serializers, int $keep_cap, int 
             $cell = ['keep' => $keep, 'isolated' => $samples[$name]['gc_on'][0]['isolated']];
             foreach (['gc_on', 'gc_off'] as $mode) {
                 $ns = array_column($samples[$name][$mode], 'ns');
-                $cell[$mode] = median($ns);
-                $cell[$mode . '_iqr'] = iqr($ns);
+                sort($ns);
+                $cell[$mode] = median_sorted($ns);
+                $cell[$mode . '_iqr'] = iqr_sorted($ns);
             }
             $cell['gc_on_runs'] = median(array_column($samples[$name]['gc_on'], 'runs'));
             $cell['gc_on_collected'] = median(array_column($samples[$name]['gc_on'], 'collected'));

@@ -23,7 +23,7 @@ ob_end_clean();
 // producer replaced. Wall-clock timings and collector thresholds cannot make
 // these exact midpoint assertions flaky.
 $lines = file($argv[0]);
-foreach (['median', 'percentile_sorted', 'iqr', 'serializer_order', 'case_data', 'bench_gc_retained'] as $name) {
+foreach (['median', 'median_sorted', 'percentile_sorted', 'iqr_sorted', 'serializer_order', 'case_data', 'bench_gc_retained'] as $name) {
     $function = new \ReflectionFunction($name);
     $source = implode('', array_slice($lines, $function->getStartLine() - 1,
         $function->getEndLine() - $function->getStartLine() + 1));
