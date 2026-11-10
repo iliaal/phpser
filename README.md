@@ -322,6 +322,35 @@ with size, encode, and decode side by side on every shape, see the
 **[interactive benchmark page](https://iliaal.github.io/phpser/)**.
 Regenerate it with `php ... bench.php --html > docs/index.html`.
 
+### Running shorter benchmarks
+
+For a quick smoke run, use one iteration and one repetition explicitly:
+
+```sh
+BENCH_ITERS=1 BENCH_REPS=1 BENCH_WARMUP=0 php -d extension=./modules/phpser.so bench.php
+BENCH_ITERS=1 BENCH_REPS=1 php -d extension=./modules/phpser.so ab.php
+```
+
+These settings check the harness; use more repetitions for performance
+comparisons. The main timing controls behave as follows:
+
+- `BENCH_ITERS` defaults to 1000 in both scripts. It controls calls per
+  sample in the main `bench.php` table and in plain/signed `ab.php` mode.
+  In the extended non-GC tables it caps the calibrated iteration count.
+  Neither script uses it for retained-GC samples.
+- `BENCH_REPS` defaults to 35 in `bench.php` and 15 in `ab.php`.
+- For both controls, an unset variable, an empty string, or the literal
+  string `0` selects the default. **Zero does not request a shorter run.**
+  Other values are converted to integers and clamped to at least 1. For
+  example, `-3` and `invalid` become 1, `2.9` becomes 2, and `12junk` becomes
+  12 because PHP accepts a leading numeric prefix.
+- `BENCH_WARMUP` applies only to `bench.php`. Unset or empty means 100
+  untimed calls per operation; all other values are converted to integers
+  and clamped to at least 0. Here, `0` explicitly disables warmup.
+
+For the separate extended and retained-GC controls, see the settings listed
+at the top of `bench.php` and `ab.php`.
+
 ## Design highlights
 
 - **Pointer-equality dict intern**: encoding checks `*zend_string == *zend_string`
