@@ -560,23 +560,19 @@ static void enc_id_grow(encode_ctx *e) {
     e->id_mask = new_mask;
 }
 
-/* At the 50% load boundary, a repeat still needs no new slot. Check for it
- * before growing; below the boundary keep the usual single probe. Returned
- * slots remain valid until the next id-table insertion. */
+/* Look up before growing: a repeat adds no entry, even at the 50% load
+ * boundary. Returned slots remain valid until the next id-table insertion. */
 static inline id_entry *enc_id_slot(encode_ctx *e, uintptr_t ptr) {
-    if (UNEXPECTED((e->id_count + 1) * 2 > e->id_mask + 1)) {
-        if (e->id_buckets) {
-            uint32_t h = id_hash(ptr) & e->id_mask;
-            while (e->id_buckets[h].ptr) {
-                if (e->id_buckets[h].ptr == ptr) return &e->id_buckets[h];
-                h = (h + 1) & e->id_mask;
-            }
-        }
-        enc_id_grow(e);
-    }
+    if (UNEXPECTED(!e->id_buckets)) enc_id_grow(e);
     uint32_t h = id_hash(ptr) & e->id_mask;
-    while (e->id_buckets[h].ptr && e->id_buckets[h].ptr != ptr) {
+    while (e->id_buckets[h].ptr) {
+        if (e->id_buckets[h].ptr == ptr) return &e->id_buckets[h];
         h = (h + 1) & e->id_mask;
+    }
+    if (UNEXPECTED((e->id_count + 1) * 2 > e->id_mask + 1)) {
+        enc_id_grow(e);
+        h = id_hash(ptr) & e->id_mask;
+        while (e->id_buckets[h].ptr) h = (h + 1) & e->id_mask;
     }
     return &e->id_buckets[h];
 }

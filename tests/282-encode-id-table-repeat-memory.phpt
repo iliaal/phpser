@@ -38,12 +38,35 @@ foreach (['objects', 'references', 'arrays'] as $kind) {
         }
     }
     $uniquePeak = encode_peak($input);
+    if ($kind !== 'objects') {
+        // Objects also resize the string cache at this input length. Plain
+        // scalar references and arrays isolate the identity-table boundary.
+        $below = $input;
+        array_pop($below);
+        $belowPeak = encode_peak($below);
+        if ($uniquePeak > $belowPeak + 16384) die("$kind: grew too early\n");
+        unset($below);
+    }
     if ($kind === 'references') $input[] =& $owners[0];
     else $input[] = $owners[0];
     $repeatPeak = encode_peak($input);
     // One TAG_REF needs only a few bytes. Allow a full smart_str page and
     // allocator-bin variation; an unnecessary 2048-to-4096-slot rehash costs
     // at least 32 KiB more even with 12-byte id_entry slots on 32-bit builds.
+    if ($kind !== 'objects') {
+        $above = $input;
+        array_pop($above);
+        if ($kind === 'references') {
+            $extra = 1024;
+            $above[] =& $extra;
+        } else {
+            $extra = [1024];
+            $above[] = $extra;
+        }
+        $abovePeak = encode_peak($above);
+        if ($abovePeak <= $uniquePeak + 16384) die("$kind: did not grow for a new entry\n");
+        unset($above, $extra);
+    }
     echo $kind, ': ', $repeatPeak <= $uniquePeak + 16384 ? 'bounded' : 'grew', "\n";
 }
 ?>
