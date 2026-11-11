@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Decoder string dictionaries allocate only their declared pointer slots, avoiding an unused sentinel slot and an extra allocator page at page-sized boundaries. Wire output and decoded values are unchanged.
 - Repeated object, reference, and shared-array identities no longer grow the encoder identity table when it is half full, avoiding an unnecessary allocation and rehash. Wire output and decoded values are unchanged.
 - An `allowed_classes` option that is neither an array nor a bool now throws `TypeError` instead of `ValueError` on every supported PHP version, including 8.2 and 8.3, matching native `unserialize()`. Code that catches `ValueError` for this case must catch `TypeError`.
 
