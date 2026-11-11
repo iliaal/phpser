@@ -3201,7 +3201,9 @@ static int decode_header(decode_ctx *d) {
      * table spares a small decode an allocation and a free. dec_get_zstr
      * bounds every index by dict_len, so dict stays NULL. */
     if (n == 0) return 0;
-    d->dict = dec_ecalloc((size_t)n + 1, sizeof(zend_string *));
+    /* Indices are bounded by dict_len; no sentinel slot is read. An extra
+     * pointer can push an otherwise page-sized table into the next MM bin. */
+    d->dict = dec_ecalloc((size_t)n, sizeof(zend_string *));
     if (UNEXPECTED(!d->dict)) return -1;
     d->dict_len = (uint32_t)n;
     for (uint32_t i = 0; i < d->dict_len; i++) {
