@@ -560,29 +560,37 @@ static void enc_id_grow(encode_ctx *e) {
     e->id_mask = new_mask;
 }
 
+/* Look up before growing: a repeat adds no entry, even at the 50% load
+ * boundary. Returned slots remain valid until the next id-table insertion. */
+static inline id_entry *enc_id_slot(encode_ctx *e, uintptr_t ptr) {
+    if (UNEXPECTED(!e->id_buckets)) enc_id_grow(e);
+    uint32_t h = id_hash(ptr) & e->id_mask;
+    while (e->id_buckets[h].ptr) {
+        if (e->id_buckets[h].ptr == ptr) return &e->id_buckets[h];
+        h = (h + 1) & e->id_mask;
+    }
+    if (UNEXPECTED((e->id_count + 1) * 2 > e->id_mask + 1)) {
+        enc_id_grow(e);
+        h = id_hash(ptr) & e->id_mask;
+        while (e->id_buckets[h].ptr) h = (h + 1) & e->id_mask;
+    }
+    return &e->id_buckets[h];
+}
+
 /* Returns 1 for a new entity, 0 for a repeat; *out_id holds its encounter id. */
 static inline int enc_visit(encode_ctx *e, void *ptr, uint8_t kind,
                             uint32_t *out_id) {
-    /* Grow when load factor would exceed 50% (cap is power of 2; count+1
-     * after this call must not exceed cap/2). Keeps probe chains short. */
-    if (UNEXPECTED((e->id_count + 1) * 2 > e->id_mask + 1)) {
-        enc_id_grow(e);
-    }
     uintptr_t pp = (uintptr_t)ptr;
-    uint32_t h = id_hash(pp) & e->id_mask;
-    id_entry *buckets = e->id_buckets;
-    while (buckets[h].ptr) {
-        if (buckets[h].ptr == pp) {
-            *out_id = buckets[h].id;
-            return 0;
-        }
-        h = (h + 1) & e->id_mask;
+    id_entry *entry = enc_id_slot(e, pp);
+    if (entry->ptr) {
+        *out_id = entry->id;
+        return 0;
     }
     uint32_t id = e->next_id++;
-    buckets[h].ptr = pp;
-    buckets[h].id = id;
-    buckets[h].kind = kind;
-    buckets[h].arr_state = ENC_ARR_ST_CLAIMED;
+    entry->ptr = pp;
+    entry->id = id;
+    entry->kind = kind;
+    entry->arr_state = ENC_ARR_ST_CLAIMED;
     if (UNEXPECTED(e->pins_active)) enc_id_addref(pp, kind);
     e->id_count++;
     *out_id = id;
@@ -595,37 +603,30 @@ enum { ENC_ARR_NEW, ENC_ARR_REPEAT, ENC_ARR_BY_VALUE };
  * enc_array_done resolves; ENC_ARR_REPEAT writes the id for a TAG_REF;
  * ENC_ARR_BY_VALUE asks for a non-claiming walk. */
 static inline int enc_visit_array(encode_ctx *e, HashTable *ht, uint32_t *out_id) {
-    if (UNEXPECTED((e->id_count + 1) * 2 > e->id_mask + 1)) {
-        enc_id_grow(e);
-    }
     uintptr_t pp = (uintptr_t)ht;
-    uint32_t h = id_hash(pp) & e->id_mask;
-    id_entry *buckets = e->id_buckets;
-    while (buckets[h].ptr) {
-        if (buckets[h].ptr == pp) {
-            ZEND_ASSERT(buckets[h].kind == ENC_ID_ARRAY
-                || buckets[h].kind == ENC_ID_ARRAY_IMMUTABLE);
-            if (buckets[h].arr_state == ENC_ARR_ST_UNSHARED) {
-                /* An earlier walk may have reached a reference through a new
-                 * object. That object now emits a back-reference, so retry the
-                 * array instead of expanding every later holder by value. */
-                buckets[h].arr_state = ENC_ARR_ST_PENDING;
-                return ENC_ARR_NEW;
-            }
-            if (buckets[h].arr_state != ENC_ARR_ST_CLAIMED) {
-                return ENC_ARR_BY_VALUE;
-            }
-            *out_id = buckets[h].id;
-            return ENC_ARR_REPEAT;
+    id_entry *entry = enc_id_slot(e, pp);
+    if (entry->ptr) {
+        ZEND_ASSERT(entry->kind == ENC_ID_ARRAY
+            || entry->kind == ENC_ID_ARRAY_IMMUTABLE);
+        if (entry->arr_state == ENC_ARR_ST_UNSHARED) {
+            /* An earlier walk may have reached a reference through a new
+             * object. That object now emits a back-reference, so retry the
+             * array instead of expanding every later holder by value. */
+            entry->arr_state = ENC_ARR_ST_PENDING;
+            return ENC_ARR_NEW;
         }
-        h = (h + 1) & e->id_mask;
+        if (entry->arr_state != ENC_ARR_ST_CLAIMED) {
+            return ENC_ARR_BY_VALUE;
+        }
+        *out_id = entry->id;
+        return ENC_ARR_REPEAT;
     }
     uint8_t kind = (GC_FLAGS(ht) & GC_IMMUTABLE)
         ? ENC_ID_ARRAY_IMMUTABLE : ENC_ID_ARRAY;
-    buckets[h].ptr = pp;
-    buckets[h].id = 0;
-    buckets[h].kind = kind;
-    buckets[h].arr_state = ENC_ARR_ST_PENDING;
+    entry->ptr = pp;
+    entry->id = 0;
+    entry->kind = kind;
+    entry->arr_state = ENC_ARR_ST_PENDING;
     if (UNEXPECTED(e->pins_active)) enc_id_addref(pp, kind);
     e->id_count++;
     return ENC_ARR_NEW;
