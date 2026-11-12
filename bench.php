@@ -872,6 +872,9 @@ function run_isolated(callable $fn): array {
         }
     }
     $path = tempnam(sys_get_temp_dir(), 'phpser-bench-');
+    if ($path === false) {
+        throw new RuntimeException('cannot create benchmark sample file');
+    }
     $pid = pcntl_fork();
     if ($pid === -1) {
         unlink($path);
