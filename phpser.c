@@ -680,8 +680,15 @@ static inline intern_slot *enc_cache_find(encode_ctx *e, zend_string *zs) {
     return NULL;
 }
 
+/* Each resize re-inserts every live entry, and nested payloads with a small
+ * top level start unseeded at 32 slots. Quadruple through 2048 slots (at most
+ * 8192, 128 KiB on 64-bit), then double so over-allocation stays bounded. */
+#define ENC_ICACHE_QUAD_MAX 2048u
+
 static void enc_icache_grow(encode_ctx *e) {
-    uint32_t new_cap = e->icache_mask ? (e->icache_mask + 1) * 2
+    uint32_t old_cap = e->icache_mask + 1;
+    uint32_t new_cap = e->icache_mask
+        ? old_cap * (old_cap <= ENC_ICACHE_QUAD_MAX ? 4 : 2)
         : (e->icache_init_cap ? e->icache_init_cap : 32);
     intern_slot *nb = ecalloc(new_cap, sizeof(intern_slot));  /* ptr==NULL = empty */
     uint32_t nm = new_cap - 1;
