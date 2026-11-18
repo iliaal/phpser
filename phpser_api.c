@@ -17,7 +17,9 @@
 
 #include "phpser_int.h"
 #include "php_phpser_api.h"
-#include "zend_atomic.h"
+#if PHP_VERSION_ID < 80700
+# include "zend_atomic.h"
+#endif
 
 #define PHPSER_KEYED_LABEL_PREFIX "phpser:"
 #define PHPSER_KEYED_LABEL_SUFFIX ":v1"
@@ -306,13 +308,34 @@ static bool phpser_apcu_registered = false;
 static bool phpser_apcu_bound_php_at_startup = false;
 /* Set the first time APCu calls either phpser callback, and inherited across
  * fork. Atomic because ZTS requests store concurrently while MINFO reads; the
- * load-first check skips the store once set (Zend's load is a plain read on
- * C11 and GCC __atomic builds, a read-modify-write on Windows and legacy GCC). */
-static zend_atomic_bool phpser_apcu_used;
+ * load-first check skips the store once set. */
+#if PHP_VERSION_ID >= 80700
+typedef atomic_bool phpser_atomic_bool;
+
+static zend_always_inline bool phpser_atomic_bool_load(phpser_atomic_bool *obj) {
+    return atomic_load(obj);
+}
+
+static zend_always_inline void phpser_atomic_bool_store(phpser_atomic_bool *obj, bool desired) {
+    atomic_store(obj, desired);
+}
+#else
+typedef zend_atomic_bool phpser_atomic_bool;
+
+static zend_always_inline bool phpser_atomic_bool_load(phpser_atomic_bool *obj) {
+    return zend_atomic_bool_load_ex(obj);
+}
+
+static zend_always_inline void phpser_atomic_bool_store(phpser_atomic_bool *obj, bool desired) {
+    zend_atomic_bool_store_ex(obj, desired);
+}
+#endif
+
+static phpser_atomic_bool phpser_apcu_used;
 
 static zend_always_inline void phpser_apcu_mark_used(void) {
-    if (UNEXPECTED(!zend_atomic_bool_load_ex(&phpser_apcu_used))) {
-        zend_atomic_bool_store_ex(&phpser_apcu_used, true);
+    if (UNEXPECTED(!phpser_atomic_bool_load(&phpser_apcu_used))) {
+        phpser_atomic_bool_store(&phpser_apcu_used, true);
     }
 }
 
@@ -358,7 +381,7 @@ static int phpser_apc_unserialize(zval *value, unsigned char *buf, size_t buf_le
 void phpser_apcu_minit(bool persistent) {
     phpser_apcu_registered = false;
     phpser_apcu_bound_php_at_startup = false;
-    zend_atomic_bool_store_ex(&phpser_apcu_used, false);
+    phpser_atomic_bool_store(&phpser_apcu_used, false);
     /* APCu keeps registered serializers for the life of the process and has
      * no unregister call, so a dl() load, unmapped at request end, would
      * leave it calling unmapped code. */
@@ -388,7 +411,7 @@ const char *phpser_apcu_status(void) {
         return "inactive (APCu bound the php serializer at startup; "
                "set apc.serializer=phpser in php.ini)";
     }
-    if (zend_atomic_bool_load_ex(&phpser_apcu_used)) {
+    if (phpser_atomic_bool_load(&phpser_apcu_used)) {
         return "registered, used by APCu in this process or the parent it forked from";
     }
     return "registered, not yet used by APCu in this process";
