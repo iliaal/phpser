@@ -4,7 +4,8 @@ name: Release Windows binaries
 # via /release-ext). Builds the extension on every supported PHP version
 # x architecture x thread-safety variant on Windows runners, then
 # uploads each .dll as a release asset following the PIE-compatible
-# naming convention (php_phpser-<version>-<php_x.y>-<ts|nts>-vs17-<arch>.zip).
+# naming convention (php_phpser-<version>-<php_x.y>-<ts|nts>-<vs>-<arch>.zip,
+# where <vs> is vs16 for PHP 8.2-8.3, vs17 for 8.4-8.5, and vs18 for 8.6).
 #
 # Tests are off here; the test workflow covers the same combinations.
 #
@@ -41,7 +42,7 @@ jobs:
       - id: matrix
         uses: php/php-windows-builder/extension-matrix@29352c0ef9e8ce65264ea9e287881a6f7758a953 # 1.9.0
         with:
-          php-version-list: '8.2, 8.3, 8.4, 8.5'
+          php-version-list: '8.2, 8.3, 8.4, 8.5, 8.6'
 
   build:
     name: Build ${{ matrix.php-version }} ${{ matrix.ts }} ${{ matrix.arch }}

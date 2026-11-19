@@ -139,7 +139,7 @@ For maintainers cutting a new version:
    does not start the binary workflows; both listen for the
    `release.published` event.
 5. The `release-windows.yml` and `release-linux.yml` workflows build the full
-   matrix (PHP 8.2-8.5 x TS/NTS x x86/x64 for Windows; PHP 8.4-8.5 x
+   matrix (PHP 8.2-8.6 x TS/NTS x x86/x64 for Windows; PHP 8.4-8.6 x
    glibc/macOS for Linux) and attach the binaries to the published release.
 6. Packagist's GitHub webhook fires on tag push and re-scans
    versions. `pie install iliaal/phpser` resolves to the new tag
