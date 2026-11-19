@@ -33,9 +33,10 @@ PHP_FUNCTION(phpser_serialize) {
 
 /* Parse a phpser_unserialize options array. On success, *out_set may be
  * non-NULL and the caller must free it. Returns -1 on invalid options (an
- * exception is already thrown). fname is the calling function's name for
- * diagnostics. PHP 8.4+ accepts stringable objects like native unserialize;
- * older PHP keeps phpser's historical string-only entry restriction. */
+ * exception is already thrown) or with a memory_limit error pending. fname is
+ * the calling function's name for diagnostics. PHP 8.4+ accepts stringable
+ * objects like native unserialize; older PHP keeps phpser's historical
+ * string-only entry restriction. */
 static int parse_unserialize_options(
     HashTable *options_ht, const char *fname,
     int *out_mode, HashTable **out_set)
@@ -60,6 +61,9 @@ static int parse_unserialize_options(
         GC_TRY_ADDREF(classes);
         zval *cn;
         ZEND_HASH_FOREACH_VAL(classes, cn) {
+            /* Each entry allocates a lowercased copy; a long list can pass the
+             * hard limit after the memory_limit error is queued. */
+            if (UNEXPECTED(PHPSER_HAS_OOM())) goto invalid;
             ZVAL_DEREF(cn);
             if (Z_TYPE_P(cn) != IS_STRING
 #if PHP_VERSION_ID >= 80400
@@ -139,7 +143,7 @@ PHP_FUNCTION(phpser_unserialize) {
     HashTable *allowed_set;
     if (parse_unserialize_options(options_ht, "phpser_unserialize",
                                   &allowed_mode, &allowed_set) < 0) {
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
 
     /* Unsigned stays lenient on trailing bytes (historical behavior). */
@@ -240,7 +244,7 @@ PHP_FUNCTION(phpser_unserialize_signed) {
     HashTable *allowed_set;
     if (parse_unserialize_options(options_ht, "phpser_unserialize_signed",
                                   &allowed_mode, &allowed_set) < 0) {
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
 
     int rc = phpser_decode_buf_opts(payload, frame_len, return_value, allowed_mode,
@@ -331,7 +335,7 @@ PHP_FUNCTION(phpser_unserialize_keyed) {
     HashTable *allowed_set;
     if (parse_unserialize_options(options_ht, "phpser_unserialize_keyed",
                                   &allowed_mode, &allowed_set) < 0) {
-        RETURN_THROWS();
+        PHPSER_RETURN_FAILED();
     }
 
     phpser_keyed_rc rc = phpser_keyed_decode(payload, payload_len, key, context, context_len,
@@ -372,6 +376,30 @@ PHP_INI_END()
 #ifdef HAVE_PHP_SESSION
 static bool phpser_session_registered = false;
 #endif
+
+/* The struct exists for its GINIT hook: TSRM runs GINIT on every new thread
+ * before any module's RINIT, and ext/session's RINIT (session.auto_start)
+ * decodes through phpser before phpser's own RINIT runs on that thread. */
+ZEND_BEGIN_MODULE_GLOBALS(phpser)
+    bool unused;
+ZEND_END_MODULE_GLOBALS(phpser)
+
+ZEND_DECLARE_MODULE_GLOBALS(phpser)
+
+static PHP_GINIT_FUNCTION(phpser) {
+#if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
+    ZEND_TSRMLS_CACHE_UPDATE();
+#endif
+    phpser_globals->unused = false;
+}
+
+/* TSRM runs GSHUTDOWN on the exiting thread from ts_free_thread(), so the
+ * per-thread key caches are wiped before their TLS block is released. */
+static PHP_GSHUTDOWN_FUNCTION(phpser) {
+    (void) phpser_globals;
+    phpser_hmac_mshutdown();
+    phpser_api_mshutdown();
+}
 
 static PHP_MINIT_FUNCTION(phpser) {
 #if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
@@ -476,7 +504,11 @@ zend_module_entry phpser_module_entry = {
 #endif
     PHP_MINFO(phpser),
     PHP_PHPSER_VERSION,
-    STANDARD_MODULE_PROPERTIES,
+    PHP_MODULE_GLOBALS(phpser),
+    PHP_GINIT(phpser),
+    PHP_GSHUTDOWN(phpser),
+    NULL,
+    STANDARD_MODULE_PROPERTIES_EX,
 };
 
 #if defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)

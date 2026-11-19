@@ -25,8 +25,7 @@
  * no allocation. The entry holds the key itself (raw bytes when at most 64,
  * else its SHA-256 digest) plus key-equivalent midstates, in static
  * thread-local memory until a different key replaces it in place or
- * phpser_hmac_mshutdown() wipes it; a ZTS thread that exits earlier frees its
- * copy unwiped.
+ * phpser_hmac_mshutdown() wipes it at module or thread shutdown.
  * ------------------------------------------------------------------------- */
 
 #include "phpser_int.h"

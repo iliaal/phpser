@@ -341,6 +341,7 @@ typedef struct {
     /* A depth placeholder keeps the body well-formed but makes the frame
      * lossy; the caller must discard it. */
     uint8_t depth_exceeded;
+    uint8_t stack_exhausted;
     /* Reject strings beyond the decoder's UINT32_MAX limit during encode. */
     uint8_t size_exceeded;
     /* An encode exception invalidates the entire frame, including session saves. */
@@ -363,6 +364,7 @@ static void enc_ctx_init(encode_ctx *e) {
     e->dict_cap = 0;
     e->depth = 0;
     e->depth_exceeded = 0;
+    e->stack_exhausted = 0;
     e->size_exceeded = 0;
     e->failed = 0;
     e->wire_v2 = 0;
@@ -931,6 +933,7 @@ static void encode_value(smart_str *body, encode_ctx *e, zval *v) {
     encode_value_ex(body, e, v, 0);
 }
 
+
 static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
                             uint32_t flags) {
     /* After encoding fails, placeholders preserve container counts until the
@@ -952,6 +955,17 @@ static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
         smart_str_appendc(body, TAG_NULL);
         return;
     }
+#ifdef ZEND_CHECK_STACK_LIMIT
+    /* MAX_DEPTH levels need about 250 KiB of C stack on release builds, more
+     * than a musl thread's 128 KiB default. */
+    if (UNEXPECTED(e->depth >= PHPSER_STACK_CHECK_DEPTH)
+        && UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
+        e->stack_exhausted = 1;
+        e->failed = 1;
+        smart_str_appendc(body, TAG_NULL);
+        return;
+    }
+#endif
     e->depth++;
     encode_value_inner(body, e, v, flags);
     e->depth--;
@@ -1156,6 +1170,10 @@ static zend_never_inline void enc_encode_sleep_object(
     int declared_only = -1;
     zval *zv_name;
     ZEND_HASH_FOREACH_VAL_IND(names_ht, zv_name) {
+        if (UNEXPECTED(PHPSER_HAS_OOM())) {
+            e->failed = 1;
+            break;
+        }
         ZVAL_DEREF(zv_name);
         if (Z_TYPE_P(zv_name) != IS_STRING) {
             php_error_docref(NULL, E_WARNING,
@@ -1231,7 +1249,10 @@ static zend_never_inline void enc_encode_sleep_object(
     smart_str_appendc(body, TAG_OBJECT);
     varint_write_u64(body, class_idx);
     varint_write_u64(body, nprops);
-    for (uint32_t i = 0; i < nprops; i++) {
+    /* The frame is discarded once encoding fails, so skip the remaining
+     * names: interning them all after a pending memory_limit error can pass
+     * the hard limit. */
+    for (uint32_t i = 0; i < nprops && !e->failed; i++) {
         varint_write_u64(body, enc_intern_zstr(e, snap_keys[i]));
         encode_value_ex(body, e, &snap_vals[i], ENC_RCN | ENC_BORROWED);
     }
@@ -1636,7 +1657,10 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             if (props) {
                 Bucket *b = props->arData;
                 Bucket *end = b + props->nNumUsed;
-                for (; b < end; b++) {
+                /* The frame is discarded once encoding fails; interning the
+                 * remaining names after a pending memory_limit error can pass
+                 * the hard limit. */
+                for (; b < end && !e->failed; b++) {
                     zval *pv = enc_obj_prop_val(b);
                     if (!pv) continue;
                     if (skip_magic && b->key
@@ -1669,7 +1693,8 @@ static zend_always_inline bool enc_key_is_schema_eligible(zend_string *key) {
         || !enc_key_is_numeric(key);
 }
 
-/* Return 1 when packed rows share the same string-key schema as row 0. */
+/* Return 1 when packed rows share the same string-key schema as row 0, 0 when
+ * they do not, and -1 with e->failed set when a memory_limit error is pending. */
 static int enc_match_rowset_schema(
     encode_ctx *e, zval *zp, uint32_t n_used, uint32_t **out_key_idx, uint32_t *out_ncols)
 {
@@ -1730,6 +1755,14 @@ static int enc_match_rowset_schema(
     /* Schema confirmed across every row; intern row-0's field names now. */
     uint32_t *key_idx = (uint32_t *)safe_emalloc((size_t)ncols, sizeof(uint32_t), 0);
     for (uint32_t c = 0; c < ncols; c++) {
+        /* Interning a wide schema can pass the hard limit after the
+         * memory_limit error is queued. */
+        if (UNEXPECTED(PHPSER_HAS_OOM())) {
+            efree(key_idx);
+            efree(k0);
+            e->failed = 1;
+            return -1;
+        }
         key_idx[c] = enc_intern_zstr(e, k0[c]);
     }
     efree(k0);
@@ -1992,9 +2025,11 @@ static zend_never_inline int enc_try_table(
     smart_str *body, encode_ctx *e, zval *zp, uint32_t n_used)
 {
     uint32_t ncols, *key_idx;
-    if (!enc_match_rowset_schema(e, zp, n_used, &key_idx, &ncols)) {
-        return 0;
-    }
+    int matched = enc_match_rowset_schema(e, zp, n_used, &key_idx, &ncols);
+    /* As below, a failed frame reports the table as handled so the fallback
+     * walk does not run. */
+    if (matched < 0) return 1;
+    if (!matched) return 0;
     uint64_t ncells = (uint64_t)ncols * n_used;
     if (ncells > UINT32_MAX || ncells > SIZE_MAX / sizeof(zval *)) {
         efree(key_idx);
@@ -3563,6 +3598,15 @@ static int decode_value(decode_ctx *d, zval *out) {
         ZVAL_UNDEF(out);
         return -1;
     }
+#ifdef ZEND_CHECK_STACK_LIMIT
+    /* Rejected like over-deep input: the remaining C stack, not MAX_DEPTH,
+     * is the binding limit on small thread stacks. */
+    if (UNEXPECTED(d->depth >= PHPSER_STACK_CHECK_DEPTH)
+        && UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
+        ZVAL_UNDEF(out);
+        return -1;
+    }
+#endif
     d->depth++;
     int rc = decode_value_inner(d, out);
     d->depth--;
@@ -4595,7 +4639,53 @@ static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys) {
     return keys;
 }
 
-/* Shared cleanup for depth/size rejects: free body, destroy ctx (which can
+#if defined(ZEND_CHECK_STACK_LIMIT) && PHP_VERSION_ID < 80400
+/* PHP 8.3 keeps zend_call_stack_size_error() static; this throws the same
+ * Error. */
+static zend_never_inline ZEND_COLD void phpser_stack_size_error(void) {
+    zend_throw_error(NULL, "Maximum call stack size of %zu bytes "
+        "(zend.max_allowed_stack_size - zend.reserved_stack_size) reached. "
+        "Infinite recursion?",
+        (size_t) ((uintptr_t) EG(stack_base) - (uintptr_t) EG(stack_limit)));
+}
+#elif defined(ZEND_CHECK_STACK_LIMIT)
+# define phpser_stack_size_error() zend_call_stack_size_error()
+#endif
+
+#ifdef ZEND_CHECK_STACK_LIMIT
+/* Set while the session handler encodes; holds a reference to the last
+ * stack-size Error a nested encode raised, so the handler can tell it from a
+ * user-thrown Error with the same message. */
+ZEND_TLS bool stack_error_tracking;
+ZEND_TLS zend_object *stack_error_raised;
+
+void phpser_stack_error_track(phpser_stack_track *saved) {
+    saved->tracking = stack_error_tracking;
+    saved->raised = stack_error_raised;
+    stack_error_tracking = true;
+    stack_error_raised = NULL;
+}
+
+bool phpser_stack_error_untrack(const phpser_stack_track *saved) {
+    zend_object *raised = stack_error_raised;
+    bool ours = raised && EG(exception) == raised;
+    if (raised) OBJ_RELEASE(raised);
+    stack_error_tracking = saved->tracking;
+    stack_error_raised = saved->raised;
+    return ours;
+}
+
+static void phpser_raise_stack_error(void) {
+    phpser_stack_size_error();
+    if (stack_error_tracking && EG(exception)) {
+        if (stack_error_raised) OBJ_RELEASE(stack_error_raised);
+        stack_error_raised = EG(exception);
+        GC_ADDREF(stack_error_raised);
+    }
+}
+#endif
+
+/* Shared cleanup for depth/size/stack rejects: free body, destroy ctx (which can
  * run destructors), reclassify as EXCEPTION if cleanup threw, optionally
  * raise the userland exception. */
 static zend_string *enc_finish_overflow(
@@ -4611,7 +4701,11 @@ static zend_string *enc_finish_overflow(
         return NULL;
     }
     if (throw_on_overflow) {
-        if (kind == PHPSER_ENC_DEPTH) {
+        if (kind == PHPSER_ENC_STACK) {
+#ifdef ZEND_CHECK_STACK_LIMIT
+            phpser_raise_stack_error();
+#endif
+        } else if (kind == PHPSER_ENC_DEPTH) {
             zend_throw_exception_ex(zend_ce_exception, 0,
                 "phpser: maximum nesting depth (%d) exceeded", MAX_DEPTH);
         } else {
@@ -4754,6 +4848,12 @@ zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
     smart_str_alloc(&body, body_estimate, 0);
     encode_value(&body, &ctx, value);
 
+    /* Running out of C stack aborts the walk like a failure, but reports like
+     * the depth cap: the session handler has no frame to throw into. */
+    if (UNEXPECTED(ctx.stack_exhausted && !EG(exception) && !PHPSER_HAS_OOM())) {
+        return enc_finish_overflow(
+            &body, &ctx, throw_on_overflow, status, PHPSER_ENC_STACK);
+    }
     /* An unsupported object or a throwing serialization hook failed mid-walk.
      * Never hand back the truncated frame (it has a TAG_NULL hole where the
      * throwing object was); the exception stays pending for the caller. Check

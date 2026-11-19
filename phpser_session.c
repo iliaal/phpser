@@ -17,6 +17,7 @@
  * ------------------------------------------------------------------------- */
 
 #include "phpser_int.h"
+#include "zend_exceptions.h"
 
 #ifdef HAVE_PHP_SESSION
 # include "ext/session/php_session.h"
@@ -134,9 +135,27 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
                                sizeof(PHPSER_SESSION_TOMBSTONE) - 1, 0);
     }
     phpser_enc_status status = PHPSER_ENC_OK;
-    zend_string *out = phpser_encode_zval_ex(session_vars,
-                                             /* throw_on_overflow */ false, &status,
-                                             key ? PHPSER_HMAC_TAG_LEN : 0);
+    zend_string *out = NULL;
+#ifdef ZEND_CHECK_STACK_LIMIT
+    /* A hook's nested phpser_serialize() reports a low C stack as the
+     * engine's Error, not through this encode's status. */
+    phpser_stack_track stack_track;
+    bool nested_stack_error = false;
+    phpser_stack_error_track(&stack_track);
+    zend_try {
+        out = phpser_encode_zval_ex(session_vars,
+                                    /* throw_on_overflow */ false, &status,
+                                    key ? PHPSER_HMAC_TAG_LEN : 0);
+    } zend_catch {
+        phpser_stack_error_untrack(&stack_track);
+        zend_bailout();
+    } zend_end_try();
+    nested_stack_error = phpser_stack_error_untrack(&stack_track);
+#else
+    out = phpser_encode_zval_ex(session_vars,
+                                /* throw_on_overflow */ false, &status,
+                                key ? PHPSER_HMAC_TAG_LEN : 0);
+#endif
     if (out && key) {
         unsigned char *tail = (unsigned char *) ZSTR_VAL(out) + ZSTR_LEN(out);
         if (UNEXPECTED(phpser_session_tag(key, ZSTR_VAL(out), ZSTR_LEN(out), tail) != 0)) {
@@ -157,6 +176,16 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
                 "wire-format limit");
             break;
         case PHPSER_ENC_EXCEPTION:
+#ifdef ZEND_CHECK_STACK_LIMIT
+            /* Treated like the outer encode running out of stack, so neither
+             * save path persists an empty session. */
+            if (!PHPSER_HAS_OOM() && nested_stack_error) {
+                zend_clear_exception();
+                php_error_docref(NULL, E_WARNING,
+                    "phpser: $_SESSION not serialized — nesting exhausted the C stack");
+                break;
+            }
+#endif
             /* Encode exceptions propagate to the save caller; persist nothing.
              * A pending memory_limit error reports itself as the fatal. */
             if (!PHPSER_HAS_OOM()) {
@@ -168,6 +197,10 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
             php_error_docref(NULL, E_WARNING,
                 "phpser: $_SESSION not serialized — nesting depth exceeds %d",
                 MAX_DEPTH);
+            break;
+        case PHPSER_ENC_STACK:
+            php_error_docref(NULL, E_WARNING,
+                "phpser: $_SESSION not serialized — nesting exhausted the C stack");
             break;
         default:
             php_error_docref(NULL, E_WARNING,

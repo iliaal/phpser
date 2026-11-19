@@ -513,6 +513,19 @@ whether registration succeeded.
   shipping a truncated payload. Object cycles go through the id table and
   don't count against the cap; only genuinely deep trees hit it. Cache
   workloads typically nest 5-10 deep.
+- **A small thread stack can stop nesting before 512 levels.** On PHP 8.3
+  and later, encode and decode check the remaining C stack against
+  `zend.max_allowed_stack_size` once nesting passes 32 levels. When the
+  stack runs low, encode throws the engine's "Maximum call stack size"
+  `Error` and decode rejects the payload as it rejects over-deep input. The
+  check also covers `__serialize()` methods that call `phpser_serialize()`
+  again, where each nested call starts its own 512-level count. 512 levels
+  need about 256 KiB of C stack on a release build of PHP and about 512 KiB
+  on a debug build. glibc threads default to the stack rlimit, usually
+  8 MiB, but musl threads default to 128 KiB. If you build FrankenPHP or
+  another threaded SAPI against musl, link it with a larger default thread
+  stack, such as `-Wl,-z,stack-size=0x100000` (1 MiB), to keep the full 512
+  levels.
 - **Non-serializable objects throw on encode**, matching native `serialize()`.
   This includes `Closure`, `Generator`, `Fiber`, `WeakMap`, `WeakReference`,
   and other classes marked not serializable. The entire encode fails even

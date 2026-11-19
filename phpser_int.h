@@ -97,8 +97,8 @@ phpser_keyed_rc phpser_keyed_decode(const char *buf, size_t buf_len, const zend_
                                     const char *context, size_t context_len, zval *out,
                                     int allowed_mode, HashTable *allowed_set);
 
-/* Wipes the calling thread's cached derived subkey. Call from MSHUTDOWN.
- * (phpser_api.c) */
+/* Wipes the calling thread's cached derived subkey. Call from MSHUTDOWN and
+ * GSHUTDOWN. (phpser_api.c) */
 void phpser_api_mshutdown(void);
 
 /* MINFO strings. (phpser_api.c) */
@@ -112,6 +112,11 @@ void phpser_apcu_minit(bool persistent);
 
 /* Bound C-stack use on deeply nested input, including ASAN builds. */
 #define MAX_DEPTH 512
+
+/* Nesting below this depth skips the C-stack check, which costs a TLS lookup
+ * per value. The levels it skips fit in zend.reserved_stack_size (at least
+ * 32 KiB), and the VM checks the stack before each userland frame. */
+#define PHPSER_STACK_CHECK_DEPTH 32
 
 /* allowed_classes filter modes for phpser_decode_buf_opts. */
 enum {
@@ -127,7 +132,21 @@ typedef enum {
     PHPSER_ENC_DEPTH,
     PHPSER_ENC_SIZE,
     PHPSER_ENC_EXCEPTION,
+    PHPSER_ENC_STACK,
 } phpser_enc_status;
+
+#ifdef ZEND_CHECK_STACK_LIMIT
+/* Lets the session handler recognize the stack-size Error a nested
+ * phpser_serialize() raised from a hook. Pair every track with an untrack,
+ * including on bailout; untrack returns whether EG(exception) is that Error.
+ * (phpser.c) */
+typedef struct {
+    bool tracking;
+    zend_object *raised;
+} phpser_stack_track;
+void phpser_stack_error_track(phpser_stack_track *saved);
+bool phpser_stack_error_untrack(const phpser_stack_track *saved);
+#endif
 
 /* Cached at MINIT (defined in phpser_hmac.c). ext/hash is always present, but
  * callers still null-check. */
@@ -142,8 +161,7 @@ int phpser_hmac_sha256(
     unsigned char out[PHPSER_HMAC_TAG_LEN]);
 
 /* Wipes the calling thread's cached HMAC key midstates. Call from
- * MSHUTDOWN; ZTS worker threads that exit earlier release theirs unwiped.
- * (phpser_hmac.c) */
+ * MSHUTDOWN and GSHUTDOWN. (phpser_hmac.c) */
 void phpser_hmac_mshutdown(void);
 
 /* SHA-256 backend the HMAC selects on this CPU: "armv8", "sha-ni", or
