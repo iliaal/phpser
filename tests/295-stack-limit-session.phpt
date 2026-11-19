@@ -47,6 +47,21 @@ $leaf = 1;
 for ($h = 0; $h < 20; $h++) { $leaf = new Hop($leaf); }
 $_SESSION = ['hops' => $leaf];
 var_dump(session_encode());
+
+// An Error the application throws with the same message is not a stack
+// failure and propagates unchanged.
+class Fake {
+    public function __serialize(): array {
+        throw new Error("Maximum call stack size of 1 bytes (zend.max_allowed_stack_size - zend.reserved_stack_size) reached. Infinite recursion?");
+    }
+    public function __unserialize(array $data): void {}
+}
+$_SESSION = ['fake' => new Fake];
+try {
+    var_dump(session_encode());
+} catch (Error $e) {
+    echo get_class($e), ": ", $e->getMessage(), "\n";
+}
 $_SESSION = [];
 session_write_close();
 echo "DONE\n";
@@ -57,4 +72,7 @@ string(29) "phpser:session-not-serialized"
 
 Warning: session_encode(): phpser: $_SESSION not serialized — nesting exhausted the C stack in %s on line %d
 string(29) "phpser:session-not-serialized"
+
+Warning: session_encode(): phpser: $_SESSION not serialized — an exception was thrown during serialization in %s on line %d
+Error: Maximum call stack size of 1 bytes (zend.max_allowed_stack_size - zend.reserved_stack_size) reached. Infinite recursion?
 DONE

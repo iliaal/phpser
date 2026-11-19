@@ -4652,6 +4652,39 @@ static zend_never_inline ZEND_COLD void phpser_stack_size_error(void) {
 # define phpser_stack_size_error() zend_call_stack_size_error()
 #endif
 
+#ifdef ZEND_CHECK_STACK_LIMIT
+/* Set while the session handler encodes; holds a reference to the last
+ * stack-size Error a nested encode raised, so the handler can tell it from a
+ * user-thrown Error with the same message. */
+ZEND_TLS bool stack_error_tracking;
+ZEND_TLS zend_object *stack_error_raised;
+
+void phpser_stack_error_track(phpser_stack_track *saved) {
+    saved->tracking = stack_error_tracking;
+    saved->raised = stack_error_raised;
+    stack_error_tracking = true;
+    stack_error_raised = NULL;
+}
+
+bool phpser_stack_error_untrack(const phpser_stack_track *saved) {
+    zend_object *raised = stack_error_raised;
+    bool ours = raised && EG(exception) == raised;
+    if (raised) OBJ_RELEASE(raised);
+    stack_error_tracking = saved->tracking;
+    stack_error_raised = saved->raised;
+    return ours;
+}
+
+static void phpser_raise_stack_error(void) {
+    phpser_stack_size_error();
+    if (stack_error_tracking && EG(exception)) {
+        if (stack_error_raised) OBJ_RELEASE(stack_error_raised);
+        stack_error_raised = EG(exception);
+        GC_ADDREF(stack_error_raised);
+    }
+}
+#endif
+
 /* Shared cleanup for depth/size/stack rejects: free body, destroy ctx (which can
  * run destructors), reclassify as EXCEPTION if cleanup threw, optionally
  * raise the userland exception. */
@@ -4670,7 +4703,7 @@ static zend_string *enc_finish_overflow(
     if (throw_on_overflow) {
         if (kind == PHPSER_ENC_STACK) {
 #ifdef ZEND_CHECK_STACK_LIMIT
-            phpser_stack_size_error();
+            phpser_raise_stack_error();
 #endif
         } else if (kind == PHPSER_ENC_DEPTH) {
             zend_throw_exception_ex(zend_ce_exception, 0,

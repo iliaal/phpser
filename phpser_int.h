@@ -135,6 +135,19 @@ typedef enum {
     PHPSER_ENC_STACK,
 } phpser_enc_status;
 
+#ifdef ZEND_CHECK_STACK_LIMIT
+/* Lets the session handler recognize the stack-size Error a nested
+ * phpser_serialize() raised from a hook. Pair every track with an untrack,
+ * including on bailout; untrack returns whether EG(exception) is that Error.
+ * (phpser.c) */
+typedef struct {
+    bool tracking;
+    zend_object *raised;
+} phpser_stack_track;
+void phpser_stack_error_track(phpser_stack_track *saved);
+bool phpser_stack_error_untrack(const phpser_stack_track *saved);
+#endif
+
 /* Cached at MINIT (defined in phpser_hmac.c). ext/hash is always present, but
  * callers still null-check. */
 extern const php_hash_ops *phpser_sha256_ops;
