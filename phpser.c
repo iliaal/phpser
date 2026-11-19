@@ -1170,6 +1170,10 @@ static zend_never_inline void enc_encode_sleep_object(
     int declared_only = -1;
     zval *zv_name;
     ZEND_HASH_FOREACH_VAL_IND(names_ht, zv_name) {
+        if (UNEXPECTED(PHPSER_HAS_OOM())) {
+            e->failed = 1;
+            break;
+        }
         ZVAL_DEREF(zv_name);
         if (Z_TYPE_P(zv_name) != IS_STRING) {
             php_error_docref(NULL, E_WARNING,
@@ -1245,7 +1249,10 @@ static zend_never_inline void enc_encode_sleep_object(
     smart_str_appendc(body, TAG_OBJECT);
     varint_write_u64(body, class_idx);
     varint_write_u64(body, nprops);
-    for (uint32_t i = 0; i < nprops; i++) {
+    /* The frame is discarded once encoding fails, so skip the remaining
+     * names: interning them all after a pending memory_limit error can pass
+     * the hard limit. */
+    for (uint32_t i = 0; i < nprops && !e->failed; i++) {
         varint_write_u64(body, enc_intern_zstr(e, snap_keys[i]));
         encode_value_ex(body, e, &snap_vals[i], ENC_RCN | ENC_BORROWED);
     }
@@ -1650,7 +1657,10 @@ static void encode_value_inner(smart_str *body, encode_ctx *e, zval *v,
             if (props) {
                 Bucket *b = props->arData;
                 Bucket *end = b + props->nNumUsed;
-                for (; b < end; b++) {
+                /* The frame is discarded once encoding fails; interning the
+                 * remaining names after a pending memory_limit error can pass
+                 * the hard limit. */
+                for (; b < end && !e->failed; b++) {
                     zval *pv = enc_obj_prop_val(b);
                     if (!pv) continue;
                     if (skip_magic && b->key
