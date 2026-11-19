@@ -156,18 +156,22 @@ jobs:
           export TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
           php run-tests.php --show-diff -g FAIL,BORK,LEAK,XLEAK tests/
 
-  # setup-php's '8.6' tracks php-src master, so build the PHP-8.6 branch
-  # directly. Release-mode (non-debug) to mirror the setup-php lanes.
+  # setup-php still serves '8.6' as a nightly build, so build the
+  # checksum-pinned php.net release tarball instead. Release-mode (non-debug)
+  # to mirror the setup-php lanes.
   linux-src:
-    name: PHP ${{ matrix.php }} - Linux (PHP-${{ matrix.php }} branch)
+    name: PHP ${{ matrix.php-release }} - Linux (php.net release)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        php: ['8.6']
+        include:
+          - php-release: '8.6.0'
+            php-release-sha256: 5f84beaa3d763aee1e4feed99bf54ec692c383b322e25626807b589238c3a087
 
     env:
-      PHP_VERSION: ${{ matrix.php }}
+      PHP_RELEASE: ${{ matrix.php-release }}
+      PHP_RELEASE_SHA256: ${{ matrix.php-release-sha256 }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -175,13 +179,16 @@ jobs:
           persist-credentials: false
 
       - name: Install dependencies
-        run: sudo apt-get update && sudo apt-get install -y re2c bison autoconf
+        run: sudo apt-get update && sudo apt-get install -y autoconf
 
-      - name: Build PHP from source
+      - name: Build PHP from the release tarball
         run: |
-          git clone --depth=1 --branch="PHP-${PHP_VERSION}" https://github.com/php/php-src.git /tmp/php-src
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/php-src.tar.xz "https://www.php.net/distributions/php-${PHP_RELEASE}.tar.xz"
+          echo "${PHP_RELEASE_SHA256}  /tmp/php-src.tar.xz" | sha256sum -c -
+          mkdir /tmp/php-src
+          tar -xJf /tmp/php-src.tar.xz -C /tmp/php-src --strip-components=1
           cd /tmp/php-src
-          ./buildconf --force
           ./configure \
             --disable-debug \
             --disable-zts \
@@ -233,7 +240,7 @@ jobs:
   linux-zts-canary:
     name: PHP 8.4 ZTS Linux (canary)
     runs-on: ubuntu-latest
-    # ZTS build canary (Linux/macOS prebuilts are NTS only). Tests also
+    # ZTS build canary (Linux/macOS prebuilts are NTS except Linux 8.6). Tests also
     # smoke-check the TLS-cache-update wiring on shared builds.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -309,7 +316,7 @@ jobs:
       - id: matrix
         uses: php/php-windows-builder/extension-matrix@29352c0ef9e8ce65264ea9e287881a6f7758a953 # 1.9.0
         with:
-          php-version-list: '8.2, 8.3, 8.4, 8.5'
+          php-version-list: '8.2, 8.3, 8.4, 8.5, 8.6'
 
   windows:
     name: Windows ${{ matrix.php-version }} ${{ matrix.ts }} ${{ matrix.arch }}

@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- PHP 8.6 prebuilt binaries, built against PHP 8.6.0: Windows (TS/NTS, x86 and x64), macOS arm64 (NTS), and Linux glibc x86_64 and arm64 (ZTS only, matching the official 8.6 Docker images; NTS PHP 8.6 on Linux builds from source).
+
 ### Changed
 
 - `phpser_serialize()`, `phpser_serialize_signed()` and `phpser_serialize_keyed()` write a top-level null, bool, int, float, or string of at most 4 GiB straight into the result, without the encoder's string cache, dictionary or intermediate body buffer. On Linux x86-64 (GCC 14), the `bench.php --extended` `string_15` and `int_single` shapes take 52-56% less encode time, a 4 KiB string 55% less and a 1 MiB string 91% less; signed encodes of the same small values take 7-17% less. Arrays, objects, references and strings over 4 GiB take the general path as before. Wire output and decoded values are unchanged.

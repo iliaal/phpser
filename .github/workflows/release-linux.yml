@@ -2,14 +2,15 @@ name: Release Linux & macOS binaries
 
 # Triggered when a GitHub Release is published. Builds .so binaries for
 # Linux glibc (x86_64 + arm64) and macOS (arm64) at the PHP versions in
-# the matrix (NTS only; ZTS lives in the Windows lane), gates each one, then
-# uploads all of them as release assets using PIE's pre-packaged-binary
-# naming convention (php_phpser-<tag>_php<x.y>-<arch>-<os>-<libc>.zip).
+# the matrix (NTS, except the ZTS Linux PHP 8.6 binary noted at its matrix
+# entry), gates each one, then uploads all of them as release assets using
+# PIE's pre-packaged-binary naming convention
+# (php_phpser-<tag>_php<x.y>-<arch>-<os>-<libc>[-zts].zip).
 #
 # Each binary compiles against a pinned NEWEST patch release of its PHP
-# minor (8.4.27, 8.5.12), so it carries the memory_limit stop behind
+# minor (8.4.27, 8.5.12, 8.6.0), so it carries the memory_limit stop behind
 # ZEND_HAS_OOM. Those headers make the module import symbols that earlier
-# patches do not export, so the binaries require 8.4.27+ / 8.5.12+. On an
+# patches do not export, so the binaries require 8.4.27+ / 8.5.12+ / 8.6.0+. On an
 # older patch the extension refuses to start with a warning (MINIT compares
 # php_version_id() against the build's PHP_VERSION_ID) instead of dying
 # with "undefined symbol" on first use. Linux builds inside the
@@ -22,8 +23,11 @@ name: Release Linux & macOS binaries
 # symbol a Linux .so imports must be exported by that patch's php binary or
 # a library loaded with it, and a Linux .so must refuse to start, not crash,
 # on the oldest patch of its minor (PHP 8.4.0 was never released, so 8.4.1
-# is the oldest 8.4 patch). The upload job runs only after every build
-# passes, so a failed gate attaches no Linux or macOS asset.
+# is the oldest 8.4 patch). While the build patch is the first release of
+# its minor (8.6.0), no older patch exists and that gate is skipped; a
+# matrix entry whose build patch is not X.Y.0 must name an oldest image.
+# The upload job runs only after every build passes, so a failed gate
+# attaches no Linux or macOS asset.
 #
 # macOS Intel (macos-13) is absent: GitHub's Intel runner pool queues 30+
 # min on busy days, and macOS 26 drops Intel. Linux musl (Alpine) is absent
@@ -81,7 +85,7 @@ jobs:
         os:
           - ubuntu-24.04
           - ubuntu-24.04-arm
-        php: ['8.4', '8.5']
+        php: ['8.4', '8.5', '8.6']
         include:
           # Official Docker images, digest-pinned. The newest-patch image
           # produces the shipped binary and sets its PHP floor; bumping it
@@ -93,6 +97,11 @@ jobs:
           - php: '8.5'
             oldest-image: php:8.5.0-cli-bookworm@sha256:4ff93cd1b053c4d5ff468ced40962092a350a8c86798fee96e807bc9b383ec75
             newest-image: php:8.5.12-cli-bookworm@sha256:104890ada56869090c9cd0ec709fe205834d3e383b46d9995dc16cd6388a9302
+          # The official images build only ZTS from 8.6 on
+          # (docker-library/php#1686), so the Linux 8.6 binary is ZTS while
+          # the other Linux binaries and every macOS binary are NTS.
+          - php: '8.6'
+            newest-image: php:8.6.0-cli-bookworm@sha256:77741fea2130560b85dd3ac693140ce09424ad9df46da1203a5a896e15b44874
     env:
       OLDEST: ${{ matrix.oldest-image }}
       NEWEST: ${{ matrix.newest-image }}
@@ -129,7 +138,12 @@ jobs:
               sleep "$delay"
             done
           }
-          pull OLDEST_IMAGE "$OLDEST"
+          if [ -n "$OLDEST" ]; then
+            pull OLDEST_IMAGE "$OLDEST"
+          elif [[ "$NEWEST" != php:*.*.0-* ]]; then
+            echo "::error::no oldest-patch image for $NEWEST"
+            exit 1
+          fi
           pull NEWEST_IMAGE "$NEWEST"
 
       - name: Build against the newest patch and check its imports
@@ -179,6 +193,10 @@ jobs:
           if [ "$rc" -ne 0 ] || printf '%s\n' "$out" | grep -qi 'undefined symbol'; then
             echo "::error::phpser.so failed on $NEWEST_IMAGE (exit $rc)"
             status=1
+          fi
+          if [ -z "${OLDEST_IMAGE:-}" ]; then
+            echo "$NEWEST_IMAGE is the first patch of its minor; no older patch to refuse"
+            exit "$status"
           fi
           echo "::group::$OLDEST_IMAGE"
           run "$OLDEST_IMAGE"
@@ -238,6 +256,9 @@ jobs:
           - php: '8.5'
             newest: '8.5.12'
             newest-sha256: 08bc2eba2a588654ade1357174aa646b761556c862dda0678345ee29ed481209
+          - php: '8.6'
+            newest: '8.6.0'
+            newest-sha256: 5f84beaa3d763aee1e4feed99bf54ec692c383b322e25626807b589238c3a087
     env:
       MACOSX_DEPLOYMENT_TARGET: '14.0'
       NEWEST: ${{ matrix.newest }}

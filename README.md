@@ -28,8 +28,10 @@ Rowsets keep the pointer-equality fast path for shared strings, while columnar e
 pie install iliaal/phpser
 ```
 
-On Linux glibc (x86_64, arm64) and macOS arm64 with PHP 8.4 or 8.5, PIE
-installs a prebuilt binary. Those binaries require PHP 8.4.27+ or 8.5.12+;
+On Linux glibc (x86_64, arm64) and macOS arm64 with PHP 8.4, 8.5, or 8.6, PIE
+installs a prebuilt binary. The Linux PHP 8.6 binary is ZTS, matching the
+official 8.6 Docker images; NTS PHP 8.6 on Linux builds from source. The
+binaries require PHP 8.4.27+ or 8.5.12+ (any 8.6 release works);
 on an earlier patch the extension refuses to start with a warning, so build
 from source there.
 
@@ -75,8 +77,8 @@ the configuration for the SAPI you use and restart that service.
 
 ### Pre-built binaries
 
-Pre-built `.dll`s for Windows (PHP 8.2-8.5, TS/NTS, x86 and x64) and `.so`s for
-Linux glibc (x86_64, arm64) and macOS arm64 (PHP 8.4-8.5) are attached
+Pre-built `.dll`s for Windows (PHP 8.2-8.6, TS/NTS, x86 and x64) and `.so`s for
+Linux glibc (x86_64, arm64) and macOS arm64 (PHP 8.4-8.6) are attached
 to each [GitHub release](https://github.com/iliaal/phpser/releases). PIE
 fetches the matching binary automatically and builds from source when no
 asset matches.
@@ -270,7 +272,7 @@ phpser.
 - **Signed sessions**: `phpser.session_key` turns on HMAC-SHA256 signing for the session handler. The tag is bound to the session ID, so a forged, corrupted, or copied-from-another-session blob fails verification and is never decoded. One INI line next to `session.serialize_handler = phpser`, no code changes. It does not stop rollback to an older blob signed for the same ID, so keep authorization state outside the session.
 - **APCu serializer and keyed signing**: `apc.serializer = phpser` stores APCu arrays and objects as phpser frames. Set `phpser.key` and the values APCu serializes carry an HMAC-SHA256 tag bound to the key and the `apcu` context, verified before decoding, so one FPM pool cannot make another pool's `apcu_fetch()` instantiate objects. Scalars are not signed. `phpser_serialize_keyed()` / `phpser_unserialize_keyed()` apply the same key to Redis, memcached, or any other store, and `php_phpser_api.h` exposes it to other extensions.
 - **Untrusted input limits**: all three userland unserialize entry points take `allowed_classes` in the same shape as native `unserialize()`: `false` rejects all classes, an array allowlists specific ones, `true` is the default. Disallowed classes decode as `__PHP_Incomplete_Class` with the original name preserved and are never instantiated. Recursion depth is capped at 512 on encode (throws) and decode (`null` for unsigned decoding, an exception for signed or keyed decoding). Duplicate assoc keys collapse to last-write-wins instead of phantom buckets. Wire-controlled key comparisons and collision chains consume bounded work budgets. TABLE/ROWSET rows and fallback object-property copies have a separate materialization budget. Exhausting a budget rejects the frame; these limits do not bound autoloaders or application hooks. See [SECURITY.md](SECURITY.md) for exact limits and class-resolution costs.
-- **Supported versions**: PHP 8.2+ (8.3, 8.4, 8.5, master). BSD 3-Clause.
+- **Supported versions**: PHP 8.2+ (8.3, 8.4, 8.5, 8.6, master). BSD 3-Clause.
 
 ## Bench (PHP 8.4.25 aarch64, idle box, 1000 iters, median of 35)
 
