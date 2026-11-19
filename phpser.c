@@ -4644,11 +4644,76 @@ static uint32_t enc_wrapped_elems(HashTable *ht) {
     return total > UINT32_MAX ? UINT32_MAX : (uint32_t)total;
 }
 
+/* A top-level scalar needs no string cache, dictionary or body buffer: its
+ * frame is the version byte, a zero dictionary count and the bytes
+ * encode_value_inner emits for the value, written straight into the result.
+ * Returns NULL without side effects for everything else, including a string
+ * over the 4 GiB wire limit; the general path then produces the same error it
+ * always did. */
+static zend_string *enc_scalar_frame(zval *value, size_t tail_reserve) {
+    char head[3 + VARINT_MAX_BYTES];
+    size_t n = 0;
+    const char *payload = NULL;
+    size_t payload_len = 0;
+    head[n++] = PHPSER_VERSION;
+    head[n++] = 0;
+    switch (Z_TYPE_P(value)) {
+        case IS_NULL:
+            head[n++] = TAG_NULL;
+            break;
+        case IS_FALSE:
+            head[n++] = TAG_FALSE;
+            break;
+        case IS_TRUE:
+            head[n++] = TAG_TRUE;
+            break;
+        case IS_LONG:
+            head[n++] = TAG_LONG;
+            n = varint_put(head, n, zigzag_encode64(Z_LVAL_P(value)));
+            break;
+        case IS_DOUBLE:
+            head[n++] = TAG_DOUBLE;
+            n = le64_put(head, n, Z_DVAL_P(value));
+            break;
+        case IS_STRING:
+            payload_len = Z_STRLEN_P(value);
+            if (payload_len > UINT32_MAX) return NULL;
+            payload = Z_STRVAL_P(value);
+            head[n++] = TAG_STR_INLINE;
+            n = varint_put(head, n, payload_len);
+            break;
+        default:
+            return NULL;
+    }
+    size_t frame_len = n + payload_len;
+    if (UNEXPECTED(tail_reserve > SIZE_MAX - 4096
+                   || frame_len > SIZE_MAX - 4096 - tail_reserve)) {
+        return NULL;
+    }
+    zend_string *res = zend_string_alloc(frame_len + tail_reserve, 0);
+    memcpy(ZSTR_VAL(res), head, n);
+    if (payload_len) memcpy(ZSTR_VAL(res) + n, payload, payload_len);
+    ZSTR_VAL(res)[frame_len] = '\0';
+    ZSTR_LEN(res) = frame_len;
+    return res;
+}
+
 zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
                                    phpser_enc_status *status, size_t tail_reserve) {
+    if (status) *status = PHPSER_ENC_OK;
+    /* Scalars skip the encoder context; see enc_scalar_frame. */
+    zend_string *scalar = enc_scalar_frame(value, tail_reserve);
+    if (scalar) {
+        /* As below, the frame allocation can queue the memory_limit error. */
+        if (UNEXPECTED(PHPSER_HAS_OOM())) {
+            zend_string_release(scalar);
+            if (status) *status = PHPSER_ENC_EXCEPTION;
+            return NULL;
+        }
+        return scalar;
+    }
     encode_ctx ctx;
     enc_ctx_init(&ctx);
-    if (status) *status = PHPSER_ENC_OK;
 
     smart_str body = {0};
     /* Estimate 16 bytes per top-level array element, capped at 256 KB to bound
