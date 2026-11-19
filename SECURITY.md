@@ -117,16 +117,19 @@ signed call skips two SHA-256 compressions. The cache holds the most recent
 signing key (raw bytes for keys up to 64 bytes, otherwise their SHA-256
 digest) and the key-derived HMAC inner and outer states, in thread-local
 memory. A different key overwrites the entry in place, and module shutdown
-wipes it; a ZTS worker thread that exits before module shutdown frees its
-copy without wiping it. The lookup compares the full 64-byte key block in
+wipes it. A ZTS worker thread released through `ts_free_thread()`, as
+threaded SAPIs do when a thread exits, wipes its own copy first; a thread
+that exits without that call frees its copy without wiping it. The lookup compares the full 64-byte key block in
 constant time, so timing reveals only whether the key matches the thread's
 previous key. Keyed signing (`phpser.key`) also caches, per thread, the
 most recent key of up to 128 bytes, its context, and the subkey derived
 from them. A miss wipes the whole entry before it is replaced, including
 when the new key is too long to cache; a keyed call that finds `phpser.key`
-unset or short wipes it too. The key compare runs in constant time. Module shutdown wipes only the shutting-down thread's
-copies of both caches; under ZTS, other worker threads' copies are freed
-without being wiped.
+unset or short wipes it too. The key compare runs in constant time. Module
+shutdown wipes the shutting-down thread's copies of both caches, and
+`ts_free_thread()` wipes the exiting thread's copies; under ZTS, a worker
+thread that exits without `ts_free_thread()` frees its copies without
+wiping them.
 
 **Session handler.** When built against the session extension, phpser
 registers `session.serialize_handler = phpser`. Unless

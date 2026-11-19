@@ -373,6 +373,30 @@ PHP_INI_END()
 static bool phpser_session_registered = false;
 #endif
 
+/* The struct exists for its GINIT hook: TSRM runs GINIT on every new thread
+ * before any module's RINIT, and ext/session's RINIT (session.auto_start)
+ * decodes through phpser before phpser's own RINIT runs on that thread. */
+ZEND_BEGIN_MODULE_GLOBALS(phpser)
+    bool unused;
+ZEND_END_MODULE_GLOBALS(phpser)
+
+ZEND_DECLARE_MODULE_GLOBALS(phpser)
+
+static PHP_GINIT_FUNCTION(phpser) {
+#if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
+    ZEND_TSRMLS_CACHE_UPDATE();
+#endif
+    phpser_globals->unused = false;
+}
+
+/* TSRM runs GSHUTDOWN on the exiting thread from ts_free_thread(), so the
+ * per-thread key caches are wiped before their TLS block is released. */
+static PHP_GSHUTDOWN_FUNCTION(phpser) {
+    (void) phpser_globals;
+    phpser_hmac_mshutdown();
+    phpser_api_mshutdown();
+}
+
 static PHP_MINIT_FUNCTION(phpser) {
 #if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
     /* Initialize TLS for shared ZTS builds. phpize defines COMPILE_DL_PHPSER;
@@ -476,7 +500,11 @@ zend_module_entry phpser_module_entry = {
 #endif
     PHP_MINFO(phpser),
     PHP_PHPSER_VERSION,
-    STANDARD_MODULE_PROPERTIES,
+    PHP_MODULE_GLOBALS(phpser),
+    PHP_GINIT(phpser),
+    PHP_GSHUTDOWN(phpser),
+    NULL,
+    STANDARD_MODULE_PROPERTIES_EX,
 };
 
 #if defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)

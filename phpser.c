@@ -341,6 +341,7 @@ typedef struct {
     /* A depth placeholder keeps the body well-formed but makes the frame
      * lossy; the caller must discard it. */
     uint8_t depth_exceeded;
+    uint8_t stack_exhausted;
     /* Reject strings beyond the decoder's UINT32_MAX limit during encode. */
     uint8_t size_exceeded;
     /* An encode exception invalidates the entire frame, including session saves. */
@@ -363,6 +364,7 @@ static void enc_ctx_init(encode_ctx *e) {
     e->dict_cap = 0;
     e->depth = 0;
     e->depth_exceeded = 0;
+    e->stack_exhausted = 0;
     e->size_exceeded = 0;
     e->failed = 0;
     e->wire_v2 = 0;
@@ -931,6 +933,7 @@ static void encode_value(smart_str *body, encode_ctx *e, zval *v) {
     encode_value_ex(body, e, v, 0);
 }
 
+
 static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
                             uint32_t flags) {
     /* After encoding fails, placeholders preserve container counts until the
@@ -952,6 +955,17 @@ static void encode_value_ex(smart_str *body, encode_ctx *e, zval *v,
         smart_str_appendc(body, TAG_NULL);
         return;
     }
+#ifdef ZEND_CHECK_STACK_LIMIT
+    /* MAX_DEPTH levels need about 250 KiB of C stack on release builds, more
+     * than a musl thread's 128 KiB default. */
+    if (UNEXPECTED(e->depth >= PHPSER_STACK_CHECK_DEPTH)
+        && UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
+        e->stack_exhausted = 1;
+        e->failed = 1;
+        smart_str_appendc(body, TAG_NULL);
+        return;
+    }
+#endif
     e->depth++;
     encode_value_inner(body, e, v, flags);
     e->depth--;
@@ -3563,6 +3577,15 @@ static int decode_value(decode_ctx *d, zval *out) {
         ZVAL_UNDEF(out);
         return -1;
     }
+#ifdef ZEND_CHECK_STACK_LIMIT
+    /* Rejected like over-deep input: the remaining C stack, not MAX_DEPTH,
+     * is the binding limit on small thread stacks. */
+    if (UNEXPECTED(d->depth >= PHPSER_STACK_CHECK_DEPTH)
+        && UNEXPECTED(zend_call_stack_overflowed(EG(stack_limit)))) {
+        ZVAL_UNDEF(out);
+        return -1;
+    }
+#endif
     d->depth++;
     int rc = decode_value_inner(d, out);
     d->depth--;
@@ -4595,7 +4618,20 @@ static zend_string **dec_read_schema_keys(decode_ctx *d, uint64_t nkeys) {
     return keys;
 }
 
-/* Shared cleanup for depth/size rejects: free body, destroy ctx (which can
+#if defined(ZEND_CHECK_STACK_LIMIT) && PHP_VERSION_ID < 80400
+/* PHP 8.3 keeps zend_call_stack_size_error() static; this throws the same
+ * Error. */
+static zend_never_inline ZEND_COLD void phpser_stack_size_error(void) {
+    zend_throw_error(NULL, "Maximum call stack size of %zu bytes "
+        "(zend.max_allowed_stack_size - zend.reserved_stack_size) reached. "
+        "Infinite recursion?",
+        (size_t) ((uintptr_t) EG(stack_base) - (uintptr_t) EG(stack_limit)));
+}
+#elif defined(ZEND_CHECK_STACK_LIMIT)
+# define phpser_stack_size_error() zend_call_stack_size_error()
+#endif
+
+/* Shared cleanup for depth/size/stack rejects: free body, destroy ctx (which can
  * run destructors), reclassify as EXCEPTION if cleanup threw, optionally
  * raise the userland exception. */
 static zend_string *enc_finish_overflow(
@@ -4611,7 +4647,11 @@ static zend_string *enc_finish_overflow(
         return NULL;
     }
     if (throw_on_overflow) {
-        if (kind == PHPSER_ENC_DEPTH) {
+        if (kind == PHPSER_ENC_STACK) {
+#ifdef ZEND_CHECK_STACK_LIMIT
+            phpser_stack_size_error();
+#endif
+        } else if (kind == PHPSER_ENC_DEPTH) {
             zend_throw_exception_ex(zend_ce_exception, 0,
                 "phpser: maximum nesting depth (%d) exceeded", MAX_DEPTH);
         } else {
@@ -4754,6 +4794,12 @@ zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
     smart_str_alloc(&body, body_estimate, 0);
     encode_value(&body, &ctx, value);
 
+    /* Running out of C stack aborts the walk like a failure, but reports like
+     * the depth cap: the session handler has no frame to throw into. */
+    if (UNEXPECTED(ctx.stack_exhausted && !EG(exception) && !PHPSER_HAS_OOM())) {
+        return enc_finish_overflow(
+            &body, &ctx, throw_on_overflow, status, PHPSER_ENC_STACK);
+    }
     /* An unsupported object or a throwing serialization hook failed mid-walk.
      * Never hand back the truncated frame (it has a TAG_NULL hole where the
      * throwing object was); the exception stays pending for the caller. Check

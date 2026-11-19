@@ -169,6 +169,10 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
                 "phpser: $_SESSION not serialized — nesting depth exceeds %d",
                 MAX_DEPTH);
             break;
+        case PHPSER_ENC_STACK:
+            php_error_docref(NULL, E_WARNING,
+                "phpser: $_SESSION not serialized — nesting exhausted the C stack");
+            break;
         default:
             php_error_docref(NULL, E_WARNING,
                 "phpser: $_SESSION not serialized — encoding failed");
