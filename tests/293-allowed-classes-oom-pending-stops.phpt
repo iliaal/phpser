@@ -12,6 +12,12 @@ phpser
 --SKIPIF--
 <?php
 if (getenv('USE_ZEND_ALLOC') === '0' && getenv('USE_TRACKED_ALLOC') !== '1') die('skip memory_limit requires Zend allocator');
+// Older patch releases bail out of the allocation, so the hard limit the test
+// guards against does not exist there.
+$v = PHP_VERSION_ID;
+if ($v < 80235 || ($v >= 80300 && $v < 80336) || ($v >= 80400 && $v < 80427) || ($v >= 80500 && $v < 80512)) {
+    die('skip memory_limit errors are not deferred before PHP 8.2.35, 8.3.36, 8.4.27 and 8.5.12');
+}
 ?>
 --INI--
 memory_limit=1G

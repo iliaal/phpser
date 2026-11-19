@@ -5,6 +5,10 @@ phpser
 --SKIPIF--
 <?php
 if (PHP_VERSION_ID < 80300) die("skip zend.max_allowed_stack_size needs PHP 8.3+");
+// Engines built without ZEND_CHECK_STACK_LIMIT never raise the stack Error.
+$probe = 'function f($x) { return array_map("f", [$x]); } try { f(1); } catch (Error $e) { echo str_contains($e->getMessage(), "Maximum call stack size") ? "ok" : "other"; }';
+$out = shell_exec(escapeshellarg(getenv('TEST_PHP_EXECUTABLE')) . ' -n -r ' . escapeshellarg($probe) . ' 2>&1');
+if ($out !== 'ok') die("skip no C-stack limit Error on this build");
 ?>
 --FILE--
 <?php

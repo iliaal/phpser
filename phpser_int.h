@@ -115,7 +115,7 @@ void phpser_apcu_minit(bool persistent);
 
 /* Nesting below this depth skips the C-stack check, which costs a TLS lookup
  * per value. The levels it skips fit in zend.reserved_stack_size (at least
- * 48 KiB), and the VM checks the stack before each userland frame. */
+ * 32 KiB), and the VM checks the stack before each userland frame. */
 #define PHPSER_STACK_CHECK_DEPTH 32
 
 /* allowed_classes filter modes for phpser_decode_buf_opts. */

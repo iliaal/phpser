@@ -5,9 +5,11 @@ phpser
 --SKIPIF--
 <?php
 if (PHP_VERSION_ID < 80300) die("skip zend.max_allowed_stack_size needs PHP 8.3+");
-// Sanitizer builds reserve more than 128K, leaving no usable stack at all.
-$probe = shell_exec(escapeshellarg(getenv('TEST_PHP_EXECUTABLE')) . ' -n -d zend.max_allowed_stack_size=128K -r "echo 1;" 2>&1');
-if ($probe !== '1') die("skip zend.reserved_stack_size exceeds 128K on this build");
+// Engines built without ZEND_CHECK_STACK_LIMIT never raise the stack Error;
+// sanitizer builds reserve more than 128K, leaving no usable stack at all.
+$probe = 'function f($x) { return array_map("f", [$x]); } try { f(1); } catch (Error $e) { echo str_contains($e->getMessage(), "Maximum call stack size") ? "ok" : "other"; }';
+$out = shell_exec(escapeshellarg(getenv('TEST_PHP_EXECUTABLE')) . ' -n -d zend.max_allowed_stack_size=128K -r ' . escapeshellarg($probe) . ' 2>&1');
+if ($out !== 'ok') die("skip no C-stack limit Error at zend.max_allowed_stack_size=128K on this build");
 ?>
 --INI--
 zend.max_allowed_stack_size=128K
