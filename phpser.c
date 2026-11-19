@@ -1693,7 +1693,8 @@ static zend_always_inline bool enc_key_is_schema_eligible(zend_string *key) {
         || !enc_key_is_numeric(key);
 }
 
-/* Return 1 when packed rows share the same string-key schema as row 0. */
+/* Return 1 when packed rows share the same string-key schema as row 0, 0 when
+ * they do not, and -1 with e->failed set when a memory_limit error is pending. */
 static int enc_match_rowset_schema(
     encode_ctx *e, zval *zp, uint32_t n_used, uint32_t **out_key_idx, uint32_t *out_ncols)
 {
@@ -1754,6 +1755,14 @@ static int enc_match_rowset_schema(
     /* Schema confirmed across every row; intern row-0's field names now. */
     uint32_t *key_idx = (uint32_t *)safe_emalloc((size_t)ncols, sizeof(uint32_t), 0);
     for (uint32_t c = 0; c < ncols; c++) {
+        /* Interning a wide schema can pass the hard limit after the
+         * memory_limit error is queued. */
+        if (UNEXPECTED(PHPSER_HAS_OOM())) {
+            efree(key_idx);
+            efree(k0);
+            e->failed = 1;
+            return -1;
+        }
         key_idx[c] = enc_intern_zstr(e, k0[c]);
     }
     efree(k0);
@@ -2016,9 +2025,11 @@ static zend_never_inline int enc_try_table(
     smart_str *body, encode_ctx *e, zval *zp, uint32_t n_used)
 {
     uint32_t ncols, *key_idx;
-    if (!enc_match_rowset_schema(e, zp, n_used, &key_idx, &ncols)) {
-        return 0;
-    }
+    int matched = enc_match_rowset_schema(e, zp, n_used, &key_idx, &ncols);
+    /* As below, a failed frame reports the table as handled so the fallback
+     * walk does not run. */
+    if (matched < 0) return 1;
+    if (!matched) return 0;
     uint64_t ncells = (uint64_t)ncols * n_used;
     if (ncells > UINT32_MAX || ncells > SIZE_MAX / sizeof(zval *)) {
         efree(key_idx);

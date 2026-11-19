@@ -17,6 +17,7 @@
  * ------------------------------------------------------------------------- */
 
 #include "phpser_int.h"
+#include "zend_exceptions.h"
 
 #ifdef HAVE_PHP_SESSION
 # include "ext/session/php_session.h"
@@ -118,6 +119,21 @@ static int phpser_session_tag(const zend_string *key, const char *frame, size_t 
     return rc;
 }
 
+#ifdef ZEND_CHECK_STACK_LIMIT
+/* A __serialize() hook that calls phpser_serialize() (or recurses through
+ * other internal calls) reports a low C stack as the engine's Error, not
+ * through the outer encode's status. */
+static bool phpser_pending_stack_error(void) {
+    zend_object *ex = EG(exception);
+    if (!ex || ex->ce != zend_ce_error) return false;
+    zval rv;
+    zval *msg = zend_read_property_ex(ex->ce, ex, ZSTR_KNOWN(ZEND_STR_MESSAGE), true, &rv);
+    static const char prefix[] = "Maximum call stack size of ";
+    return Z_TYPE_P(msg) == IS_STRING && Z_STRLEN_P(msg) >= sizeof(prefix) - 1
+        && memcmp(Z_STRVAL_P(msg), prefix, sizeof(prefix) - 1) == 0;
+}
+#endif
+
 PS_SERIALIZER_ENCODE_FUNC(phpser) {
     /* PS(http_session_vars) is the $_SESSION zval reference. Deref before
      * encoding so the wire format stores a plain array, not IS_REFERENCE. */
@@ -157,6 +173,16 @@ PS_SERIALIZER_ENCODE_FUNC(phpser) {
                 "wire-format limit");
             break;
         case PHPSER_ENC_EXCEPTION:
+#ifdef ZEND_CHECK_STACK_LIMIT
+            /* Treated like the outer encode running out of stack, so neither
+             * save path persists an empty session. */
+            if (!PHPSER_HAS_OOM() && phpser_pending_stack_error()) {
+                zend_clear_exception();
+                php_error_docref(NULL, E_WARNING,
+                    "phpser: $_SESSION not serialized — nesting exhausted the C stack");
+                break;
+            }
+#endif
             /* Encode exceptions propagate to the save caller; persist nothing.
              * A pending memory_limit error reports itself as the fatal. */
             if (!PHPSER_HAS_OOM()) {

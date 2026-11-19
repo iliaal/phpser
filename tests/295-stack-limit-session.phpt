@@ -1,5 +1,5 @@
 --TEST--
-phpser: session encode that exhausts the C stack warns and stores the failure marker
+phpser: session encode that exhausts the C stack, directly or in a nested hook, warns and stores the failure marker
 --EXTENSIONS--
 phpser
 session
@@ -9,9 +9,11 @@ if (PHP_VERSION_ID < 80300) die("skip zend.max_allowed_stack_size needs PHP 8.3+
 if (@ini_set('session.serialize_handler', 'phpser') === false) {
     die('skip phpser built without session support (HAVE_PHP_SESSION undefined)');
 }
-// Sanitizer builds reserve more than 128K, leaving no usable stack at all.
-$probe = shell_exec(escapeshellarg(getenv('TEST_PHP_EXECUTABLE')) . ' -n -d zend.max_allowed_stack_size=128K -r "echo 1;" 2>&1');
-if ($probe !== '1') die("skip zend.reserved_stack_size exceeds 128K on this build");
+// Engines built without ZEND_CHECK_STACK_LIMIT never raise the stack Error;
+// sanitizer builds reserve more than 128K, leaving no usable stack at all.
+$probe = 'function f($x) { return array_map("f", [$x]); } try { f(1); } catch (Error $e) { echo str_contains($e->getMessage(), "Maximum call stack size") ? "ok" : "other"; }';
+$out = shell_exec(escapeshellarg(getenv('TEST_PHP_EXECUTABLE')) . ' -n -d zend.max_allowed_stack_size=128K -r ' . escapeshellarg($probe) . ' 2>&1');
+if ($out !== 'ok') die("skip no C-stack limit Error at zend.max_allowed_stack_size=128K on this build");
 ?>
 --INI--
 zend.max_allowed_stack_size=128K
@@ -29,11 +31,30 @@ $a = 42;
 for ($i = 0; $i < 511; $i++) { $a = [$a]; }
 $_SESSION = ['deep' => $a];
 var_dump(session_encode());
+
+// A nested phpser_serialize() from __serialize() reports the low stack as the
+// engine's Error; the handler stores the marker for it too.
+class Hop {
+    public function __construct(public $next) {}
+    public function __serialize(): array {
+        $a = $this->next;
+        for ($i = 0; $i < 100; $i++) { $a = [$a]; }
+        return ['s' => phpser_serialize($a)];
+    }
+    public function __unserialize(array $data): void {}
+}
+$leaf = 1;
+for ($h = 0; $h < 20; $h++) { $leaf = new Hop($leaf); }
+$_SESSION = ['hops' => $leaf];
+var_dump(session_encode());
 $_SESSION = [];
 session_write_close();
 echo "DONE\n";
 ?>
 --EXPECTF--
+Warning: session_encode(): phpser: $_SESSION not serialized — nesting exhausted the C stack in %s on line %d
+string(29) "phpser:session-not-serialized"
+
 Warning: session_encode(): phpser: $_SESSION not serialized — nesting exhausted the C stack in %s on line %d
 string(29) "phpser:session-not-serialized"
 DONE
