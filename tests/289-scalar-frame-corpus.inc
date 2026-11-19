@@ -78,7 +78,7 @@ function scalar_frame_corpus_digest(bool $wide_ints): string {
         $signed = phpser_serialize_signed($v, 'scalar-frame-signing-key');
         $keyed = phpser_serialize_keyed($v, 'scalar-frame');
         foreach ([$plain, $signed, $keyed] as $frame) {
-            hash_update($h, pack('J', strlen($frame)) . $frame);
+            hash_update($h, pack('N', strlen($frame)) . $frame);
         }
         $back = [
             phpser_unserialize($plain),

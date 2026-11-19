@@ -9,9 +9,9 @@ phpser.key=scalar-frame-test-key-0123456789abcdef
 require __DIR__ . '/289-scalar-frame-corpus.inc';
 // Digests of the corpus encoded by the build before the scalar fast path
 // (38499ce); scalar_frame_corpus_digest() also checks every round trip.
-var_dump(scalar_frame_corpus_digest(false) === '645a6e3a1f80304a03d9c6b46a45b82e92c7d4298d3fbf93e4d6cad5d88dfe48');
+var_dump(scalar_frame_corpus_digest(false) === 'ed745f7803c7348cfb3e350767b79cc2c9f0d5069d923dc31a0732e3958ce810');
 // Integers beyond 32 bits exist only on 64-bit builds.
-var_dump(PHP_INT_SIZE === 4 || scalar_frame_corpus_digest(true) === '2c495498e3d9e71bdb9db7ca0bf2f1c69a707987510acacdd235c44e01c32b0f');
+var_dump(PHP_INT_SIZE === 4 || scalar_frame_corpus_digest(true) === '42e869fd844501c78df402a6f93d9d7394edb14033af38e66daf914b384a0c3f');
 ?>
 --EXPECT--
 bool(true)
