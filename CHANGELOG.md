@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- PHP 8.6 prebuilt binaries, built against PHP 8.6.0: Windows (TS/NTS, x86 and x64), macOS arm64 (NTS), and Linux glibc x86_64 and arm64 (ZTS only, matching the official 8.6 Docker images; NTS PHP 8.6 on Linux builds from source).
+- PHP 8.6 prebuilt binaries, built against PHP 8.6.0: Windows (TS/NTS, x86 and x64), Linux glibc (x86_64, arm64), and macOS arm64.
 
 ### Changed
 

@@ -2,10 +2,9 @@ name: Release Linux & macOS binaries
 
 # Triggered when a GitHub Release is published. Builds .so binaries for
 # Linux glibc (x86_64 + arm64) and macOS (arm64) at the PHP versions in
-# the matrix (NTS, except the ZTS Linux PHP 8.6 binary noted at its matrix
-# entry), gates each one, then uploads all of them as release assets using
-# PIE's pre-packaged-binary naming convention
-# (php_phpser-<tag>_php<x.y>-<arch>-<os>-<libc>[-zts].zip).
+# the matrix (NTS only; ZTS lives in the Windows lane), gates each one, then
+# uploads all of them as release assets using PIE's pre-packaged-binary
+# naming convention (php_phpser-<tag>_php<x.y>-<arch>-<os>-<libc>.zip).
 #
 # Each binary compiles against a pinned NEWEST patch release of its PHP
 # minor (8.4.27, 8.5.12, 8.6.0), so it carries the memory_limit stop behind
@@ -14,7 +13,8 @@ name: Release Linux & macOS binaries
 # older patch the extension refuses to start with a warning (MINIT compares
 # php_version_id() against the build's PHP_VERSION_ID) instead of dying
 # with "undefined symbol" on first use. Linux builds inside the
-# digest-pinned official bookworm image; macOS builds PHP from the
+# digest-pinned official bookworm image, except PHP 8.6 (see its matrix
+# entry); macOS builds PHP from the
 # checksum-pinned php.net release tarball, so a later patch release cannot
 # raise the floor without a repo diff.
 #
@@ -98,13 +98,19 @@ jobs:
             oldest-image: php:8.5.0-cli-bookworm@sha256:4ff93cd1b053c4d5ff468ced40962092a350a8c86798fee96e807bc9b383ec75
             newest-image: php:8.5.12-cli-bookworm@sha256:104890ada56869090c9cd0ec709fe205834d3e383b46d9995dc16cd6388a9302
           # The official images build only ZTS from 8.6 on
-          # (docker-library/php#1686), so the Linux 8.6 binary is ZTS while
-          # the other Linux binaries and every macOS binary are NTS.
+          # (docker-library/php#1686), so the 8.6 build image is NTS PHP
+          # compiled from the checksum-pinned php.net tarball on the
+          # digest-pinned bookworm-slim base the official bookworm images use.
           - php: '8.6'
-            newest-image: php:8.6.0-cli-bookworm@sha256:77741fea2130560b85dd3ac693140ce09424ad9df46da1203a5a896e15b44874
+            newest-tarball: '8.6.0'
+            newest-tarball-sha256: 5f84beaa3d763aee1e4feed99bf54ec692c383b322e25626807b589238c3a087
+            base-image: debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
     env:
       OLDEST: ${{ matrix.oldest-image }}
       NEWEST: ${{ matrix.newest-image }}
+      NEWEST_TARBALL: ${{ matrix.newest-tarball }}
+      NEWEST_TARBALL_SHA256: ${{ matrix.newest-tarball-sha256 }}
+      BASE: ${{ matrix.base-image }}
       MATRIX_PHP: ${{ matrix.php }}
       RELEASE_TAG: ${{ github.event.release.tag_name || 'dispatch' }}
     steps:
@@ -122,7 +128,7 @@ jobs:
           pull() {
             local delay reg
             local -a regs=(ghcr.io/iliaal docker.io/library public.ecr.aws/docker/library)
-            if [[ "$2" != php:*@sha256:* ]]; then
+            if [[ "$2" != php:*@sha256:* && "$2" != debian:*@sha256:* ]]; then
               echo "::error::$1 is not digest-pinned: $2"
               return 1
             fi
@@ -140,11 +146,44 @@ jobs:
           }
           if [ -n "$OLDEST" ]; then
             pull OLDEST_IMAGE "$OLDEST"
-          elif [[ "$NEWEST" != php:*.*.0-* ]]; then
-            echo "::error::no oldest-patch image for $NEWEST"
+          elif [[ "${NEWEST:-php:$NEWEST_TARBALL-}" != php:*.*.0-* ]]; then
+            echo "::error::no oldest-patch image for ${NEWEST:-$NEWEST_TARBALL}"
             exit 1
           fi
-          pull NEWEST_IMAGE "$NEWEST"
+          if [ -n "$NEWEST_TARBALL" ]; then
+            pull BASE_IMAGE "$BASE"
+          else
+            pull NEWEST_IMAGE "$NEWEST"
+          fi
+
+      - name: Build NTS PHP ${{ matrix.newest-tarball }} from the release tarball
+        if: matrix.newest-tarball != ''
+        run: |
+          set -euo pipefail
+          ctx="$RUNNER_TEMP/php-image"
+          mkdir -p "$ctx"
+          curl -fsSL --retry 3 -o "$ctx/php-src.tar.xz" "https://www.php.net/distributions/php-${NEWEST_TARBALL}.tar.xz"
+          echo "${NEWEST_TARBALL_SHA256}  $ctx/php-src.tar.xz" | sha256sum -c -
+          tag="phpser-build/php:${NEWEST_TARBALL}-nts"
+          docker build --pull=false -q -t "$tag" --build-arg BASE_IMAGE -f - "$ctx" <<'EOF'
+          ARG BASE_IMAGE
+          FROM ${BASE_IMAGE}
+          ENV PHPIZE_DEPS="autoconf dpkg-dev file g++ gcc libc-dev make pkg-config re2c"
+          COPY php-src.tar.xz /usr/src/
+          RUN set -eux; \
+            apt-get update -qq; \
+            apt-get install -y -qq --no-install-recommends $PHPIZE_DEPS xz-utils > /dev/null; \
+            mkdir /usr/src/php; \
+            tar -xJf /usr/src/php-src.tar.xz -C /usr/src/php --strip-components=1; \
+            cd /usr/src/php; \
+            ./configure --prefix=/usr/local --disable-all --enable-session \
+              --disable-cgi --disable-phpdbg > /dev/null; \
+            make -j"$(nproc)" > /dev/null; \
+            make install > /dev/null; \
+            cd /; rm -rf /usr/src/php /usr/src/php-src.tar.xz /var/lib/apt/lists/*; \
+            php -n -r 'exit(ZEND_THREAD_SAFE || PHP_DEBUG ? 1 : 0);'
+          EOF
+          echo "NEWEST_IMAGE=$tag" >> "$GITHUB_ENV"
 
       - name: Build against the newest patch and check its imports
         run: |

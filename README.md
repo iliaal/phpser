@@ -28,10 +28,9 @@ Rowsets keep the pointer-equality fast path for shared strings, while columnar e
 pie install iliaal/phpser
 ```
 
-On Linux glibc (x86_64, arm64) and macOS arm64 with PHP 8.4, 8.5, or 8.6, PIE
-installs a prebuilt binary. The Linux PHP 8.6 binary is ZTS, matching the
-official 8.6 Docker images; NTS PHP 8.6 on Linux builds from source. The
-binaries require PHP 8.4.27+ or 8.5.12+ (any 8.6 release works);
+On Linux glibc (x86_64, arm64) and macOS arm64 with NTS PHP 8.4, 8.5, or 8.6,
+PIE installs a prebuilt binary. Those binaries require PHP 8.4.27+ or 8.5.12+
+(any 8.6 release works);
 on an earlier patch the extension refuses to start with a warning, so build
 from source there.
 
