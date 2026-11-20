@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-11-20
+
 ### Added
 
 - PHP 8.6 prebuilt binaries, built against PHP 8.6.0: Windows (TS/NTS, x86 and x64), Linux glibc (x86_64, arm64), and macOS arm64.
@@ -470,7 +472,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   collapse to `TAG_REF`), cycles, enums, `__serialize`/`__unserialize`,
   `__sleep`/`__wakeup`, and the legacy `Serializable` interface.
 
-[Unreleased]: https://github.com/iliaal/phpser/compare/0.10.3...HEAD
+[Unreleased]: https://github.com/iliaal/phpser/compare/0.11.0...HEAD
+[0.11.0]: https://github.com/iliaal/phpser/releases/tag/0.11.0
 [0.10.3]: https://github.com/iliaal/phpser/releases/tag/0.10.3
 [0.10.2]: https://github.com/iliaal/phpser/releases/tag/0.10.2
 [0.10.1]: https://github.com/iliaal/phpser/releases/tag/0.10.1
