@@ -28,11 +28,11 @@ Rowsets keep the pointer-equality fast path for shared strings, while columnar e
 pie install iliaal/phpser
 ```
 
-On Linux glibc (x86_64, arm64) and macOS arm64 with NTS PHP 8.4, 8.5, or 8.6,
-PIE installs a prebuilt binary. Those binaries require PHP 8.4.27+ or 8.5.12+
-(any 8.6 release works);
-on an earlier patch the extension refuses to start with a warning, so build
-from source there.
+On Unix, PIE looks for a matching prebuilt archive before trying a source
+build. The [0.11.0 Unix archives](#pre-built-binaries) were built for
+NTS PHP 8.4.27, 8.5.12, and 8.6.0. Use at least that patch release within the
+matching PHP minor. The Unix binaries refuse to start on earlier patches;
+for older patches, use the manual [source build](#from-source).
 
 On a minimal PHP image (e.g. `php:8.x-cli` from Docker Hub), PIE needs a
 few build tools installed first:
@@ -76,11 +76,11 @@ the configuration for the SAPI you use and restart that service.
 
 ### Pre-built binaries
 
-Pre-built `.dll`s for Windows (PHP 8.2-8.6, TS/NTS, x86 and x64) and `.so`s for
-Linux glibc (x86_64, arm64) and macOS arm64 (PHP 8.4-8.6) are attached
-to each [GitHub release](https://github.com/iliaal/phpser/releases). PIE
-fetches the matching binary automatically and builds from source when no
-asset matches.
+[Release 0.11.0](https://github.com/iliaal/phpser/releases/tag/0.11.0) ships
+Windows DLL archives for PHP 8.2–8.6 (TS/NTS, x86/x64) and Unix NTS archives
+for PHP 8.4–8.6 on glibc Linux (x86_64/arm64) and Apple Silicon macOS.
+Check the selected release's assets for your PHP and platform. On Windows,
+PIE needs a matching DLL archive; it does not build from source.
 
 ## Usage
 
