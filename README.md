@@ -31,8 +31,11 @@ pie install iliaal/phpser
 On Unix, PIE looks for a matching prebuilt archive before trying a source
 build. The [0.11.0 Unix archives](#pre-built-binaries) were built for
 NTS PHP 8.4.27, 8.5.12, and 8.6.0. Use at least that patch release within the
-matching PHP minor. The Unix binaries refuse to start on earlier patches;
-for older patches, use the manual [source build](#from-source).
+matching PHP minor. When PIE 1.5.5 resolves phpser 0.11.0 on a matching NTS
+platform, it still selects the prebuilt archive on PHP 8.4.1–8.4.26 and
+8.5.0–8.5.11: it matches the PHP major and minor version, not the patch. The
+selected extension then refuses to start with a warning. Upgrade PHP or use
+the manual [source build](#from-source) if you must stay on an older patch.
 
 On a minimal PHP image (e.g. `php:8.x-cli` from Docker Hub), PIE needs a
 few build tools installed first:
