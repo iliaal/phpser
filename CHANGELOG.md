@@ -7,8 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Encoding, decoding, `phpser_serialize_signed()` and `phpser_serialize_keyed()` and their unserialize counterparts, the APCu serializer, and the signed session handler take less time. The encoder defers array duplication and pinning until a userland hook can run, and emits dense packed and unshared associative arrays in dedicated loops; the decoder reads varints inline and caches class layouts per request; keyed calls and the APCu serializer cache the HMAC-SHA256 inner and outer midstates of `phpser.key` and of the last derived subkey per thread, instead of a copy of the key and the subkey. On aarch64 (Neoverse-N1, PHP 8.4.28 NTS), the `ab.php` rowset, DTO, Eloquent collection and wallet shapes take 21-40% less encode time and 15-32% less decode time, packed arrays 9-15% less encode time, small and medium keyed values 20-31% less encode time, APCu stores 15-22% less and fetches 7-14% less, and signed session encode and decode 49% and 41% less. Dense packed decode, `deep_50` encode and top-level scalar encode moved less than 1.2%. The 24 plain and signed benchmark payloads keep their sizes.
+- Encoding a table whose rows all share one refcounted array holding only scalars no longer duplicates that array in memory. Wire output and decoded values are unchanged.
+- A string that a `__serialize()` or other encode hook builds and returns with no other reference, such as a `format('Y-m-d')` or `strtoupper()` result, is no longer deduplicated against equal strings elsewhere in the payload, so payloads that repeat such strings can grow: 1,000 objects returning them from `__serialize()` encode 11.4% larger. Decoded values are unchanged.
+
 ### Fixed
 
+- Passing live `ArrayObject` storage directly to `phpser_serialize()` no longer reads freed memory when a `__serialize()` hook, directly or in a nested value, appends to that `ArrayObject` and grows its storage.
 - `make test` no longer fails `tests/257-offheap-string-oom-pending.phpt` when PHP scans a directory for additional INI files, such as `/etc/php.d`. The test's child PHP read that directory and printed a startup warning for each extension it could not load from the build's `modules/` directory.
 
 ## [0.11.0] - 2026-11-20

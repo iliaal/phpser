@@ -54,9 +54,25 @@
  * reports failure instead of treating an empty string as a new session. */
 #define PHPSER_SESSION_TOMBSTONE "phpser:session-not-serialized"
 
+/* Module globals shared across phpser_module.c, phpser_api.c, and
+ * phpser_session.c for OnUpdate-cached INI keys. */
+ZEND_BEGIN_MODULE_GLOBALS(phpser)
+    zend_string *key;
+    uint64_t key_gen;
+    zend_string *session_key;
+    uint64_t session_key_gen;
+ZEND_END_MODULE_GLOBALS(phpser)
+
+ZEND_EXTERN_MODULE_GLOBALS(phpser)
+#if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
+ZEND_TSRMLS_CACHE_EXTERN()
+#endif
+#define PHPSER_G(v) ZEND_MODULE_GLOBALS_ACCESSOR(phpser, v)
+
 /* "enabled", "disabled", or an "invalid ..." explanation for MINFO.
  * Defined only when HAVE_PHP_SESSION. (phpser_session.c) */
 const char *phpser_session_signing_status(void);
+void phpser_session_mshutdown(void);
 
 /* Keyed (phpser.key) signing shared by the C API, the APCu serializer, and
  * the userland keyed functions. (phpser_api.c) */
@@ -115,8 +131,13 @@ void phpser_apcu_minit(bool persistent);
 
 /* Nesting below this depth skips the C-stack check, which costs a TLS lookup
  * per value. The levels it skips fit in zend.reserved_stack_size (at least
- * 32 KiB), and the VM checks the stack before each userland frame. */
-#define PHPSER_STACK_CHECK_DEPTH 32
+ * 32 KiB), and the VM checks the stack before each userland frame. Debug and
+ * ASAN frames are larger, so check earlier there. */
+#if ZEND_DEBUG || defined(__SANITIZE_ADDRESS__)
+# define PHPSER_STACK_CHECK_DEPTH 8
+#else
+# define PHPSER_STACK_CHECK_DEPTH 32
+#endif
 
 /* allowed_classes filter modes for phpser_decode_buf_opts. */
 enum {
@@ -160,6 +181,20 @@ int phpser_hmac_sha256(
     const unsigned char *data, size_t data_len,
     unsigned char out[PHPSER_HMAC_TAG_LEN]);
 
+/* Precompute inner/outer SHA-256 midstates for `key` so repeated HMACs under
+ * the same key skip key normalization, constant-time compare, and 2 block
+ * compressions. Returns 0 on success, -1 if SHA256 ops unavailable. */
+int phpser_hmac_prepare_midstate(
+    const unsigned char *key, size_t key_len,
+    uint32_t inner[8], uint32_t outer[8]);
+
+/* HMAC-SHA256 using precomputed (inner, outer) midstates from
+ * phpser_hmac_prepare_midstate(). */
+int phpser_hmac_sha256_midstate(
+    const uint32_t inner[8], const uint32_t outer[8],
+    const unsigned char *data, size_t data_len,
+    unsigned char out[PHPSER_HMAC_TAG_LEN]);
+
 /* Wipes the calling thread's cached HMAC key midstates. Call from
  * MSHUTDOWN and GSHUTDOWN. (phpser_hmac.c) */
 void phpser_hmac_mshutdown(void);
@@ -191,6 +226,13 @@ int phpser_ct_eq(const unsigned char *a, const unsigned char *b, size_t n);
 zend_string *phpser_encode_zval_ex(zval *value, bool throw_on_overflow,
                                    phpser_enc_status *status, size_t tail_reserve);
 zend_string *phpser_encode_zval(zval *value, bool throw_on_overflow);
+
+/* Raw-buffer encode for callers (APCu) that own an emalloc'd byte buffer
+ * directly instead of a zend_string: allocates frame_len + tail_reserve + 1
+ * bytes once, writes the NUL-terminated frame, sets *out_len = frame_len. */
+unsigned char *phpser_encode_zval_raw(zval *value, bool throw_on_overflow,
+                                      phpser_enc_status *status, size_t tail_reserve,
+                                      size_t *out_len);
 
 /* Reusable decode: parse a framed payload into `out`. Returns 0 on success,
  * -1 on any framing/buffer error. On error, `out` is set to NULL.

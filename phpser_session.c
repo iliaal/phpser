@@ -35,6 +35,34 @@ static int phpser_decode_buf(const char *str, size_t str_len, zval *out) {
 #define PHPSER_SESSION_KDF_LABEL "phpser:session:v1"
 
 #define PHPSER_SESSION_KEY_MIN 32
+#define PHPSER_SESSION_SID_CACHE_MAX 128
+
+typedef struct {
+    bool master_valid;
+    uint64_t master_gen;
+    const zend_string *master_key;
+    uint32_t master_inner[8];
+    uint32_t master_outer[8];
+    bool sub_valid;
+    uint64_t sub_gen;
+    const zend_string *sub_key;
+    size_t sid_len;
+    char sid[PHPSER_SESSION_SID_CACHE_MAX];
+    uint32_t sub_inner[8];
+    uint32_t sub_outer[8];
+} phpser_session_hmac_cache;
+
+ZEND_TLS phpser_session_hmac_cache session_hmac_cache;
+
+void phpser_session_mshutdown(void) {
+    ZEND_SECURE_ZERO(&session_hmac_cache, sizeof(session_hmac_cache));
+}
+
+static zend_always_inline void phpser_session_cache_drop(void) {
+    if (UNEXPECTED(session_hmac_cache.master_valid || session_hmac_cache.sub_valid)) {
+        ZEND_SECURE_ZERO(&session_hmac_cache, sizeof(session_hmac_cache));
+    }
+}
 
 typedef enum {
     PHPSER_SKEY_UNSET = 0,
@@ -43,16 +71,24 @@ typedef enum {
 } phpser_skey_status;
 
 static phpser_skey_status phpser_session_key_lookup(zend_string **out) {
-    /* zend_ini_get_value() is the lookup that exists on PHP 8.2 through 8.6;
-     * zend_ini_str_ex() is 8.3+ and INI_STR() is gone in 8.6. */
-    zend_string *name = ZSTR_INIT_LITERAL("phpser.session_key", 0);
-    zend_string *key = zend_ini_get_value(name);
-    zend_string_release_ex(name, 0);
+    zend_string *key;
+    if (EXPECTED(PHPSER_G(session_key_gen) != 0)) {
+        key = PHPSER_G(session_key);
+    } else {
+        zend_ini_entry *entry = zend_hash_str_find_ptr(EG(ini_directives),
+                                                       "phpser.session_key",
+                                                       sizeof("phpser.session_key") - 1);
+        key = entry ? entry->value : NULL;
+        PHPSER_G(session_key) = key;
+        PHPSER_G(session_key_gen) = 1;
+    }
     *out = NULL;
     if (!key || ZSTR_LEN(key) == 0) {
+        phpser_session_cache_drop();
         return PHPSER_SKEY_UNSET;
     }
     if (ZSTR_LEN(key) < PHPSER_SESSION_KEY_MIN) {
+        phpser_session_cache_drop();
         return PHPSER_SKEY_SHORT;
     }
     *out = key;
@@ -101,21 +137,75 @@ static int phpser_session_tag(const zend_string *key, const char *frame, size_t 
     if (UNEXPECTED(!sid)) {
         return -1;
     }
+    phpser_session_hmac_cache *c = &session_hmac_cache;
+    uint64_t gen = PHPSER_G(session_key_gen);
+    size_t sid_len = ZSTR_LEN(sid);
+    bool cacheable_sid = sid_len <= PHPSER_SESSION_SID_CACHE_MAX;
+
+    if (EXPECTED(cacheable_sid && c->sub_valid && c->sub_gen == gen && c->sub_key == key
+                 && c->sid_len == sid_len
+                 && memcmp(c->sid, ZSTR_VAL(sid), sid_len) == 0)) {
+        return phpser_hmac_sha256_midstate(c->sub_inner, c->sub_outer,
+                                           (const unsigned char *) frame, frame_len, tag);
+    }
+
+    if (!c->master_valid || c->master_gen != gen || c->master_key != key) {
+        ZEND_SECURE_ZERO(c, sizeof(*c));
+        if (phpser_hmac_prepare_midstate((const unsigned char *) ZSTR_VAL(key),
+                                         ZSTR_LEN(key),
+                                         c->master_inner, c->master_outer) != 0) {
+            ZEND_SECURE_ZERO(c, sizeof(*c));
+            return -1;
+        }
+        c->master_valid = true;
+        c->master_gen = gen;
+        c->master_key = key;
+    }
+
     size_t label_len = sizeof(PHPSER_SESSION_KDF_LABEL);
-    size_t msg_len = label_len + ZSTR_LEN(sid);
-    unsigned char *msg = emalloc(msg_len);
+    size_t msg_len = label_len + sid_len;
+    unsigned char stack_msg[128];
+    unsigned char *msg = msg_len <= sizeof(stack_msg) ? stack_msg : emalloc(msg_len);
     memcpy(msg, PHPSER_SESSION_KDF_LABEL, label_len);
-    memcpy(msg + label_len, ZSTR_VAL(sid), ZSTR_LEN(sid));
+    memcpy(msg + label_len, ZSTR_VAL(sid), sid_len);
 
     unsigned char subkey[PHPSER_HMAC_TAG_LEN];
-    int rc = phpser_hmac_sha256((const unsigned char *) ZSTR_VAL(key), ZSTR_LEN(key),
-                                msg, msg_len, subkey);
-    efree(msg);
-    if (rc == 0) {
-        rc = phpser_hmac_sha256(subkey, sizeof(subkey),
-                                (const unsigned char *) frame, frame_len, tag);
+    int rc = phpser_hmac_sha256_midstate(c->master_inner, c->master_outer,
+                                         msg, msg_len, subkey);
+    if (msg != stack_msg) efree(msg);
+    if (rc != 0) {
+        ZEND_SECURE_ZERO(subkey, sizeof(subkey));
+        return -1;
     }
+
+    if (cacheable_sid) {
+        rc = phpser_hmac_prepare_midstate(subkey, sizeof(subkey),
+                                          c->sub_inner, c->sub_outer);
+        ZEND_SECURE_ZERO(subkey, sizeof(subkey));
+        if (rc != 0) {
+            c->sub_valid = false;
+            ZEND_SECURE_ZERO(c->sub_inner, sizeof(c->sub_inner));
+            ZEND_SECURE_ZERO(c->sub_outer, sizeof(c->sub_outer));
+            return -1;
+        }
+        c->sub_valid = true;
+        c->sub_gen = gen;
+        c->sub_key = key;
+        c->sid_len = sid_len;
+        memcpy(c->sid, ZSTR_VAL(sid), sid_len);
+        return phpser_hmac_sha256_midstate(c->sub_inner, c->sub_outer,
+                                           (const unsigned char *) frame, frame_len, tag);
+    }
+
+    uint32_t tmp_inner[8], tmp_outer[8];
+    rc = phpser_hmac_prepare_midstate(subkey, sizeof(subkey), tmp_inner, tmp_outer);
     ZEND_SECURE_ZERO(subkey, sizeof(subkey));
+    if (rc == 0) {
+        rc = phpser_hmac_sha256_midstate(tmp_inner, tmp_outer,
+                                         (const unsigned char *) frame, frame_len, tag);
+    }
+    ZEND_SECURE_ZERO(tmp_inner, sizeof(tmp_inner));
+    ZEND_SECURE_ZERO(tmp_outer, sizeof(tmp_outer));
     return rc;
 }
 
@@ -254,9 +344,10 @@ PS_SERIALIZER_DECODE_FUNC(phpser) {
     ZVAL_NEW_REF(&PS(http_session_vars), &decoded);
     Z_ADDREF_P(&PS(http_session_vars));
     /* Keep the userland $_SESSION symbol bound to the new session reference. */
-    zend_string *var_name = ZSTR_INIT_LITERAL("_SESSION", 0);
-    zend_hash_update_ind(&EG(symbol_table), var_name, &PS(http_session_vars));
-    zend_string_release_ex(var_name, 0);
+    zend_hash_str_update_ind(&EG(symbol_table), "_SESSION", sizeof("_SESSION") - 1,
+                             &PS(http_session_vars));
     return SUCCESS;
 }
+#else
+void phpser_session_mshutdown(void) {}
 #endif /* HAVE_PHP_SESSION */

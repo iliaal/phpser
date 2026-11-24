@@ -39,12 +39,12 @@ PHP_FUNCTION(phpser_serialize) {
  * string-only entry restriction. */
 static int parse_unserialize_options(
     HashTable *options_ht, const char *fname,
-    int *out_mode, HashTable **out_set)
+    int *out_mode, HashTable *allowed_buf, HashTable **out_set)
 {
     HashTable *classes = NULL;
     *out_mode = ALLOWED_ALL;
     *out_set = NULL;
-    if (!options_ht) return 0;
+    if (!options_ht || zend_hash_num_elements(options_ht) == 0) return 0;
     zval *ac = zend_hash_str_find_deref(options_ht, "allowed_classes",
                                          sizeof("allowed_classes") - 1);
     if (!ac) return 0;
@@ -53,7 +53,7 @@ static int parse_unserialize_options(
     if (Z_TYPE_P(ac) == IS_ARRAY) {
         /* PHP class names are case-insensitive. */
         *out_mode = ALLOWED_SET;
-        *out_set = emalloc(sizeof(HashTable));
+        *out_set = allowed_buf;
         zend_hash_init(*out_set, zend_hash_num_elements(Z_ARRVAL_P(ac)),
                        NULL, NULL, 0);
         /* __toString may replace a referenced option or mutate its array. */
@@ -123,7 +123,6 @@ invalid:
     if (classes) zend_array_release(classes);
     if (*out_set) {
         zend_hash_destroy(*out_set);
-        efree(*out_set);
         *out_set = NULL;
     }
     return -1;
@@ -140,9 +139,10 @@ PHP_FUNCTION(phpser_unserialize) {
     ZEND_PARSE_PARAMETERS_END();
 
     int allowed_mode;
+    HashTable allowed_buf;
     HashTable *allowed_set;
     if (parse_unserialize_options(options_ht, "phpser_unserialize",
-                                  &allowed_mode, &allowed_set) < 0) {
+                                  &allowed_mode, &allowed_buf, &allowed_set) < 0) {
         PHPSER_RETURN_FAILED();
     }
 
@@ -152,7 +152,6 @@ PHP_FUNCTION(phpser_unserialize) {
 
     if (allowed_set) {
         zend_hash_destroy(allowed_set);
-        efree(allowed_set);
     }
 }
 
@@ -241,9 +240,10 @@ PHP_FUNCTION(phpser_unserialize_signed) {
     }
 
     int allowed_mode;
+    HashTable allowed_buf;
     HashTable *allowed_set;
     if (parse_unserialize_options(options_ht, "phpser_unserialize_signed",
-                                  &allowed_mode, &allowed_set) < 0) {
+                                  &allowed_mode, &allowed_buf, &allowed_set) < 0) {
         PHPSER_RETURN_FAILED();
     }
 
@@ -252,7 +252,6 @@ PHP_FUNCTION(phpser_unserialize_signed) {
 
     if (allowed_set) {
         zend_hash_destroy(allowed_set);
-        efree(allowed_set);
     }
 
     /* Distinguish malformed signed data from a valid signed null. Preserve
@@ -332,9 +331,10 @@ PHP_FUNCTION(phpser_unserialize_keyed) {
         RETURN_THROWS();
     }
     int allowed_mode;
+    HashTable allowed_buf;
     HashTable *allowed_set;
     if (parse_unserialize_options(options_ht, "phpser_unserialize_keyed",
-                                  &allowed_mode, &allowed_set) < 0) {
+                                  &allowed_mode, &allowed_buf, &allowed_set) < 0) {
         PHPSER_RETURN_FAILED();
     }
 
@@ -343,7 +343,6 @@ PHP_FUNCTION(phpser_unserialize_keyed) {
 
     if (allowed_set) {
         zend_hash_destroy(allowed_set);
-        efree(allowed_set);
     }
 
     if (rc == PHPSER_KEYED_BAD_TAG) {
@@ -366,31 +365,40 @@ PHP_FUNCTION(phpser_unserialize_keyed) {
 
 #include "phpser_arginfo.h"
 
+ZEND_DECLARE_MODULE_GLOBALS(phpser)
+
+static ZEND_INI_MH(OnUpdatePhpserKey) {
+    PHPSER_G(key) = new_value;
+    PHPSER_G(key_gen)++;
+    if (PHPSER_G(key_gen) == 0) PHPSER_G(key_gen) = 1;
+    phpser_api_mshutdown();
+    return SUCCESS;
+}
+
+static ZEND_INI_MH(OnUpdatePhpserSessionKey) {
+    PHPSER_G(session_key) = new_value;
+    PHPSER_G(session_key_gen)++;
+    if (PHPSER_G(session_key_gen) == 0) PHPSER_G(session_key_gen) = 1;
+    phpser_session_mshutdown();
+    return SUCCESS;
+}
+
 /* SYSTEM|PERDIR keeps the key out of reach of ini_set() in application code;
  * set it in php.ini or an FPM pool's php_admin_value. */
 PHP_INI_BEGIN()
-    PHP_INI_ENTRY("phpser.session_key", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
-    PHP_INI_ENTRY("phpser.key", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, NULL)
+    PHP_INI_ENTRY("phpser.session_key", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, OnUpdatePhpserSessionKey)
+    PHP_INI_ENTRY("phpser.key", "", PHP_INI_SYSTEM | PHP_INI_PERDIR, OnUpdatePhpserKey)
 PHP_INI_END()
 
 #ifdef HAVE_PHP_SESSION
 static bool phpser_session_registered = false;
 #endif
 
-/* The struct exists for its GINIT hook: TSRM runs GINIT on every new thread
- * before any module's RINIT, and ext/session's RINIT (session.auto_start)
- * decodes through phpser before phpser's own RINIT runs on that thread. */
-ZEND_BEGIN_MODULE_GLOBALS(phpser)
-    bool unused;
-ZEND_END_MODULE_GLOBALS(phpser)
-
-ZEND_DECLARE_MODULE_GLOBALS(phpser)
-
 static PHP_GINIT_FUNCTION(phpser) {
 #if (defined(COMPILE_DL_PHPSER) || defined(ZEND_COMPILE_DL_EXT)) && defined(ZTS)
     ZEND_TSRMLS_CACHE_UPDATE();
 #endif
-    phpser_globals->unused = false;
+    memset(phpser_globals, 0, sizeof(*phpser_globals));
 }
 
 /* TSRM runs GSHUTDOWN on the exiting thread from ts_free_thread(), so the
@@ -399,6 +407,7 @@ static PHP_GSHUTDOWN_FUNCTION(phpser) {
     (void) phpser_globals;
     phpser_hmac_mshutdown();
     phpser_api_mshutdown();
+    phpser_session_mshutdown();
 }
 
 static PHP_MINIT_FUNCTION(phpser) {
@@ -445,6 +454,7 @@ static PHP_MSHUTDOWN_FUNCTION(phpser) {
     UNREGISTER_INI_ENTRIES();
     phpser_hmac_mshutdown();
     phpser_api_mshutdown();
+    phpser_session_mshutdown();
     phpser_sha256_ops = NULL;
     return SUCCESS;
 }

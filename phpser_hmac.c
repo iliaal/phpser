@@ -85,23 +85,101 @@ static void sha256_absorb_final(phpser_sha256_blocks_fn blocks, uint32_t st[8],
     store_be32(buf + tail - 8, (uint32_t)(bits >> 32));
     store_be32(buf + tail - 4, (uint32_t)bits);
     blocks(st, buf, tail / SHA256_BLOCK);
-    /* The tail holds key bytes when hashing an over-long key. */
-    ZEND_SECURE_ZERO(buf, tail);
+    /* Only an over-long key (prefix_len == 0) puts secret bytes in `buf`. */
+    if (prefix_len == 0) {
+        ZEND_SECURE_ZERO(buf, tail);
+    }
+}
+
+static zend_always_inline phpser_sha256_blocks_fn hmac_blocks_fn(void)
+{
+    phpser_hmac_state *hs = &hmac_state;
+    if (UNEXPECTED(!hs->blocks)) {
+        const char *backend;
+        hs->blocks = phpser_sha256_select(&backend);
+    }
+    return hs->blocks;
+}
+
+static void hmac_compute_midstates(phpser_sha256_blocks_fn blocks,
+                                   const unsigned char k[SHA256_BLOCK],
+                                   uint32_t inner[8], uint32_t outer[8])
+{
+    unsigned char pad[SHA256_BLOCK];
+    for (size_t i = 0; i < SHA256_BLOCK; i++) pad[i] = k[i] ^ 0x36;
+    memcpy(inner, phpser_sha256_iv, 8 * sizeof(uint32_t));
+    blocks(inner, pad, 1);
+    for (size_t i = 0; i < SHA256_BLOCK; i++) pad[i] ^= 0x36 ^ 0x5c;
+    memcpy(outer, phpser_sha256_iv, 8 * sizeof(uint32_t));
+    blocks(outer, pad, 1);
+    ZEND_SECURE_ZERO(pad, sizeof(pad));
 }
 
 static void hmac_load_key(phpser_hmac_state *hs, phpser_sha256_blocks_fn blocks,
                           const unsigned char k[SHA256_BLOCK])
 {
-    unsigned char pad[SHA256_BLOCK];
-    for (size_t i = 0; i < SHA256_BLOCK; i++) pad[i] = k[i] ^ 0x36;
-    memcpy(hs->inner, phpser_sha256_iv, sizeof(hs->inner));
-    blocks(hs->inner, pad, 1);
-    for (size_t i = 0; i < SHA256_BLOCK; i++) pad[i] ^= 0x36 ^ 0x5c;
-    memcpy(hs->outer, phpser_sha256_iv, sizeof(hs->outer));
-    blocks(hs->outer, pad, 1);
+    hmac_compute_midstates(blocks, k, hs->inner, hs->outer);
     memcpy(hs->key_block, k, SHA256_BLOCK);
     hs->key_valid = true;
-    ZEND_SECURE_ZERO(pad, sizeof(pad));
+}
+
+static void hmac_finish_midstates(phpser_sha256_blocks_fn blocks,
+                                  const uint32_t inner[8], const uint32_t outer[8],
+                                  const unsigned char *data, size_t data_len,
+                                  unsigned char out[PHPSER_HMAC_TAG_LEN])
+{
+    uint32_t st[8];
+    /* Inner: H((K^ipad) || data), resumed from the cached midstate. */
+    memcpy(st, inner, sizeof(st));
+    sha256_absorb_final(blocks, st, data, data_len, SHA256_BLOCK);
+
+    /* Outer: H((K^opad) || inner). 64 + 32 bytes always pads to one block. */
+    unsigned char blk[SHA256_BLOCK];
+    store_digest(blk, st);
+    blk[32] = 0x80;
+    memset(blk + 33, 0, SHA256_BLOCK - 33 - 8);
+    store_be32(blk + 56, 0);
+    store_be32(blk + 60, (SHA256_BLOCK + PHPSER_HMAC_TAG_LEN) * 8);
+    memcpy(st, outer, sizeof(st));
+    blocks(st, blk, 1);
+    store_digest(out, st);
+
+    ZEND_SECURE_ZERO(st, sizeof(st));
+    ZEND_SECURE_ZERO(blk, sizeof(blk));
+}
+
+int phpser_hmac_prepare_midstate(
+    const unsigned char *key, size_t key_len,
+    uint32_t inner[8], uint32_t outer[8])
+{
+    if (UNEXPECTED(!phpser_sha256_ops)) return -1;
+    phpser_sha256_blocks_fn blocks = hmac_blocks_fn();
+    unsigned char k[SHA256_BLOCK];
+    if (key_len > SHA256_BLOCK) {
+        uint32_t st[8];
+        memcpy(st, phpser_sha256_iv, sizeof(st));
+        sha256_absorb_final(blocks, st, key, key_len, 0);
+        store_digest(k, st);
+        memset(k + 32, 0, SHA256_BLOCK - 32);
+        ZEND_SECURE_ZERO(st, sizeof(st));
+    } else {
+        memcpy(k, key, key_len);
+        memset(k + key_len, 0, SHA256_BLOCK - key_len);
+    }
+    hmac_compute_midstates(blocks, k, inner, outer);
+    ZEND_SECURE_ZERO(k, sizeof(k));
+    return 0;
+}
+
+int phpser_hmac_sha256_midstate(
+    const uint32_t inner[8], const uint32_t outer[8],
+    const unsigned char *data, size_t data_len,
+    unsigned char out[PHPSER_HMAC_TAG_LEN])
+{
+    if (UNEXPECTED(!phpser_sha256_ops)) return -1;
+    phpser_sha256_blocks_fn blocks = hmac_blocks_fn();
+    hmac_finish_midstates(blocks, inner, outer, data, data_len, out);
+    return 0;
 }
 
 int phpser_hmac_sha256(
@@ -111,12 +189,8 @@ int phpser_hmac_sha256(
 {
     if (UNEXPECTED(!phpser_sha256_ops)) return -1;
 
+    phpser_sha256_blocks_fn blocks = hmac_blocks_fn();
     phpser_hmac_state *hs = &hmac_state;
-    if (UNEXPECTED(!hs->blocks)) {
-        const char *backend;
-        hs->blocks = phpser_sha256_select(&backend);
-    }
-    phpser_sha256_blocks_fn blocks = hs->blocks;
 
     unsigned char k[SHA256_BLOCK];
     uint32_t st[8];
@@ -125,6 +199,7 @@ int phpser_hmac_sha256(
         sha256_absorb_final(blocks, st, key, key_len, 0);
         store_digest(k, st);
         memset(k + 32, 0, SHA256_BLOCK - 32);
+        ZEND_SECURE_ZERO(st, sizeof(st));
     } else {
         memcpy(k, key, key_len);
         memset(k + key_len, 0, SHA256_BLOCK - key_len);
@@ -136,23 +211,7 @@ int phpser_hmac_sha256(
     }
     ZEND_SECURE_ZERO(k, sizeof(k));
 
-    /* Inner: H((K^ipad) || data), resumed from the cached midstate. */
-    memcpy(st, hs->inner, sizeof(st));
-    sha256_absorb_final(blocks, st, data, data_len, SHA256_BLOCK);
-
-    /* Outer: H((K^opad) || inner). 64 + 32 bytes always pads to one block. */
-    unsigned char blk[SHA256_BLOCK];
-    store_digest(blk, st);
-    blk[32] = 0x80;
-    memset(blk + 33, 0, SHA256_BLOCK - 33 - 8);
-    store_be32(blk + 56, 0);
-    store_be32(blk + 60, (SHA256_BLOCK + PHPSER_HMAC_TAG_LEN) * 8);
-    memcpy(st, hs->outer, sizeof(st));
-    blocks(st, blk, 1);
-    store_digest(out, st);
-
-    ZEND_SECURE_ZERO(st, sizeof(st));
-    ZEND_SECURE_ZERO(blk, sizeof(blk));
+    hmac_finish_midstates(blocks, hs->inner, hs->outer, data, data_len, out);
     return 0;
 }
 

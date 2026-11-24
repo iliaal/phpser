@@ -22,9 +22,11 @@ memory_limit=256M
 <?php
 register_shutdown_function(function () { echo "shutdown\n"; });
 // A literal row would be immutable under OPcache, which the gather never
-// duplicates; build it at runtime so every slot shares one refcounted table.
+// duplicates; build it at runtime with a container cell so the gather runs its
+// shared-row duplication path.
 $row = [];
-foreach (['a', 'b', 'c', 'd'] as $i => $k) $row[$k] = $i + 1;
+foreach (['a', 'b', 'c'] as $i => $k) $row[$k] = $i + 1;
+$row['d'] = new stdClass();
 $rows = array_fill(0, 40000, $row);
 unset($row);
 gc_mem_caches();

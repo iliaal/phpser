@@ -84,7 +84,7 @@ on fresh threads of an embedded ZTS PHP. With `session.auto_start=1` and
 `session.serialize_handler=phpser`, ext/session decodes the stored session
 through phpser before phpser's own `RINIT` runs on the thread. The script
 runs 8 threads of 20 requests each, then checks that `ts_free_thread()`
-wiped the signing key cached in each thread's TLS block. CI does not run it
+wiped the `phpser.key` HMAC midstates cached in each thread's TLS block. CI does not run it
 yet. To run it on Linux, build PHP with `--enable-zts --enable-embed=shared
 --enable-session`, build the extension with that PHP's `phpize` and
 `php-config`, then run:
