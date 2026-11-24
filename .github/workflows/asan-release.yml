@@ -1,0 +1,145 @@
+name: Release-build ASAN
+
+# Tests 297 and 298 cover use-after-free paths that only a release (non-debug)
+# PHP reaches: a debug build aborts on HT_ASSERT_RC1 inside the SPL write
+# first, so both tests skip on PHP_DEBUG and the debug ASAN lane in tests.yml
+# cannot catch a regression there. This lane runs the suite against a release
+# PHP built with ASAN and the Zend allocator disabled, so freed HashTable
+# buffers go back to malloc where ASAN sees the reuse.
+on:
+  schedule:
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: asan-release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  asan-release:
+    name: PHP ${{ matrix.php-release }} release build - ASAN
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - php-release: '8.6.0'
+            php-release-sha256: 5f84beaa3d763aee1e4feed99bf54ec692c383b322e25626807b589238c3a087
+
+    # Leak checking stays with the debug ASAN lane in tests.yml; under this
+    # release build LeakSanitizer reports objects from cyclic graphs that a
+    # release PHP does not free at shutdown.
+    env:
+      ASAN_OPTIONS: exitcode=139:verify_asan_link_order=0:detect_odr_violation=0:detect_leaks=0
+      UBSAN_OPTIONS: print_stacktrace=1
+      USE_ZEND_ALLOC: 0
+      USE_TRACKED_ALLOC: 1
+      PHP_RELEASE: ${{ matrix.php-release }}
+      PHP_RELEASE_SHA256: ${{ matrix.php-release-sha256 }}
+      ASAN_CFLAGS: -fsanitize=address,undefined -fno-sanitize=function,vptr -shared-libasan -DZEND_TRACK_ARENA_ALLOC
+      ASAN_LDFLAGS: -fsanitize=address,undefined -shared-libasan
+      PHP_PREFIX: /tmp/php-asan-release
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install dependencies
+        run: sudo apt-get update && sudo apt-get install -y llvm clang autoconf
+
+      # See the ASAN job in tests.yml: configure's conftest binaries need the
+      # shared ASan runtime on LD_LIBRARY_PATH.
+      - name: Resolve clang runtime dir
+        id: clang_rt
+        run: |
+          lib=$(clang -print-file-name="libclang_rt.asan-$(uname -m).so")
+          [ -f "$lib" ] || lib=$(clang -print-file-name=libclang_rt.asan.so)
+          if [ ! -f "$lib" ]; then
+            echo "::error::clang shared ASan runtime not found"; exit 1
+          fi
+          echo "dir=$(dirname "$lib")" >> "$GITHUB_OUTPUT"
+          echo "version=$(clang -dumpfullversion)" >> "$GITHUB_OUTPUT"
+
+      # The installed PHP links the clang runtime by path, so the key carries
+      # the clang version and this file's hash (build flags) next to the
+      # checksum-pinned PHP release.
+      - name: Cache ASAN PHP build
+        id: php_cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/php-asan-release
+          key: php-asan-release-${{ matrix.php-release }}-${{ matrix.php-release-sha256 }}-clang-${{ steps.clang_rt.outputs.version }}-${{ hashFiles('.github/workflows/asan-release.yml') }}
+
+      - name: Build release PHP with ASAN
+        if: steps.php_cache.outputs.cache-hit != 'true'
+        env:
+          LD_LIBRARY_PATH: ${{ steps.clang_rt.outputs.dir }}
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 -o /tmp/php-src.tar.xz "https://www.php.net/distributions/php-${PHP_RELEASE}.tar.xz"
+          echo "${PHP_RELEASE_SHA256}  /tmp/php-src.tar.xz" | sha256sum -c -
+          mkdir /tmp/php-src
+          tar -xJf /tmp/php-src.tar.xz -C /tmp/php-src --strip-components=1
+          cd /tmp/php-src
+          CC=clang CXX=clang++ CFLAGS="$ASAN_CFLAGS" LDFLAGS="$ASAN_LDFLAGS" \
+          ./configure \
+            --disable-debug \
+            --disable-zts \
+            --disable-all \
+            --enable-cli \
+            --enable-session \
+            --prefix="$PHP_PREFIX"
+          make -j"$(nproc)"
+          make install
+
+      - name: Check PHP is a release build
+        env:
+          LD_LIBRARY_PATH: ${{ steps.clang_rt.outputs.dir }}
+        run: |
+          "$PHP_PREFIX/bin/php" -r 'exit(PHP_DEBUG ? 1 : 0);'
+
+      - name: Build extension with ASAN
+        env:
+          LD_LIBRARY_PATH: ${{ steps.clang_rt.outputs.dir }}
+        run: |
+          export PATH="$PHP_PREFIX/bin:$PATH"
+          phpize
+          CC=clang CXX=clang++ CFLAGS="$ASAN_CFLAGS" LDFLAGS="$ASAN_LDFLAGS" \
+          ./configure \
+            --enable-phpser \
+            --with-php-config="$PHP_PREFIX/bin/php-config"
+          make -j"$(nproc)"
+
+      - name: Run tests under ASAN
+        env:
+          LD_LIBRARY_PATH: ${{ steps.clang_rt.outputs.dir }}
+          NO_INTERACTION: 1
+        # Unoptimized ASAN frames overrun PHP's stack guard on the depth-cap
+        # tests at the default 8 MiB stack.
+        run: |
+          ulimit -s 65536
+          export TEST_PHP_EXECUTABLE="$PHP_PREFIX/bin/php"
+          TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
+          export TEST_PHP_ARGS
+          "$PHP_PREFIX/bin/php" run-tests.php --show-diff --asan -g FAIL,BORK,LEAK,XLEAK tests/
+
+      # A skip would make the lane green without exercising the release-only paths.
+      - name: Check release-only UAF tests ran
+        env:
+          LD_LIBRARY_PATH: ${{ steps.clang_rt.outputs.dir }}
+          NO_INTERACTION: 1
+        run: |
+          set -o pipefail
+          ulimit -s 65536
+          export TEST_PHP_EXECUTABLE="$PHP_PREFIX/bin/php"
+          TEST_PHP_ARGS="-d extension=$(pwd)/modules/phpser.so"
+          export TEST_PHP_ARGS
+          "$PHP_PREFIX/bin/php" run-tests.php --show-diff --asan \
+            tests/297-encode-snap-borrowed-dropper-uaf.phpt \
+            tests/298-encode-toplevel-storage-nontable-uaf.phpt | tee uaf-tests.log
+          grep -Eq 'Tests passed +: +2 ' uaf-tests.log
