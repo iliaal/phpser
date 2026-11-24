@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Passing live `ArrayObject` storage directly to `phpser_serialize()` no longer reads freed memory when a `__serialize()` hook, directly or in a nested value, appends to that `ArrayObject` and grows its storage.
+- `make test` no longer fails `tests/257-offheap-string-oom-pending.phpt` when PHP scans a directory for additional INI files, such as `/etc/php.d`. The test's child PHP read that directory and printed a startup warning for each extension it could not load from the build's `modules/` directory.
 
 ## [0.11.0] - 2026-11-20
 
