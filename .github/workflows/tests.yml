@@ -305,6 +305,9 @@ jobs:
 
   # Windows builds need the PHP SDK and matching MSVC toolset. The composite
   # action handles SDK download, VS detection, the nmake build, and tests.
+  # Push and PR runs keep one x64 lane per toolset (vs16: 8.2, vs17: 8.4,
+  # vs18: 8.6) in TS and NTS; release-windows.yml tests the full shipped
+  # matrix, x86 included, weekly and on dispatch.
   windows-matrix:
     name: Resolve Windows matrix
     runs-on: ubuntu-latest
@@ -317,7 +320,9 @@ jobs:
       - id: matrix
         uses: php/php-windows-builder/extension-matrix@29352c0ef9e8ce65264ea9e287881a6f7758a953 # 1.9.0
         with:
-          php-version-list: '8.2, 8.3, 8.4, 8.5, 8.6'
+          php-version-list: '8.2, 8.4, 8.6'
+          arch-list: 'x64'
+          ts-list: 'nts, ts'
 
   windows:
     name: Windows ${{ matrix.php-version }} ${{ matrix.ts }} ${{ matrix.arch }}

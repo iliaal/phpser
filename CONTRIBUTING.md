@@ -151,7 +151,11 @@ For maintainers cutting a new version:
    table in `SECURITY.md` to the new minor (pre-1.0: latest minor
    only); it does not track the version automatically.
 2. Commit + push to master. CI (Tests workflow, all jobs green) is
-   required before tagging.
+   required before tagging. Push CI tests one x64 Windows lane per MSVC
+   toolset, so also run `gh workflow run release-windows.yml --ref master`
+   and require it green on the release commit: that dispatch builds and
+   tests every shipped Windows DLL (x86 and PHP 8.3/8.5 included) without
+   uploading anything.
 3. `git tag -a X.Y.Z -m "phpser X.Y.Z"` with a release-note body,
    then `git push origin X.Y.Z`. Use bare semver (`0.1.1`, not
    `v0.1.1`) to match the fleet convention.
