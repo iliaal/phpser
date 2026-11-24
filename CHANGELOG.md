@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `make test` no longer fails `tests/257-offheap-string-oom-pending.phpt` when PHP scans a directory for additional INI files, such as `/etc/php.d`. The test's child PHP read that directory and printed a startup warning for each extension it could not load from the build's `modules/` directory.
+
 ## [0.11.0] - 2026-11-20
 
 ### Added
