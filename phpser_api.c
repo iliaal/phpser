@@ -178,7 +178,9 @@ static bool phpser_keyed_verify(const zend_string *key, const char *buf, size_t 
     if (phpser_keyed_tag(key, context, context_len, buf, frame_len, tag) != 0) {
         return false;
     }
-    return phpser_ct_eq(tag, (const unsigned char *) buf + frame_len, PHPSER_HMAC_TAG_LEN);
+    bool ok = phpser_ct_eq(tag, (const unsigned char *) buf + frame_len, PHPSER_HMAC_TAG_LEN);
+    ZEND_SECURE_ZERO(tag, sizeof(tag));
+    return ok;
 }
 
 phpser_keyed_rc phpser_keyed_decode(const char *buf, size_t buf_len, const zend_string *key,
