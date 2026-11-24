@@ -63,7 +63,9 @@ jobs:
             echo "::error::clang shared ASan runtime not found"; exit 1
           fi
           echo "dir=$(dirname "$lib")" >> "$GITHUB_OUTPUT"
-          echo "version=$(clang -dumpfullversion)" >> "$GITHUB_OUTPUT"
+          version=$(clang -dumpversion)
+          [ -n "$version" ] || { echo "::error::clang -dumpversion printed nothing"; exit 1; }
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       # The installed PHP links the clang runtime by path, so the key carries
       # the clang version and this file's hash (build flags) next to the
