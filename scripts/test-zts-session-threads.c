@@ -18,6 +18,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sapi/embed/php_embed.h>
+#include <ext/hash/php_hash.h>
+#include <ext/hash/php_hash_sha.h>
 
 #ifndef ZTS
 #error This regression requires a ZTS PHP embed library.
@@ -28,6 +30,7 @@
 
 static const char *ext_path;
 static const char *key;
+static uint32_t key_inner[8], key_outer[8];
 static atomic_int requests_ok, key_before_free, key_after_free, scan_errors;
 static __thread char cookie[64];
 
@@ -43,15 +46,33 @@ static int find_tls_size(struct dl_phdr_info *info, size_t sz, void *data) {
     return 1;
 }
 
-/* 1 when the calling thread's phpser TLS block holds the raw phpser.key
- * bytes, 0 when not, -1 when the block cannot be located. */
+/* phpser caches the HMAC-SHA256 inner and outer midstates of phpser.key, not
+ * the key itself: one SHA-256 compression of (key ^ ipad) and of (key ^ opad)
+ * from the standard IV, as native-endian state words. */
+static void compute_key_midstates(void) {
+    unsigned char k[64] = {0}, pad[64];
+    memcpy(k, key, strlen(key));
+    uint32_t *out[2] = {key_inner, key_outer};
+    const unsigned char x[2] = {0x36, 0x5c};
+    for (int j = 0; j < 2; j++) {
+        PHP_SHA256_CTX ctx;
+        PHP_SHA256Init(&ctx);
+        for (size_t i = 0; i < sizeof(pad); i++) pad[i] = k[i] ^ x[j];
+        PHP_SHA256Update(&ctx, pad, sizeof(pad));
+        memcpy(out[j], ctx.state, sizeof(key_inner));
+    }
+}
+
+/* How many of the two phpser.key midstates the calling thread's phpser TLS
+ * block holds, or -1 when the block cannot be located. */
 static int tls_holds_key(void) {
     void *h = dlopen(ext_path, RTLD_NOW | RTLD_NOLOAD);
     void *blk = NULL;
     int found = -1;
     if (!h) return -1;
     if (dlinfo(h, RTLD_DI_TLS_DATA, &blk) == 0 && blk && tls_size)
-        found = memmem(blk, tls_size, key, strlen(key)) != NULL;
+        found = (memmem(blk, tls_size, key_inner, sizeof(key_inner)) != NULL)
+            + (memmem(blk, tls_size, key_outer, sizeof(key_outer)) != NULL);
     dlclose(h);
     return found;
 }
@@ -91,8 +112,8 @@ static void *worker(void *arg) {
     ts_free_thread();
     int after = tls_holds_key();
     if (before < 0 || after < 0) atomic_fetch_add(&scan_errors, 1);
-    if (before == 1) atomic_fetch_add(&key_before_free, 1);
-    if (after == 1) atomic_fetch_add(&key_after_free, 1);
+    if (before == 2) atomic_fetch_add(&key_before_free, 1);
+    if (after > 0) atomic_fetch_add(&key_after_free, 1);
     return NULL;
 }
 
@@ -103,6 +124,10 @@ int main(int argc, char **argv) {
     }
     ext_path = argv[2];
     key = argv[3];
+    if (strlen(key) > 64) {
+        fprintf(stderr, "phpser.key must be at most 64 bytes\n");
+        return 2;
+    }
     php_embed_module.php_ini_path_override = argv[1];
     php_embed_module.php_ini_ignore_cwd = 1;
     php_embed_module.read_cookies = drv_read_cookies;
@@ -112,6 +137,9 @@ int main(int argc, char **argv) {
         return 1;
     }
     dl_iterate_phdr(find_tls_size, NULL);
+    /* PHP's SHA-256 picks its implementation from CPU features the engine
+     * detects at startup. */
+    compute_key_midstates();
     /* php_embed_init() left a request open on the main thread, where MINIT
      * already set phpser's TSRM cache; the stored sessions are written there
      * so the worker threads have something to decode. */
@@ -148,7 +176,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "could not locate the phpser TLS block\n");
         return 1;
     }
-    /* key_before_free proves the scan sees the cached key at all. */
+    /* key_before_free proves the scan sees the cached midstates at all. */
     if (seeded != NTHREADS || ok != NTHREADS * NREQ
         || atomic_load(&key_before_free) != NTHREADS || atomic_load(&key_after_free) != 0) {
         fprintf(stderr, "ZTS session-thread regression failed\n");
