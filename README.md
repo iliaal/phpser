@@ -54,6 +54,15 @@ to PHP's ZipArchive, which puts the `.so` at a path PIE doesn't check, and
 install fails with `ExtensionBinaryNotFound` even though the download
 succeeded.
 
+### Remi RPM packages
+
+If you already use a Remi PHP stream on Enterprise Linux, Remi Collet
+publishes [`php-iliaal-phpser`](https://rpms.remirepo.net/enterprise/8.0/php86/x86_64/repoview/)
+for modular PHP. For parallel PHP installations, choose the package with
+the matching PHP version prefix, such as
+[`php86-php-iliaal-phpser`](https://rpms.remirepo.net/enterprise/8.1/remi/x86_64/repoview/)
+for Remi's parallel PHP 8.6 installation.
+
 ### From source
 
 ```bash
