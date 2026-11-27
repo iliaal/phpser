@@ -118,16 +118,12 @@ $rt = phpser_unserialize(phpser_serialize($nested));
 echo (current($rt) === ['b' => ['c' => 42]]) ? "bug096 OK\n" : "bug096 fail\n";
 
 // AllowDynamicProperties keeps version-dependent deprecations out of this test.
-if (PHP_VERSION_ID >= 80200) {
-    #[\AllowDynamicProperties]
-    class Bug099 { public int $declared = 1; }
-    $o = new Bug099();
-    $o->extra = "dyn";
-    $rt = phpser_unserialize(phpser_serialize($o));
-    echo ($rt->declared === 1 && $rt->extra === "dyn") ? "bug099 OK\n" : "bug099 fail\n";
-} else {
-    echo "bug099 OK\n";
-}
+#[\AllowDynamicProperties]
+class Bug099 { public int $declared = 1; }
+$o = new Bug099();
+$o->extra = "dyn";
+$rt = phpser_unserialize(phpser_serialize($o));
+echo ($rt->declared === 1 && $rt->extra === "dyn") ? "bug099 OK\n" : "bug099 fail\n";
 ?>
 --EXPECT--
 bug72134 OK
