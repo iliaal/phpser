@@ -2,10 +2,6 @@
 phpser: readonly properties (PHP 8.1+) survive round-trip
 --EXTENSIONS--
 phpser
---SKIPIF--
-<?php
-if (PHP_VERSION_ID < 80100) print "skip PHP 8.1+ required for readonly";
-?>
 --FILE--
 <?php
 
